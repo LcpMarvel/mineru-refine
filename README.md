@@ -111,12 +111,21 @@ mergeTable **不做列对齐判断，也不做列对齐修复**："是否同一�
 - 出口合格判定全部是机器检查：worklist 空 ∧ `C_out ⊆ C_in` ∧ 异常数 ≤ 输入 ∧ 几何可定位；
   任一不满足 → fail-open。
 
+## 安装
+
+```bash
+bun add mineru-refine
+```
+
+> **运行时要求 Bun ≥ 1.1**（直接发布 TS 源码，且使用了 `Bun.file` / `Bun.serve` 等
+> Bun API,不支持纯 Node）。环境变量见下文 [LLM 接入](#llm-接入全部裸-api零-sdk)。
+
 ## 使用
 
 ### 作为库（收/发内存对象，不读写文件）
 
 ```ts
-import { refine } from "./src/refine.ts";
+import { refine, imageDirLoader } from "mineru-refine";
 
 const { items, report } = await refine(contentList, {
   sha256,          // 可选；提供则启用进程内缓存
@@ -139,7 +148,7 @@ const { items, report } = await refine(contentList, {
 ### HTTP 服务（跨语言消费方首选）
 
 ```bash
-bun run server                  # 默认端口 8771，MINERU_REFINE_PORT 可改
+bunx mineru-refine-server       # 或源码仓内 bun run server；默认端口 8771，MINERU_REFINE_PORT 可改
 curl -X POST localhost:8771/refine -d '{"items":[...], "sha256":"...", "imageDir":"/abs/mineru/out"}'
 curl localhost:8771/health
 ```
@@ -153,7 +162,7 @@ curl localhost:8771/health
 ### CLI（备选）
 
 ```bash
-cat content_list.json | bun run cli      # stdin JSON → stdout JSON（仅 items）
+cat content_list.json | bunx mineru-refine      # stdin JSON → stdout JSON
 ```
 
 ## LLM 接入（全部裸 API，零 SDK）

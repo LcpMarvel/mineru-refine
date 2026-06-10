@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 // HTTP transport（首选）：POST /refine 收 content_list JSON，回 { items, provenance, report }。
 // docfuse(Python) 在 _parse_extracted_dir 解析 content_list.json 之前调一次。
 // fail-open 在 refine() 内已兜；transport 层再兜一层（坏请求 → 400，内部错 → 仍回原 items 不可能时 500）。

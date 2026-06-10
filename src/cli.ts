@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 // CLI transport（备选，首选是 HTTP）：stdin 收 JSON、stdout 回 JSON，docfuse subprocess 调用。
 // stdin 形如 { "items": [...], "sha256"?: "...", "maxIterations"?: n, "imageDir"?: "/abs/path" }
 // 或直接是 items 数组。imageDir 指向 MinerU 产物目录（含 images/），提供则启用视觉裁决。
