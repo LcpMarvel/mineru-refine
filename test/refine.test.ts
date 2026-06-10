@@ -170,6 +170,7 @@ describe("跨页表格/列表（端到端，mock LLM）", () => {
         type: "table",
         table_body: "<table><tbody><tr><td>序号</td><td>事项</td></tr><tr><td>1</td><td>启动</td></tr></tbody></table>",
         table_caption: ["表1 安排"],
+        img_path: "images/t1.jpg",
         page_idx: 0,
         bbox: [50, 100, 550, 800],
       },
@@ -179,6 +180,7 @@ describe("跨页表格/列表（端到端，mock LLM）", () => {
         type: "table",
         table_body: "<table><tbody><tr><td>2</td><td>评审</td></tr></tbody></table>",
         table_caption: [],
+        img_path: "images/t2.jpg",
         page_idx: 1,
         bbox: [50, 80, 550, 300],
       },
@@ -188,9 +190,14 @@ describe("跨页表格/列表（端到端，mock LLM）", () => {
     ];
   }
 
+  // split_table 仅视觉裁决：loadImage + visionFn 是 mergeTable 的唯一通路
+  const loadAnyImage = async () => new Uint8Array([9, 9, 9]);
+  const visionMerge = async () =>
+    ({ verdict: "merge", reason: "同一张表", usage: { prompt_tokens: 1, completion_tokens: 1 } }) as const;
+
   test("mergeTable + 空壳 drop + mergeList 全链路，行级保真闸过、出口闸过", async () => {
     const input = splitDocInput();
-    const r = await refine(input, { chatFn: makeMockChat() });
+    const r = await refine(input, { chatFn: makeMockChat(), loadImage: loadAnyImage, visionFn: visionMerge });
     expect(r.report.failOpen).toBe(false);
     expect(r.report.opCounts).toEqual({ mergeTable: 1, drop: 1, mergeList: 1 });
 
@@ -215,21 +222,22 @@ describe("跨页表格/列表（端到端，mock LLM）", () => {
   });
 
   test("幂等：清洗结果再跑一次是 no-op 且零 LLM 调用", async () => {
-    const first = await refine(splitDocInput(), { chatFn: makeMockChat() });
+    const first = await refine(splitDocInput(), { chatFn: makeMockChat(), loadImage: loadAnyImage, visionFn: visionMerge });
     const second = makeMockChat();
-    const r2 = await refine(first.items, { chatFn: second });
+    const r2 = await refine(first.items, { chatFn: second, loadImage: loadAnyImage, visionFn: visionMerge });
     expect(r2.items).toEqual(first.items);
     expect(r2.report.opCounts).toEqual({});
     expect(second.calls).toBe(0);
   });
 
-  test("LLM 判两表是不同表 → dismiss，不动文档", async () => {
+  test("视觉判两表是不同表 → dismiss，不动文档", async () => {
     const input = splitDocInput();
     const r = await refine(input, {
       chatFn: makeMockChat({
-        split_table: (id) => ({ name: "dismiss", args: { id, reason: "两张不同的表" } }),
         split_list: (id) => ({ name: "dismiss", args: { id, reason: "两个独立列表" } }),
       }),
+      loadImage: loadAnyImage,
+      visionFn: async () => ({ verdict: "dismiss", reason: "两张不同的表", usage: { prompt_tokens: 1, completion_tokens: 1 } }),
     });
     expect(r.report.failOpen).toBe(false);
     expect(r.report.opCounts).toEqual({ drop: 1 }); // 只剩空壳被删
@@ -301,31 +309,64 @@ describe("split_table 视觉裁决（Qwen-VL mock）", () => {
     expect(r.report.dismissed).toBe(1);
   });
 
-  test("图取不到（loadImage 回 null）→ 回退文本路径", async () => {
-    const chat = makeMockChat(); // 默认 split_table → mergeTable
+  test("图取不到（loadImage 回 null）→ 搁置，不回退文本", async () => {
+    const chat = chatMustNotSeeSplitTable();
     const r = await refine(visionDocInput(), {
       chatFn: chat,
       loadImage: async () => null,
       visionFn: async () => {
         throw new Error("不该被调用：图都没取到");
       },
+      log: () => {},
     });
-    expect(r.report.opCounts).toEqual({ mergeTable: 1 });
-    expect(chat.calls).toBeGreaterThan(0);
+    expect(r.report.failOpen).toBe(false);
+    expect(r.report.opCounts).toEqual({});
+    expect(r.items.filter((it) => it.type === "table")).toHaveLength(2);
+    expect(chat.calls).toBe(0);
   });
 
-  test("视觉 API 故障 → 回退文本路径，不 fail-open", async () => {
-    const chat = makeMockChat();
+  test("视觉 API 故障 → 搁置，不回退文本、不 fail-open", async () => {
+    const chat = chatMustNotSeeSplitTable();
     const r = await refine(visionDocInput(), {
       chatFn: chat,
       loadImage,
       visionFn: async () => {
         throw new Error("Qwen-VL 不可用（测试注入）");
       },
+      log: () => {},
     });
     expect(r.report.failOpen).toBe(false);
-    expect(r.report.opCounts).toEqual({ mergeTable: 1 });
-    expect(chat.calls).toBeGreaterThan(0);
+    expect(r.report.opCounts).toEqual({});
+    expect(r.items.filter((it) => it.type === "table")).toHaveLength(2);
+    expect(chat.calls).toBe(0);
+  });
+
+  test("未提供 loadImage（无视觉模型）→ split_table 整体跳过：不 mergeTable、不走文本路径、不 fail-open", async () => {
+    const chat = chatMustNotSeeSplitTable();
+    const r = await refine(visionDocInput(), {
+      chatFn: chat,
+      visionFn: async () => {
+        throw new Error("不该被调用：没有 loadImage");
+      },
+      log: () => {},
+    });
+    expect(r.report.failOpen).toBe(false);
+    expect(r.report.opCounts).toEqual({});
+    expect(r.report.iterations).toBe(0);
+    expect(chat.calls).toBe(0);
+    expect(r.items.filter((it) => it.type === "table")).toHaveLength(2); // 两表原样保留
+  });
+
+  test("无视觉模型 + 其它疑点照常修复：仅 split_table 被跳过，闸门不误触", async () => {
+    // 拆表对 + 一个空壳表：空壳照常 drop，拆表跳过；输出仍残留 split_table 疑点但不 fail-open
+    const input: MineruItem[] = [
+      ...visionDocInput(),
+      { type: "table", img_path: "", table_caption: [], table_footnote: [], page_idx: 2, bbox: bbox(80) }, // 空壳
+    ];
+    const r = await refine(input, { chatFn: chatMustNotSeeSplitTable(), log: () => {} });
+    expect(r.report.failOpen).toBe(false);
+    expect(r.report.opCounts).toEqual({ drop: 1 });
+    expect(r.items.filter((it) => it.type === "table")).toHaveLength(2);
   });
 });
 

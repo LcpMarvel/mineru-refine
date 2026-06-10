@@ -56,7 +56,7 @@ LaTeX / 链接残留——只做**削减与重组，绝不新增一个字**。�
 | `page_artifact` | 高频重复短文本 / 与已分类页眉页脚同文（≥2 处家具佐证） | `drop` |
 | `residual_markup` | markdown 链接、`$...$`、`\frac` 等 LaTeX 残骸 | `strip` |
 | `empty_table` | 零内容空壳表（无行/caption/图——MinerU 自行跨页合并后留下的占位，真实数据中"续表"多为此形态） | `drop` |
-| `split_table` | 跨页相邻两个**有体**表格（跳过页面家具判相邻） | `mergeTable`（优先视觉裁决，见下） |
+| `split_table` | 跨页两个**有体**表格、中间仅页面家具（页码只要求递增不要求相邻——三页以上的链式拆表合并一段后与下一段隔 ≥2 页，每轮合一对逐段咬合） | `mergeTable`（**仅视觉裁决**，见下） |
 | `split_list` | 跨页相邻两个列表 | `mergeList` |
 
 **只标记、无 op（LLM 只能 `dismiss`，计入 report 供观测）：**
@@ -84,16 +84,17 @@ mergeTable **不做列对齐判断，也不做列对齐修复**："是否同一�
 列参差的行原样保留，绝不发明空单元格去"补齐"——补哪一列是语义猜测，猜错即篡改，
 而行级保真闸恰好把这类"修复"挡在门外。错位若存在，那是 MinerU 输入即有的，合并不引入新损伤。
 
-### split_table 的视觉裁决（Qwen-VL）
+### split_table 的视觉裁决（Qwen-VL，唯一路径）
 
-"是否同一张表"是图里一眼可见、文本里只能猜的事实，所以提供 `loadImage` 时
-`split_table` 疑点**优先路由给 Qwen-VL**：把 A/B 两表的 MinerU 裁剪图（content_list 的
-`img_path` 本来就指向它们）发给 `qwen-vl-max` 问一个窄问题，结构化回答映射到
-`mergeTable` 或 `dismiss`。要点：
+"是否同一张表"是图里一眼可见、文本里只能猜的事实，所以 `split_table` 疑点**只走
+Qwen-VL 视觉裁决**：把 A/B 两表的 MinerU 裁剪图（content_list 的 `img_path` 本来就
+指向它们）发给 `qwen-vl-max` 问一个窄问题，结构化回答映射到 `mergeTable` 或
+`dismiss`。文本路径没有 `mergeTable`——首末行摘要不足以核对表格行的真实归属，
+错合比漏合更糟。要点：
 
 - **只输出决策，不产内容字符**——merge 仍走 `applyOpChecked` 行级保真闸，不碰纯削减红线。
-- **fail-open 到文本路径**：无图 / 无 key / VLM 不可用 / 判决 op 被闸门拒 → 自动回退
-  DeepSeek 文本裁决，绝不阻塞。
+- **不提供 `loadImage`（无视觉模型）→ split_table 整体跳过**，表格原样保留。
+- **无图 / 无 key / VLM 不可用 / 判决 op 被闸门拒 → 搁置该疑点**（不回退文本，绝不阻塞）。
 - 实测两份真实文档 7 判 7 对（5 真续表 merge + 2 假续表 dismiss，含 rowspan 列数不等、
   文控页同位置异表等困难形态），单次 ~2k token。
 
@@ -131,7 +132,7 @@ const { items, report } = await refine(contentList, {
   sha256,          // 可选；提供则启用进程内缓存
   maxIterations,   // 外层循环硬上限；不传则自适应：min(max(48, 2×疑点数+16), 512)
   concurrency,     // 疑点并行裁决数，默认 8；1 = 严格串行
-  loadImage: imageDirLoader(mineruOutputDir), // 可选；启用 split_table 视觉裁决
+  loadImage: imageDirLoader(mineruOutputDir), // 可选；不提供则 split_table 整体跳过（视觉是其唯一裁决路径）
 });
 ```
 
@@ -154,7 +155,8 @@ curl localhost:8771/health
 ```
 
 `imageDir`（可选）是 MinerU 产物目录的绝对路径，须与本服务共享文件系统；
-提供则启用视觉裁决。CLI 同理（stdin 包对象里带 `imageDir` 字段）。
+提供则启用视觉裁决，不提供则 split_table 疑点整体跳过（不做 mergeTable）。
+CLI 同理（stdin 包对象里带 `imageDir` 字段）。
 
 消费方在解析 `content_list.json` 之前调一次，用返回的 `items` 替换即可；
 建议在调用侧也兜一层超时/不可用回退（fail-open 双保险）。
@@ -182,7 +184,7 @@ cat content_list.json | bunx mineru-refine      # stdin JSON → stdout JSON
 
 - 环境变量：`QWEN_APIKEY`（必填）、`QWEN_BASE_URL` / `QWEN_VISION_MODEL`（有默认值）。
 - 图走 base64 data URL，`temperature: 0`，回复按 JSON 裁决解析（过 `safe-json-repair`）。
-- 网络错误 / 429 / 5xx 自动重试；任何失败回退 DeepSeek 文本路径。
+- 网络错误 / 429 / 5xx 自动重试；重试耗尽则搁置该疑点（不回退文本，表格原样保留）。
 
 ## 开发
 
@@ -224,7 +226,7 @@ src/ops/index.ts  # 9 个削减/重组 op + 保真闸 + 回滚
 src/invariant.ts  # C_out ⊆ C_in / table_body / 几何校验
 src/loop.ts       # 确定性外层循环 + LLM tool-use + 守卫
 src/deepseek.ts   # 裸 fetch v4-pro（thinking disabled / tool_choice required / temp 0）
-src/qwen_vl.ts    # 裸 fetch qwen-vl-max（split_table 视觉裁决，失败回退文本）
+src/qwen_vl.ts    # 裸 fetch qwen-vl-max（split_table 唯一裁决路径，失败搁置）
 src/markdown.ts   # 清洗后 items → full.md 确定性重渲染
 src/refine.ts     # 入口：fail-open + 缓存 + 出口闸门
 src/server.ts     # HTTP transport

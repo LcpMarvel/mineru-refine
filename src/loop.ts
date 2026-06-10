@@ -32,7 +32,7 @@ export type LoopOptions = {
   maxRoundsPerSuspect?: number; // 单疑点内层对话轮数上限
   concurrency?: number; // 同批并行裁决的疑点数（1 = 严格串行）
   chatFn?: ChatFn; // 依赖注入，测试用 mock
-  loadImage?: LoadImageFn; // 提供时 split_table 优先走视觉裁决（取不到图/视觉失败 → 回退文本路径）
+  loadImage?: LoadImageFn; // split_table 仅视觉裁决：提供时走 Qwen-VL，取不到图/视觉失败 → 搁置该疑点（不回退文本）；不提供 = 无视觉模型，split_table 整体跳过
   visionFn?: VisionJudgeFn; // 依赖注入，测试用 mock（默认 Qwen-VL 裸 API）
   log?: (msg: string) => void;
 };
@@ -182,19 +182,8 @@ export const TOOLS: Tool[] = [
       },
     },
   },
-  {
-    type: "function",
-    function: {
-      name: "mergeTable",
-      description:
-        "把跨页被拆的两个 table 合成一个：B 的表格行原样追加到 A 之后，caption 拼接。idB 须在 idA 之后，中间只允许隔页眉/页码/页脚。仅当确认两表是【同一张表】被分页拆开（看 A 末行与 B 首行的内容连续性、列结构；列数不等可能是 rowspan 跨页携带，不能仅凭列数否定）。B 首行若与 A 表头逐字节相同（每页重印表头）会被自动去重。",
-      parameters: {
-        type: "object",
-        properties: { idA: { ...idParam, description: "前表 ID" }, idB: { ...idParam, description: "续表 ID" } },
-        required: ["idA", "idB"],
-      },
-    },
-  },
+  // 注：mergeTable 不在文本工具集里——split_table 仅视觉裁决（tryVisionVerdict），
+  // 文本 LLM 不该在任何疑点对话里合并表格（首末行摘要不足以核对行归属）。
   {
     type: "function",
     function: {
@@ -214,7 +203,7 @@ export const TOOLS: Tool[] = [
   },
 ];
 
-const OP_NAMES = new Set(["merge", "split", "demote", "promote", "reorder", "drop", "strip", "mergeTable", "mergeList"]);
+const OP_NAMES = new Set(["merge", "split", "demote", "promote", "reorder", "drop", "strip", "mergeList"]);
 const OBSERVE_NAMES = new Set(["outline", "getItems", "whyFlagged", "peekPage"]);
 
 // system prompt 稳定不变（放 messages 前缀吃 DeepSeek prefix cache）。
@@ -230,8 +219,7 @@ const SYSTEM_PROMPT = `你是 MinerU PDF 解析结果的结构修复器（linter
    - 列表项（-、•、①、(1) 等开头的行）之间绝不 merge——行尾无标点是列表的常态，不是断句。
    - 但 page_artifact 证据若给出「已分类页眉/页脚同文佐证」，说明同文块在别处已被正确分类为页面家具，该块就是漏标的同款 → 应 drop，不要因「像标题」而 dismiss。
    - 同一文本的多处 page_artifact 疑点应裁决一致：要删都删，不要删一处留其余。
-   - 跨页拆表裁决看【内容】而非形式：B 无 caption、B 首行像 A 末行的延续（如首格为空、序号接续）→ 同一张表 → mergeTable；两表各有独立 caption/表头主题不同 → 不同表 → dismiss。
-4. 修复只许削减/重组（merge/split/demote/promote/reorder/drop/strip/mergeTable/mergeList），系统会机器校验"不新增任何字符、表格行不被篡改"，违规会被自动回滚。
+4. 修复只许削减/重组（merge/split/demote/promote/reorder/drop/strip/mergeList），系统会机器校验"不新增任何字符、表格行不被篡改"，违规会被自动回滚。
 5. 每个疑点最终以【一个】变更 op 或 dismiss 收尾。`;
 
 // ── 观察工具实现（确定性，只读）──
@@ -323,8 +311,6 @@ function toOpCall(name: string, args: Record<string, unknown>): OpCall {
       return { op: "drop", id: String(args.id) };
     case "strip":
       return { op: "strip", id: String(args.id), pattern: String(args.pattern) as StripPattern };
-    case "mergeTable":
-      return { op: "mergeTable", idA: String(args.idA), idB: String(args.idB) };
     case "mergeList":
       return { op: "mergeList", idA: String(args.idA), idB: String(args.idB), joinSeam: Boolean(args.joinSeam) };
     default:
@@ -355,6 +341,11 @@ class OscillationGuard {
 
 const suspectKey = (w: WorkItem) => `${w.kind}:${w.itemId}`;
 
+/** 无视觉模型（未提供 loadImage）时 split_table 不裁决：表格行级保真只信图像证据，不让纯文本路径做 mergeTable。 */
+export function skippedWithoutVision(w: WorkItem, hasLoadImage: boolean): boolean {
+  return w.kind === "split_table" && !hasLoadImage;
+}
+
 // ── 主循环 ──
 
 export async function runLoop(initial: RefItem[], nextId: IdGen, opts: LoopOptions = {}): Promise<LoopResult> {
@@ -378,11 +369,20 @@ export async function runLoop(initial: RefItem[], nextId: IdGen, opts: LoopOptio
   let violations = 0;
   let iterations = 0;
   let llmSuccesses = 0; // 至少一次成功 → 后续单点 LLM 故障只搁置疑点；全程零成功 → 上抛触发 fail-open
+  const hasVision = !!opts.loadImage;
+  let warnedVisionless = false;
 
-  // loop-until-dry：worklist（有 op、未 dismiss）弹空才到底
+  // loop-until-dry：worklist（有 op、未 dismiss、未因无视觉模型跳过）弹空才到底
   while (iterations < maxIterations) {
     const worklist = detect(state.items);
-    const actionable = worklist.filter((w) => w.hasOp && !dismissedKeys.has(suspectKey(w)));
+    if (!hasVision && !warnedVisionless) {
+      const skipped = worklist.filter((w) => skippedWithoutVision(w, hasVision)).length;
+      if (skipped > 0) {
+        warnedVisionless = true;
+        log(`未提供视觉模型（loadImage），跳过 ${skipped} 个 split_table 疑点，不做 mergeTable`);
+      }
+    }
+    const actionable = worklist.filter((w) => w.hasOp && !dismissedKeys.has(suspectKey(w)) && !skippedWithoutVision(w, hasVision));
     if (actionable.length === 0) break;
 
     // 一批最多 concurrency 个疑点并行裁决（不同位置的块相互独立，这是主要提速来源）
@@ -459,9 +459,10 @@ type SuspectCtx = {
 };
 
 /**
- * split_table 的视觉裁决（优先路径）：把 A/B 两表的 MinerU 裁剪图交给 Qwen-VL 判
+ * split_table 的视觉裁决（唯一路径）：把 A/B 两表的 MinerU 裁剪图交给 Qwen-VL 判
  * "是否同一张表被分页拆开"。仅输出决策，merge 仍走 applyOpChecked 保真闸。
- * 返回 null = 此路不通（无图/无 key/判决 op 被闸门拒），回退文本路径，绝不阻塞。
+ * 返回 null = 此路不通（无图/无 key/判决 op 被闸门拒）→ 调用方搁置该疑点，
+ * 不回退文本：纯文本（首末行摘要）不足以核对表格行的真实归属，错合比漏合更糟。
  */
 async function tryVisionVerdict(
   target: WorkItem,
@@ -503,11 +504,11 @@ async function tryVisionVerdict(
         ctx.log(`视觉 mergeTable ${idA}+${idB}: ${v.reason}`);
         outcome = { kind: "applied", opName: "mergeTable", removedSpans: result.removedSpans };
       } else {
-        ctx.log(`视觉判 merge 但 op 被拒（${result.reason}），回退文本路径`);
+        ctx.log(`视觉判 merge 但 op 被拒（${result.reason}），搁置`);
       }
     }
   } catch (e) {
-    ctx.log(`视觉裁决失败（${(e as Error).message}），回退文本路径`);
+    ctx.log(`视觉裁决失败（${(e as Error).message}），搁置`);
   }
   return outcome;
 }
@@ -518,8 +519,11 @@ async function handleSuspect(
   worklist: WorkItem[],
   ctx: SuspectCtx,
 ): Promise<SuspectOutcome> {
-  const visionOutcome = await tryVisionVerdict(target, state, worklist, ctx);
-  if (visionOutcome) return visionOutcome;
+  // split_table 仅视觉裁决，此路不通就搁置——绝不落到文本路径
+  if (target.kind === "split_table") {
+    const visionOutcome = await tryVisionVerdict(target, state, worklist, ctx);
+    return visionOutcome ?? { kind: "dismissed", reason: "vision_unavailable", violations: 0 };
+  }
 
   const OP_HINTS: Partial<Record<WorkItem["kind"], string>> = {
     pseudo_heading: "确认是被误判的正文 → demote；确认是真标题 → dismiss",
@@ -528,13 +532,12 @@ async function handleSuspect(
     page_artifact: "确认是页码/页眉/页脚/水印（非正文）→ drop；是正文 → dismiss。证据含「家具佐证」的基本可直接 drop",
     residual_markup: "确认是解析残留 → strip（选对 pattern：$...$ 用 latex_dollar、裸 \\命令{} 用 latex_command、\\$ 用 escaped_dollar）；本就该有 → dismiss",
     empty_table: "确认是零内容空壳（无行无字无图）→ drop；探测器已验证为空，一般可直接 drop",
-    split_table: "确认两表是同一张被分页拆开（B 无独立 caption、内容/序号接续；列数不等可能是 rowspan 跨页携带或某页尾列全空被 MinerU 略去）→ mergeTable；是两张不同的表 → dismiss",
     split_list: "确认两 list 是同一列表被分页拆开 → mergeList（A 尾项被截断、B 首项是其延续时 joinSeam=true）；各自独立 → dismiss",
   };
 
   // 上下文前置：把裁决最可能需要的观察结果直接放进首条消息，省掉 1-2 轮观察往返。
   // 跨页疑点预载整页上下文（等价 peekPage），其余预载 ±2 邻居（等价 getItems）。
-  const CROSS_PAGE_KINDS = new Set<WorkItem["kind"]>(["cross_page_break", "split_table", "split_list"]);
+  const CROSS_PAGE_KINDS = new Set<WorkItem["kind"]>(["cross_page_break", "split_list"]);
   let preload = "";
   try {
     preload = CROSS_PAGE_KINDS.has(target.kind)

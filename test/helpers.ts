@@ -77,10 +77,9 @@ export function makeMockChat(overrides: Partial<Record<SuspectKind, KindHandler>
     residual_markup: (id) => ({ name: "strip", args: { id, pattern: "md_link" } }),
     giant_block: (id) => ({ name: "dismiss", args: { id, reason: "mock 默认不拆" } }),
     empty_table: (id) => ({ name: "drop", args: { id } }),
-    split_table: (id, evidence) => {
-      const idB = /后块=(it_\d+)/.exec(evidence)?.[1];
-      if (!idB) throw new Error(`mock 无法从证据解析后块 ID: ${evidence}`);
-      return { name: "mergeTable", args: { idA: id, idB } };
+    // split_table 仅视觉裁决，永不落文本路径——落到这里就是实现回归了
+    split_table: (id) => {
+      throw new Error(`split_table 不应走文本路径（疑点 ${id} 落到了文本 mock）`);
     },
     split_list: (id, evidence) => {
       const idB = /后块=(it_\d+)/.exec(evidence)?.[1];

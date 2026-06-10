@@ -208,12 +208,16 @@ export function detect(items: readonly RefItem[]): WorkItem[] {
       );
     }
 
-    // ── 跨页拆表/拆列表（→ mergeTable/mergeList）。页边界处跳过页面家具找下一个内容块。──
+    // ── 跨页拆表/拆列表（→ mergeTable/mergeList）。页边界处跳过页面家具找下一个内容块。
+    // 页码只要求严格递增、不要求相邻：结构相邻（中间仅家具）已保证跳过的页面没有正文，
+    // 而 mergeTable 产物 page_idx 取首块，链式拆表（3 页以上）合并一段后与下一段隔 ≥2 页，
+    // 若要求 page_idx+1 则链条在第二段处断掉，永远合不完。──
     if ((item.type === "table" || item.type === "list") && typeof item.page_idx === "number") {
       let j = i + 1;
       while (j < items.length && PAGE_FURNITURE_TYPES.has(items[j]!.item.type)) j++;
       const next = items[j];
-      if (next && next.item.type === item.type && next.item.page_idx === item.page_idx + 1) {
+      if (next && next.item.type === item.type && typeof next.item.page_idx === "number" && next.item.page_idx > item.page_idx) {
+        const gapNote = next.item.page_idx - item.page_idx > 1 ? `，中间隔 ${next.item.page_idx - item.page_idx - 1} 页且无任何正文块（常见于已合并过一段的链式拆表）` : "";
         if (item.type === "table") {
           // 任一侧是空壳就合不了（空壳走 empty_table → drop），只标双方有体的
           if (!isEmptyTableHusk(item) && !isEmptyTableHusk(next.item)) {
@@ -222,7 +226,7 @@ export function detect(items: readonly RefItem[]): WorkItem[] {
               suspect(
                 "split_table",
                 id,
-                `跨页相邻两 table（${id} p${item.page_idx} 首行${cols(item.table_body)}列 + ${next.id} p${next.item.page_idx} 首行${cols(next.item.table_body)}列），疑似同一表格被拆。后块=${next.id}。注意：列数不等可能是 rowspan 跨页携带，不能仅凭列数否定`,
+                `跨页两 table 间仅页面家具（${id} p${item.page_idx} 首行${cols(item.table_body)}列 + ${next.id} p${next.item.page_idx} 首行${cols(next.item.table_body)}列${gapNote}），疑似同一表格被拆。后块=${next.id}。注意：列数不等可能是 rowspan 跨页携带，不能仅凭列数否定`,
                 true,
               ),
             );
@@ -232,7 +236,7 @@ export function detect(items: readonly RefItem[]): WorkItem[] {
             suspect(
               "split_list",
               id,
-              `跨页相邻两 list（${id} p${item.page_idx} 尾项「…${(item.list_items ?? []).at(-1)?.slice(-40) ?? ""}」 + ${next.id} p${next.item.page_idx} 首项「${(next.item.list_items ?? [])[0]?.slice(0, 40) ?? ""}…」），疑似同一列表被拆。后块=${next.id}`,
+              `跨页两 list 间仅页面家具（${id} p${item.page_idx} 尾项「…${(item.list_items ?? []).at(-1)?.slice(-40) ?? ""}」 + ${next.id} p${next.item.page_idx} 首项「${(next.item.list_items ?? [])[0]?.slice(0, 40) ?? ""}…」${gapNote}），疑似同一列表被拆。后块=${next.id}`,
               true,
             ),
           );

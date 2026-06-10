@@ -5,12 +5,12 @@
 import { assignIds, stripIds } from "./id.ts";
 import { detect } from "./detect.ts";
 import { checkFidelity } from "./invariant.ts";
-import { runLoop, type ChatFn, type LoadImageFn } from "./loop.ts";
+import { runLoop, skippedWithoutVision, type ChatFn, type LoadImageFn } from "./loop.ts";
 import type { VisionJudgeFn } from "./qwen_vl.ts";
-import type { MineruItem, ProvenanceEntry, RefineReport, RefineResult } from "./types.ts";
+import type { MineruItem, ProvenanceEntry, RefineReport, RefineResult, WorkItem } from "./types.ts";
 
-export const REFINE_LOGIC_VERSION = "0.5.1"; // 0.5：split_table 视觉裁决；0.5.1：maxIterations 自适应默认
-export const PROMPT_VERSION = "p3";
+export const REFINE_LOGIC_VERSION = "0.6.0"; // 0.5：split_table 视觉裁决；0.5.1：maxIterations 自适应默认；0.6：拆表检测放宽到链式（页码不要求相邻）+ split_table 仅视觉裁决（无视觉模型/视觉失败一律搁置，文本路径撤掉 mergeTable）
+export const PROMPT_VERSION = "p4"; // p4：system prompt 与工具集移除 mergeTable
 export const MODEL_ID = "deepseek-v4-pro";
 
 export type RefineOptions = {
@@ -18,7 +18,7 @@ export type RefineOptions = {
   sha256?: string; // 源文件 SHA256；提供时启用缓存
   maxIterations?: number; // 外层循环硬上限；不传则自适应（adaptiveMaxIterations，随疑点数 48~512）
   concurrency?: number; // 并行裁决的疑点数（默认 8；1 = 严格串行）
-  /** 只读图片访问器（imgPath 相对路径 → 字节）。提供时 split_table 走 Qwen-VL 视觉裁决，失败自动回退文本。 */
+  /** 只读图片访问器（imgPath 相对路径 → 字节）。split_table 仅视觉裁决：提供时走 Qwen-VL（取不到图/视觉失败 → 搁置该疑点）；不提供 = 无视觉模型，split_table 整体跳过。任何情况下都不走文本路径做 mergeTable。 */
   loadImage?: LoadImageFn;
   /** 内部/测试用：注入 LLM 调用（默认 DeepSeek 裸 API）。 */
   chatFn?: ChatFn;
@@ -96,7 +96,11 @@ export async function refine(items: MineruItem[], opts: RefineOptions = {}): Pro
 
   try {
     const { ref, nextId } = assignIds(snapshot);
-    const inputSuspects = detect(ref).filter((w) => w.hasOp).length;
+    // 无视觉模型时 split_table 整体跳过，不计入迭代预算，也不参与"异常数单调"闸门
+    //（跳过的疑点原样留在输出里，按原计数会被误判为"修不动"触发 fail-open）
+    const hasVision = !!opts.loadImage;
+    const gateCountable = (w: WorkItem) => w.hasOp && !skippedWithoutVision(w, hasVision);
+    const inputSuspects = detect(ref).filter(gateCountable).length;
     const refBefore = ref.map((r) => ({ id: r.id, item: structuredClone(r.item) }));
 
     const loop = await runLoop(ref, nextId, {
@@ -112,7 +116,7 @@ export async function refine(items: MineruItem[], opts: RefineOptions = {}): Pro
     const fidelity = checkFidelity(refBefore, loop.items);
     if (!fidelity.ok) return failOpen(`出口保真闸门不过: ${fidelity.reason}`);
 
-    const outputSuspects = detect(loop.items).filter((w) => w.hasOp).length;
+    const outputSuspects = detect(loop.items).filter(gateCountable).length;
     if (outputSuspects > inputSuspects) {
       return failOpen(`异常数不单调: 输入 ${inputSuspects} → 输出 ${outputSuspects}`);
     }

@@ -108,6 +108,21 @@ describe("跨页拆表/拆列表/空壳表（hasOp）与空 caption（仅标记�
     expect(st[0]!.evidence).toContain("后块=it_0004");
   });
 
+  test("链式拆表：页码隔 ≥2 但中间仅家具仍标 split_table（真实数据：MN-JZY-001 三页拆表合并一段后产物在 p24、残片在 p26）", () => {
+    const { ref } = assignIds([
+      { type: "table", table_body: T1, table_caption: ["表1"], page_idx: 24, bbox: bbox(0) },
+      { type: "header", text: "附件3：战略管理之“看市场和客户”", page_idx: 24, bbox: bbox(700) },
+      { type: "page_number", text: "25 /71", page_idx: 24, bbox: bbox(780) },
+      { type: "page_number", text: "26 / 71", page_idx: 25, bbox: bbox(780) },
+      { type: "table", table_body: T2, table_caption: [], page_idx: 26, bbox: bbox(100) },
+    ]);
+    const st = detect(ref).filter((w) => w.kind === "split_table");
+    expect(st).toHaveLength(1);
+    expect(st[0]!.itemId).toBe("it_0001");
+    expect(st[0]!.evidence).toContain("后块=it_0005");
+    expect(st[0]!.evidence).toContain("中间隔 1 页");
+  });
+
   test("零内容空壳表 → empty_table（hasOp）且进 droppableIds；不参与 split_table", () => {
     const { ref } = assignIds([
       { type: "table", table_body: T1, table_caption: ["表1"], page_idx: 0, bbox: bbox(0) },
