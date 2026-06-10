@@ -6,6 +6,7 @@
   "module": "src/refine.ts",
   "scripts": {
     "m0": "bun run scripts/m0_smoke.ts",
+    "m0:vl": "bun run scripts/qwen_smoke.ts",
     "mineru:fetch": "bun run scripts/mineru_fetch.ts",
     "refine:real": "bun run scripts/refine_real.ts",
     "test": "bun test",

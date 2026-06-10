@@ -1,6 +1,8 @@
-// 异常探测器（SPEC §9）：确定性启发式 → worklist。产出"疑点"非"结论"，
+// 异常探测器：确定性启发式 → worklist。产出"疑点"非"结论"，
 // 由 LLM 在 loop 中裁决。判定逻辑借鉴 docfuse _SANITIZE_PASSES 的思想原型。
 
+import { tableRows } from "./invariant.ts";
+import { isEmptyTableHusk } from "./ops/index.ts";
 import { PAGE_FURNITURE_TYPES, type RefItem, type SuspectKind, type WorkItem } from "./types.ts";
 
 const SENTENCE_END = /[。．.!！?？;；…]\s*$/;
@@ -43,7 +45,7 @@ export function detect(items: readonly RefItem[]): WorkItem[] {
 
   // 高频重复短文本（页眉/页脚/水印候选）：同文本出现在 ≥3 个不同页。
   // 注意：MinerU 的 type=header/footer/page_number 是【已正确分类】的页面家具，不是 quirk
-  // （§9 针对的是被误标为 text 的混入正文），那些类型一律不进 worklist。
+  // （探测器针对的是被误标为 text 的混入正文），那些类型一律不进 worklist。
   const textPages = new Map<string, Set<number>>();
   for (const { item } of items) {
     if (item.type === "text" && typeof item.text === "string") {
@@ -191,27 +193,54 @@ export function detect(items: readonly RefItem[]): WorkItem[] {
       }
     }
 
-    // ── 以下仅标记、无 op（D5）──
-    if (item.type === "table" && i + 1 < items.length) {
-      const next = items[i + 1]!;
-      if (
-        next.item.type === "table" &&
-        typeof item.page_idx === "number" &&
-        next.item.page_idx === item.page_idx + 1
-      ) {
-        out.push(suspect("split_table", id, `相邻两 table 跨页（${id} + ${next.id}），疑似同一表格被拆`, false));
+    // ── 空壳表（→ drop）：零内容占位。MinerU 跨页合并表格后，续页常留下
+    // {"type":"table","img_path":"","table_caption":[]} 这种无行无字的空壳（真实数据 8/11 的"续表"如此）。
+    // 不要求紧跟在表后：空壳链（连续多页占位）里后面的壳只挨着前面的壳。──
+    if (isEmptyTableHusk(item)) {
+      const prev = items.slice(0, i).findLast((r) => !PAGE_FURNITURE_TYPES.has(r.item.type));
+      out.push(
+        suspect(
+          "empty_table",
+          id,
+          `零内容空壳表（无表格行/caption/图），疑似 MinerU 跨页合并后留下的占位。前一个内容块=${prev ? `${prev.id}(${prev.item.type}, p${prev.item.page_idx})` : "无"}`,
+          true,
+        ),
+      );
+    }
+
+    // ── 跨页拆表/拆列表（→ mergeTable/mergeList）。页边界处跳过页面家具找下一个内容块。──
+    if ((item.type === "table" || item.type === "list") && typeof item.page_idx === "number") {
+      let j = i + 1;
+      while (j < items.length && PAGE_FURNITURE_TYPES.has(items[j]!.item.type)) j++;
+      const next = items[j];
+      if (next && next.item.type === item.type && next.item.page_idx === item.page_idx + 1) {
+        if (item.type === "table") {
+          // 任一侧是空壳就合不了（空壳走 empty_table → drop），只标双方有体的
+          if (!isEmptyTableHusk(item) && !isEmptyTableHusk(next.item)) {
+            const cols = (body: unknown) => (tableRows(typeof body === "string" ? body : "")[0]?.match(/<t[dh]/gi) ?? []).length;
+            out.push(
+              suspect(
+                "split_table",
+                id,
+                `跨页相邻两 table（${id} p${item.page_idx} 首行${cols(item.table_body)}列 + ${next.id} p${next.item.page_idx} 首行${cols(next.item.table_body)}列），疑似同一表格被拆。后块=${next.id}。注意：列数不等可能是 rowspan 跨页携带，不能仅凭列数否定`,
+                true,
+              ),
+            );
+          }
+        } else {
+          out.push(
+            suspect(
+              "split_list",
+              id,
+              `跨页相邻两 list（${id} p${item.page_idx} 尾项「…${(item.list_items ?? []).at(-1)?.slice(-40) ?? ""}」 + ${next.id} p${next.item.page_idx} 首项「${(next.item.list_items ?? [])[0]?.slice(0, 40) ?? ""}…」），疑似同一列表被拆。后块=${next.id}`,
+              true,
+            ),
+          );
+        }
       }
     }
-    if (item.type === "list" && i + 1 < items.length) {
-      const next = items[i + 1]!;
-      if (
-        next.item.type === "list" &&
-        typeof item.page_idx === "number" &&
-        next.item.page_idx === item.page_idx + 1
-      ) {
-        out.push(suspect("split_list", id, `相邻两 list 跨页（${id} + ${next.id}），疑似同一列表被拆`, false));
-      }
-    }
+
+    // ── 以下仅标记、无 op（标记后不做处理）──
     if (item.type === "table" || item.type === "image") {
       const caption = item.type === "table" ? item.table_caption : (item as { img_caption?: string[] }).img_caption;
       if (!Array.isArray(caption) || caption.length === 0 || caption.every((c) => !c.trim())) {
@@ -223,7 +252,7 @@ export function detect(items: readonly RefItem[]): WorkItem[] {
   return out;
 }
 
-/** 当前被标为 page_artifact 的 id 集（drop 白名单的第二道保险）。 */
+/** 当前被标为 page_artifact / empty_table 的 id 集（drop 白名单的第二道保险）。 */
 export function droppableIds(worklist: readonly WorkItem[]): Set<string> {
-  return new Set(worklist.filter((w) => w.kind === "page_artifact").map((w) => w.itemId));
+  return new Set(worklist.filter((w) => w.kind === "page_artifact" || w.kind === "empty_table").map((w) => w.itemId));
 }

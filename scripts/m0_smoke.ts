@@ -1,4 +1,4 @@
-// M0 冒烟（阻断里程碑，SPEC §15）。
+// M0 冒烟（`bun run m0`，不过则后续无从谈起）。
 // 目标：验证 deepseek-v4-pro 裸 API 在【多轮 tool-call loop】中的机械可靠性——
 //   1. tool_choice:"required" → 模型每轮必返 tool_calls（绝不吐自由正文）
 //   2. arguments(JSON 字符串) 经 safe-json-repair 稳定解析

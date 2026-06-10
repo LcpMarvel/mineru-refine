@@ -1,5 +1,5 @@
 // DeepSeek 裸 API 客户端（无 SDK）。仅封装一次 POST /chat/completions。
-// 设计依据见 SPEC §11：deepseek-v4-pro / thinking disabled / tool_choice required / temperature 0。
+// 接入约定：deepseek-v4-pro / thinking disabled / tool_choice required / temperature 0。
 
 const ENDPOINT = "https://api.deepseek.com/chat/completions";
 const MODEL = "deepseek-v4-pro";
@@ -52,7 +52,7 @@ export async function chat(
     tools,
     tool_choice: opts?.toolChoice ?? "required",
     temperature: 0, // thinking disabled 下生效
-    thinking: { type: "disabled" }, // SPEC §11：绕开 reasoning_content 回传的 400 雷
+    thinking: { type: "disabled" }, // 绕开 reasoning_content 回传的 400 雷
     stream: false,
   });
 

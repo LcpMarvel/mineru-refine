@@ -1,4 +1,4 @@
-// M2：异常探测器单测（SPEC §9）。
+// 异常探测器单测。
 
 import { describe, expect, test } from "bun:test";
 import { detect, droppableIds } from "../src/detect.ts";
@@ -72,11 +72,14 @@ describe("detect 可处理疑点（hasOp）", () => {
   });
 });
 
-describe("detect 仅标记类（hasOp=false，D5）", () => {
-  test("跨页 table / 跨页 list / 空 caption", () => {
+describe("跨页拆表/拆列表/空壳表（hasOp）与空 caption（仅标记）", () => {
+  const T1 = "<table><tr><td>表头</td></tr><tr><td>甲</td></tr></table>";
+  const T2 = "<table><tr><td>乙</td></tr></table>";
+
+  test("跨页两有体 table / 两 list → split_table/split_list（hasOp），空 caption 仅标记", () => {
     const items: MineruItem[] = [
-      { type: "table", table_body: "<table>1</table>", table_caption: ["表1"], page_idx: 0, bbox: bbox(0) },
-      { type: "table", table_body: "<table>2</table>", table_caption: [], page_idx: 1, bbox: bbox(0) },
+      { type: "table", table_body: T1, table_caption: ["表1"], page_idx: 0, bbox: bbox(0) },
+      { type: "table", table_body: T2, table_caption: [], page_idx: 1, bbox: bbox(0) },
       { type: "list", list_items: ["a"], page_idx: 1, bbox: bbox(100) },
       { type: "list", list_items: ["b"], page_idx: 2, bbox: bbox(0) },
       { type: "image", img_path: "images/x.jpg", page_idx: 2, bbox: bbox(200) },
@@ -86,10 +89,60 @@ describe("detect 仅标记类（hasOp=false，D5）", () => {
     const byKind = (k: SuspectKind) => wl.filter((w) => w.kind === k);
     expect(byKind("split_table")).toHaveLength(1);
     expect(byKind("split_list")).toHaveLength(1);
+    expect(byKind("split_table")[0]!.hasOp).toBe(true);
+    expect(byKind("split_list")[0]!.hasOp).toBe(true);
     expect(byKind("caption_issue").map((w) => w.itemId)).toEqual(["it_0002", "it_0005"]);
-    for (const k of ["split_table", "split_list", "caption_issue"] as const) {
-      expect(byKind(k).every((w) => !w.hasOp)).toBe(true);
-    }
+    expect(byKind("caption_issue").every((w) => !w.hasOp)).toBe(true);
+  });
+
+  test("跨页表对隔着页面家具仍能探测（真实数据：中间总有 2-3 个页眉/页码）", () => {
+    const { ref } = assignIds([
+      { type: "table", table_body: T1, table_caption: ["表1"], page_idx: 0, bbox: bbox(0) },
+      { type: "page_number", text: "1", page_idx: 0, bbox: bbox(780) },
+      { type: "header", text: "公司内部资料", page_idx: 1, bbox: bbox(10) },
+      { type: "table", table_body: T2, table_caption: [], page_idx: 1, bbox: bbox(100) },
+    ]);
+    const st = detect(ref).filter((w) => w.kind === "split_table");
+    expect(st).toHaveLength(1);
+    expect(st[0]!.itemId).toBe("it_0001");
+    expect(st[0]!.evidence).toContain("后块=it_0004");
+  });
+
+  test("零内容空壳表 → empty_table（hasOp）且进 droppableIds；不参与 split_table", () => {
+    const { ref } = assignIds([
+      { type: "table", table_body: T1, table_caption: ["表1"], page_idx: 0, bbox: bbox(0) },
+      // 真实形态：MinerU 跨页合并后留下的占位
+      { type: "table", img_path: "", table_caption: [], table_footnote: [], page_idx: 1, bbox: bbox(0) },
+      { type: "table", img_path: "", table_caption: [], table_footnote: [], page_idx: 2, bbox: bbox(0) }, // 空壳链
+    ]);
+    const wl = detect(ref);
+    const husks = wl.filter((w) => w.kind === "empty_table");
+    expect(husks.map((w) => w.itemId)).toEqual(["it_0002", "it_0003"]);
+    expect(husks.every((w) => w.hasOp)).toBe(true);
+    expect(wl.filter((w) => w.kind === "split_table")).toHaveLength(0);
+    expect(droppableIds(wl).has("it_0002")).toBe(true);
+    expect(droppableIds(wl).has("it_0003")).toBe(true);
+  });
+
+  test("有 caption 但无行的表不算空壳（字符不可丢）", () => {
+    const { ref } = assignIds([
+      { type: "table", table_caption: ["仅有标题的表"], page_idx: 0, bbox: bbox(0) },
+    ]);
+    expect(detect(ref).filter((w) => w.kind === "empty_table")).toHaveLength(0);
+  });
+
+  test("同页两表 / 隔内容块的跨页两表不标 split_table", () => {
+    const { ref } = assignIds([
+      { type: "table", table_body: T1, table_caption: ["表1"], page_idx: 0, bbox: bbox(0) },
+      { type: "table", table_body: T2, table_caption: ["表2"], page_idx: 0, bbox: bbox(300) },
+    ]);
+    expect(detect(ref).filter((w) => w.kind === "split_table")).toHaveLength(0);
+    const { ref: ref2 } = assignIds([
+      { type: "table", table_body: T1, table_caption: ["表1"], page_idx: 0, bbox: bbox(0) },
+      { type: "text", text: "中间隔着一段正文说明。", page_idx: 0, bbox: bbox(300) },
+      { type: "table", table_body: T2, table_caption: ["表2"], page_idx: 1, bbox: bbox(0) },
+    ]);
+    expect(detect(ref2).filter((w) => w.kind === "split_table")).toHaveLength(0);
   });
 });
 

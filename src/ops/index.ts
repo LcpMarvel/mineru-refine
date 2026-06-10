@@ -1,10 +1,10 @@
-// 7 个削减/重组 op（SPEC §8，D4=(c) 全集）。纯函数：(items, args) -> 新 items，绝不突变入参。
-// applyOpChecked 是唯一对外执行入口：执行 + 保真闸（§5）+ 几何派生（§6），违反即回滚（丢弃副本）。
-// 参数一律稳定 ID（§4a）。op 自身参数非法（ID 不存在 / 不相邻 / 不在白名单）直接抛错。
+// 9 个削减/重组 op（纯削减全集，不加字）。纯函数：(items, args) -> 新 items，绝不突变入参。
+// applyOpChecked 是唯一对外执行入口：执行 + 保真闸 + 几何派生，违反即回滚（丢弃副本）。
+// 参数一律稳定 ID。op 自身参数非法（ID 不存在 / 不相邻 / 不在白名单）直接抛错。
 
 import type { IdGen } from "../id.ts";
 import { mustIndexOfId } from "../id.ts";
-import { checkFidelity } from "../invariant.ts";
+import { checkFidelity, tableRows } from "../invariant.ts";
 import { PAGE_FURNITURE_TYPES, type MineruItem, type OpCall, type RefItem, type RemovedSpan, type StripPattern } from "../types.ts";
 
 type OpOutcome = { items: RefItem[]; removedSpans: RemovedSpan[] };
@@ -17,28 +17,21 @@ function nonWs(s: string): string {
   return s.replace(/\s+/g, "");
 }
 
-// ── merge(idA, idB)：两 text 块拼成一块（修跨页断句）。bbox=并集，page_idx 取首块（§6）。
-// 两块之间只允许隔着页面家具（header/page_number/footer），家具原位保留在合并块之后。──
-function opMerge(items: RefItem[], nextId: IdGen, idA: string, idB: string): OpOutcome {
+/** 合并类 op 共用的相邻性检查：idB 须在 idA 之后，两者之间只允许隔页面家具（原位保留）。 */
+function adjacentPair(opName: string, items: RefItem[], idA: string, idB: string) {
   const ia = mustIndexOfId(items, idA);
   const ib = mustIndexOfId(items, idB);
-  if (ib <= ia) throw new Error(`merge 要求 ${idB} 在 ${idA} 之后（实际位置 ${ia} / ${ib}）`);
+  if (ib <= ia) throw new Error(`${opName} 要求 ${idB} 在 ${idA} 之后（实际位置 ${ia} / ${ib}）`);
   const between = items.slice(ia + 1, ib);
   const blocker = between.find((r) => !PAGE_FURNITURE_TYPES.has(r.item.type));
   if (blocker) {
-    throw new Error(`merge 被拒：${idA} 与 ${idB} 之间隔着内容块 ${blocker.id}（type=${blocker.item.type}），仅允许隔页面家具`);
+    throw new Error(`${opName} 被拒：${idA} 与 ${idB} 之间隔着内容块 ${blocker.id}（type=${blocker.item.type}），仅允许隔页面家具`);
   }
-  const a = items[ia]!.item;
-  const b = items[ib]!.item;
-  if (a.type !== "text" || b.type !== "text") throw new Error(`merge 仅限 text 块（实际 ${a.type} + ${b.type}）`);
-  if (typeof a.text !== "string" || typeof b.text !== "string") throw new Error("merge 的两块都必须有 text");
+  return { ia, ib, between };
+}
 
-  const head = a.text.replace(/\s+$/, "");
-  const tail = b.text.replace(/^\s+/, "");
-  // 英文断词处补一个空格（空白符不计入 C 比对，§5 白名单）；中文直接拼。
-  const glue = /[A-Za-z0-9,;]$/.test(head) && /^[A-Za-z0-9]/.test(tail) ? " " : "";
-
-  const merged: MineruItem = { ...cloneItem(items[ia]!), text: head + glue + tail };
+/** 合并类 op 共用的 bbox 并集（跨页时取并集是近似，但保证仍能回指源块区域）。 */
+function unionBbox(merged: MineruItem, a: MineruItem, b: MineruItem): void {
   if (Array.isArray(a.bbox) && Array.isArray(b.bbox) && a.bbox.length === 4 && b.bbox.length === 4) {
     merged.bbox = [
       Math.min(a.bbox[0]!, b.bbox[0]!),
@@ -47,13 +40,103 @@ function opMerge(items: RefItem[], nextId: IdGen, idA: string, idB: string): OpO
       Math.max(a.bbox[3]!, b.bbox[3]!),
     ];
   }
+}
+
+// 英文断词处补一个空格（空白符在保真白名单内，不计入 C 比对）；中文直接拼。
+function glueFor(head: string, tail: string): string {
+  return /[A-Za-z0-9,;]$/.test(head) && /^[A-Za-z0-9]/.test(tail) ? " " : "";
+}
+
+// ── merge(idA, idB)：两 text 块拼成一块（修跨页断句）。bbox=并集，page_idx 取首块。──
+function opMerge(items: RefItem[], nextId: IdGen, idA: string, idB: string): OpOutcome {
+  const { ia, ib, between } = adjacentPair("merge", items, idA, idB);
+  const a = items[ia]!.item;
+  const b = items[ib]!.item;
+  if (a.type !== "text" || b.type !== "text") throw new Error(`merge 仅限 text 块（实际 ${a.type} + ${b.type}）`);
+  if (typeof a.text !== "string" || typeof b.text !== "string") throw new Error("merge 的两块都必须有 text");
+
+  const head = a.text.replace(/\s+$/, "");
+  const tail = b.text.replace(/^\s+/, "");
+  const merged: MineruItem = { ...cloneItem(items[ia]!), text: head + glueFor(head, tail) + tail };
+  unionBbox(merged, a, b);
   const out = items.slice();
-  // merge 产一个新 ID（§4a）；A/B 之间的页面家具原位保留在合并块之后
+  // merge 按稳定 ID 规则产一个新 ID；A/B 之间的页面家具原位保留在合并块之后
   out.splice(ia, ib - ia + 1, { id: nextId(), item: merged }, ...between);
   return { items: out, removedSpans: [] };
 }
 
-// ── split(id, offset)：text 在字符 offset 处切两块。两子块继承父 bbox/page_idx（§6 一期）。──
+// ── mergeTable(idA, idB)：跨页被拆的两个表合成一个。B 的 <tr> 行按原字节追加到 A 的
+// 末行之后（A 的外壳字节原样保留）；caption/footnote 数组拼接；bbox=并集，page_idx 取首块。
+// 唯一允许的削减：B 首行与 A 首行逐字节相等（每页重印的表头）→ 去掉并留痕。──
+function opMergeTable(items: RefItem[], nextId: IdGen, idA: string, idB: string): OpOutcome {
+  const { ia, ib, between } = adjacentPair("mergeTable", items, idA, idB);
+  const a = items[ia]!.item;
+  const b = items[ib]!.item;
+  if (a.type !== "table" || b.type !== "table") throw new Error(`mergeTable 仅限 table 块（实际 ${a.type} + ${b.type}）`);
+  const aBody = typeof a.table_body === "string" ? a.table_body : "";
+  const bBody = typeof b.table_body === "string" ? b.table_body : "";
+  const aRows = tableRows(aBody);
+  let bRows = tableRows(bBody);
+  if (aRows.length === 0 || bRows.length === 0) {
+    throw new Error(`mergeTable 被拒：${aRows.length === 0 ? idA : idB} 没有表格行（空壳表应 drop，不是 merge）`);
+  }
+
+  const removedSpans: RemovedSpan[] = [];
+  if (bRows[0] === aRows[0]) {
+    removedSpans.push({ itemId: idB, text: bRows[0]!, reason: "mergeTable:dup_header" });
+    bRows = bRows.slice(1);
+  }
+  if (bRows.length === 0) throw new Error(`mergeTable 被拒：${idB} 去掉重复表头后没有剩余行，应 drop`);
+
+  // B 的行插在 A 末行的 </tr> 之后：A 外壳逐字节不动（出口行级保真闸依赖这一点）
+  const lastRowEnd = aBody.toLowerCase().lastIndexOf("</tr>") + "</tr>".length;
+  const mergedBody = aBody.slice(0, lastRowEnd) + bRows.join("") + aBody.slice(lastRowEnd);
+
+  const merged: MineruItem = { ...cloneItem(items[ia]!), table_body: mergedBody };
+  // caption/footnote 拼接（B 的字符不许丢：caption 在 C 比对内，footnote 虽不计也必须带走）
+  for (const field of ["table_caption", "table_footnote"] as const) {
+    const av = a[field];
+    const bv = b[field];
+    if (Array.isArray(bv) && bv.length > 0) {
+      merged[field] = [...(Array.isArray(av) ? av : []), ...bv];
+    }
+  }
+  unionBbox(merged, a, b);
+  const out = items.slice();
+  out.splice(ia, ib - ia + 1, { id: nextId(), item: merged }, ...between);
+  return { items: out, removedSpans };
+}
+
+// ── mergeList(idA, idB, joinSeam)：跨页被拆的两个 list 合成一个。list_items 拼接；
+// joinSeam=true 时把 A 尾项与 B 首项缝成一项（跨页断句发生在列表项中间）。──
+function opMergeList(items: RefItem[], nextId: IdGen, idA: string, idB: string, joinSeam: boolean): OpOutcome {
+  const { ia, ib, between } = adjacentPair("mergeList", items, idA, idB);
+  const a = items[ia]!.item;
+  const b = items[ib]!.item;
+  if (a.type !== "list" || b.type !== "list") throw new Error(`mergeList 仅限 list 块（实际 ${a.type} + ${b.type}）`);
+  const aItems = a.list_items;
+  const bItems = b.list_items;
+  if (!Array.isArray(aItems) || aItems.length === 0 || !Array.isArray(bItems) || bItems.length === 0) {
+    throw new Error("mergeList 的两块都必须有非空 list_items");
+  }
+
+  let mergedItems: string[];
+  if (joinSeam) {
+    const head = aItems[aItems.length - 1]!.replace(/\s+$/, "");
+    const tail = bItems[0]!.replace(/^\s+/, "");
+    mergedItems = [...aItems.slice(0, -1), head + glueFor(head, tail) + tail, ...bItems.slice(1)];
+  } else {
+    mergedItems = [...aItems, ...bItems];
+  }
+
+  const merged: MineruItem = { ...cloneItem(items[ia]!), list_items: mergedItems };
+  unionBbox(merged, a, b);
+  const out = items.slice();
+  out.splice(ia, ib - ia + 1, { id: nextId(), item: merged }, ...between);
+  return { items: out, removedSpans: [] };
+}
+
+// ── split(id, offset)：text 在字符 offset 处切两块。两子块继承父 bbox/page_idx（一期从简）。──
 function opSplit(items: RefItem[], nextId: IdGen, id: string, offset: number): OpOutcome {
   const i = mustIndexOfId(items, id);
   const it = items[i]!.item;
@@ -116,8 +199,21 @@ function opReorder(items: RefItem[], idsInOrder: string[]): OpOutcome {
   return { items: out, removedSpans: [] };
 }
 
-// ── drop(id)：删页码/页眉/页脚/水印。白名单：type=page_number，或短 text/header（≤120 内容字符）。──
+// ── drop(id)：删页码/页眉/页脚/水印/空壳表。白名单：type=page_number、
+// 短 text/header（≤120 内容字符）、或零内容空壳表。──
 const DROP_MAX_CHARS = 120;
+
+/** 零内容空壳表：无表格行、无 caption/footnote 字符、无图（MinerU 跨页合并后留下的占位）。 */
+export function isEmptyTableHusk(it: MineruItem): boolean {
+  if (it.type !== "table") return false;
+  if (typeof it.table_body === "string" && tableRows(it.table_body).length > 0) return false;
+  if (typeof it.img_path === "string" && it.img_path.length > 0) return false;
+  for (const field of ["table_caption", "table_footnote"] as const) {
+    const v = it[field];
+    if (Array.isArray(v) && v.some((s) => typeof s === "string" && nonWs(s).length > 0)) return false;
+  }
+  return true;
+}
 
 function opDrop(items: RefItem[], id: string, droppableIds?: ReadonlySet<string>): OpOutcome {
   const i = mustIndexOfId(items, id);
@@ -127,15 +223,16 @@ function opDrop(items: RefItem[], id: string, droppableIds?: ReadonlySet<string>
     (it.type === "text" || it.type === "header") &&
     typeof it.text === "string" &&
     nonWs(it.text).length <= DROP_MAX_CHARS;
-  if (!isPageNumber && !isShortText) {
-    throw new Error(`drop 白名单不命中：${id}（type=${it.type}）只允许删页码或 ≤${DROP_MAX_CHARS} 字的短文本`);
+  const isHusk = isEmptyTableHusk(it);
+  if (!isPageNumber && !isShortText && !isHusk) {
+    throw new Error(`drop 白名单不命中：${id}（type=${it.type}）只允许删页码、≤${DROP_MAX_CHARS} 字的短文本或零内容空壳表`);
   }
   if (droppableIds && !droppableIds.has(id)) {
-    throw new Error(`drop 被拒：${id} 未被探测器标记为 page_artifact 疑点`);
+    throw new Error(`drop 被拒：${id} 未被探测器标记为 page_artifact/empty_table 疑点`);
   }
   const out = items.slice();
   out.splice(i, 1);
-  const removed = typeof it.text === "string" ? it.text : `[${it.type}]`;
+  const removed = typeof it.text === "string" && it.text ? it.text : `[${it.type}]`;
   return { items: out, removedSpans: [{ itemId: id, text: removed, reason: "drop" }] };
 }
 
@@ -189,7 +286,7 @@ function opStrip(items: RefItem[], id: string, pattern: StripPattern): OpOutcome
 
 export type ApplyContext = {
   nextId: IdGen;
-  /** 探测器当前标记为 page_artifact 的 id 集；提供时 drop 必须命中（双保险）。 */
+  /** 探测器当前标记为 page_artifact/empty_table 的 id 集；提供时 drop 必须命中（双保险）。 */
   droppableIds?: ReadonlySet<string>;
   /** 输入文档的页集合（几何校验基准）。 */
   validPages: ReadonlySet<number>;
@@ -226,6 +323,12 @@ export function applyOpChecked(items: RefItem[], call: OpCall, ctx: ApplyContext
       case "strip":
         outcome = opStrip(items, call.id, call.pattern);
         break;
+      case "mergeTable":
+        outcome = opMergeTable(items, ctx.nextId, call.idA, call.idB);
+        break;
+      case "mergeList":
+        outcome = opMergeList(items, ctx.nextId, call.idA, call.idB, call.joinSeam ?? false);
+        break;
       default:
         return { ok: false, reason: `未知 op: ${(call as { op: string }).op}`, kind: "invalid_args" };
     }
@@ -233,7 +336,7 @@ export function applyOpChecked(items: RefItem[], call: OpCall, ctx: ApplyContext
     return { ok: false, reason: (e as Error).message, kind: "invalid_args" };
   }
 
-  // 保真闸（§5）：drop/strip 是有意削减，字符子集天然成立；闸门防的是 op 实现 bug 与几何破坏。
+  // 保真闸：drop/strip 是有意削减，字符子集天然成立；闸门防的是 op 实现 bug 与几何破坏。
   const fidelity = checkFidelity(items, outcome.items, ctx.validPages);
   if (!fidelity.ok) {
     return { ok: false, reason: fidelity.reason, kind: "fidelity_violation" };

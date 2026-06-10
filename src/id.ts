@@ -1,4 +1,4 @@
-// 内部稳定 ID（SPEC §4a）：入口分配，op 按规则产新/继承，出口剥除。
+// 内部稳定 ID：入口分配，op 按规则产新/继承，出口剥除。
 // 绝不用 array index 跨 op 寻址。
 
 import type { MineruItem, RefItem } from "./types.ts";
@@ -17,7 +17,7 @@ export function assignIds(items: MineruItem[]): { ref: RefItem[]; nextId: IdGen 
   return { ref, nextId };
 }
 
-/** 出口：剥除内部 ID，返回纯 MinerU schema（§2 透明性）。 */
+/** 出口：剥除内部 ID，返回纯 MinerU schema（schema 透明性）。 */
 export function stripIds(ref: RefItem[]): MineruItem[] {
   return ref.map((r) => structuredClone(r.item));
 }

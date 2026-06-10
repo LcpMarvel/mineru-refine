@@ -1,4 +1,4 @@
-// 保真不变式单测（SPEC §5 / §13.2-3-5）。
+// 保真不变式单测。
 
 import { describe, expect, test } from "bun:test";
 import { assignIds } from "../src/id.ts";
@@ -83,5 +83,35 @@ describe("checkFidelity 组合", () => {
   });
   test("inputPages 收集页集合", () => {
     expect([...inputPages([{ type: "text", page_idx: 0 }, { type: "text", page_idx: 2 }])]).toEqual([0, 2]);
+  });
+});
+
+describe("checkTableBodies 行级路径（mergeTable 产物）", () => {
+  const bodyA = "<table><tbody>\n<tr><td>表头</td></tr>\n<tr><td>甲</td></tr>\n</tbody></table>";
+  const bodyB = "<table><tbody><tr><td>乙</td></tr></tbody></table>";
+  const tin = [
+    { type: "table", table_body: bodyA } as MineruItem,
+    { type: "table", table_body: bodyB } as MineruItem,
+  ];
+
+  test("合法合并（A 外壳 + A 行 ++ B 行）→ pass；去掉重复行（⊆）也 pass", () => {
+    const merged = "<table><tbody>\n<tr><td>表头</td></tr>\n<tr><td>甲</td></tr><tr><td>乙</td></tr>\n</tbody></table>";
+    expect(checkTableBodies(tin, [{ type: "table", table_body: merged } as MineruItem]).ok).toBe(true);
+    // 少一行（如重复表头被去）仍是子集 → pass
+    const fewer = "<table><tbody>\n<tr><td>表头</td></tr>\n<tr><td>乙</td></tr>\n</tbody></table>";
+    expect(checkTableBodies(tin, [{ type: "table", table_body: fewer } as MineruItem]).ok).toBe(true);
+  });
+
+  test("行内字节被篡改 → fail；行外（外壳）被篡改 → fail；行重复消费 → fail", () => {
+    const tamperedRow = "<table><tbody>\n<tr><td>表头！</td></tr>\n<tr><td>甲</td></tr><tr><td>乙</td></tr>\n</tbody></table>";
+    expect(checkTableBodies(tin, [{ type: "table", table_body: tamperedRow } as MineruItem]).ok).toBe(false);
+    const tamperedShell = "<table class=x><tbody>\n<tr><td>表头</td></tr>\n<tr><td>甲</td></tr><tr><td>乙</td></tr>\n</tbody></table>";
+    expect(checkTableBodies(tin, [{ type: "table", table_body: tamperedShell } as MineruItem]).ok).toBe(false);
+    // 同一输入行被两个输出表消费 → 第二次 fail
+    const dupUse = [
+      { type: "table", table_body: bodyB } as MineruItem,
+      { type: "table", table_body: "<table><tbody><tr><td>乙</td></tr><tr><td>甲</td></tr></tbody></table>" } as MineruItem,
+    ];
+    expect(checkTableBodies(tin, dupUse).ok).toBe(false);
   });
 });

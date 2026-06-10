@@ -1,4 +1,4 @@
-// 确定性外层循环（SPEC §7/§10）：弹出 worklist 疑点 → 交 LLM（带上下文）→
+// 确定性外层循环：弹出 worklist 疑点 → 交 LLM（带上下文）→
 // LLM 回一个 op 或 dismiss → 执行（保真闸+回滚）→ 重探测。loop-until-dry + 守卫。
 // LLM 不当司机：每个疑点一个独立小对话，工具集固定，tool_choice:required。
 
@@ -7,11 +7,15 @@ import { chat, type ChatResult, type Message, type Tool, type ToolCall } from ".
 import { detect, droppableIds } from "./detect.ts";
 import type { IdGen } from "./id.ts";
 import { mustIndexOfId, indexOfId } from "./id.ts";
-import { inputPages } from "./invariant.ts";
+import { inputPages, tableRows } from "./invariant.ts";
 import { applyOpChecked } from "./ops/index.ts";
+import { judgeSplitTable, type VisionJudgeFn } from "./qwen_vl.ts";
 import type { OpCall, RefItem, RemovedSpan, StripPattern, WorkItem } from "./types.ts";
 
 export type ChatFn = typeof chat;
+
+/** 只读图片访问器：imgPath 是 content_list 里的相对路径（如 images/xxx.jpg），取不到回 null。 */
+export type LoadImageFn = (imgPath: string) => Promise<Uint8Array | null>;
 
 export type LoopResult = {
   items: RefItem[];
@@ -24,10 +28,12 @@ export type LoopResult = {
 };
 
 export type LoopOptions = {
-  maxIterations?: number; // 外层硬上限（§10）
+  maxIterations?: number; // 外层硬上限（防永不终止的守卫）
   maxRoundsPerSuspect?: number; // 单疑点内层对话轮数上限
   concurrency?: number; // 同批并行裁决的疑点数（1 = 严格串行）
   chatFn?: ChatFn; // 依赖注入，测试用 mock
+  loadImage?: LoadImageFn; // 提供时 split_table 优先走视觉裁决（取不到图/视觉失败 → 回退文本路径）
+  visionFn?: VisionJudgeFn; // 依赖注入，测试用 mock（默认 Qwen-VL 裸 API）
   log?: (msg: string) => void;
 };
 
@@ -35,7 +41,7 @@ const DEFAULT_MAX_ITERATIONS = 48;
 const DEFAULT_MAX_ROUNDS = 8;
 const DEFAULT_CONCURRENCY = 8;
 
-// ── 工具定义（§8 全集 → DeepSeek function schema）──
+// ── 工具定义（op 全集 → DeepSeek function schema）──
 
 const idParam = { type: "string", description: "item 的稳定 ID（如 it_0003），来自疑点描述或观察工具" };
 
@@ -176,12 +182,42 @@ export const TOOLS: Tool[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "mergeTable",
+      description:
+        "把跨页被拆的两个 table 合成一个：B 的表格行原样追加到 A 之后，caption 拼接。idB 须在 idA 之后，中间只允许隔页眉/页码/页脚。仅当确认两表是【同一张表】被分页拆开（看 A 末行与 B 首行的内容连续性、列结构；列数不等可能是 rowspan 跨页携带，不能仅凭列数否定）。B 首行若与 A 表头逐字节相同（每页重印表头）会被自动去重。",
+      parameters: {
+        type: "object",
+        properties: { idA: { ...idParam, description: "前表 ID" }, idB: { ...idParam, description: "续表 ID" } },
+        required: ["idA", "idB"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "mergeList",
+      description:
+        "把跨页被拆的两个 list 合成一个（list_items 拼接）。idB 须在 idA 之后，中间只允许隔页眉/页码/页脚。若 A 的尾项在页边界被截断、B 的首项是它的延续（尾项无句末标点且首项非新条目特征），传 joinSeam=true 把两项缝成一项。",
+      parameters: {
+        type: "object",
+        properties: {
+          idA: { ...idParam, description: "前 list ID" },
+          idB: { ...idParam, description: "续 list ID" },
+          joinSeam: { type: "boolean", description: "A 尾项与 B 首项是否缝成一项（断句跨页时 true），默认 false" },
+        },
+        required: ["idA", "idB"],
+      },
+    },
+  },
 ];
 
-const OP_NAMES = new Set(["merge", "split", "demote", "promote", "reorder", "drop", "strip"]);
+const OP_NAMES = new Set(["merge", "split", "demote", "promote", "reorder", "drop", "strip", "mergeTable", "mergeList"]);
 const OBSERVE_NAMES = new Set(["outline", "getItems", "whyFlagged", "peekPage"]);
 
-// system prompt 稳定不变（放 messages 前缀吃 DeepSeek prefix cache，§11）。
+// system prompt 稳定不变（放 messages 前缀吃 DeepSeek prefix cache）。
 const SYSTEM_PROMPT = `你是 MinerU PDF 解析结果的结构修复器（linter/fixer）。文档被解析成块（item）数组，每块有稳定 ID、类型（text/header/table/list/page_number/image）、页码 page_idx 和文本。
 
 你的任务：对【当前疑点】做一次裁决。你只能调用工具，绝不输出正文文本。
@@ -194,7 +230,8 @@ const SYSTEM_PROMPT = `你是 MinerU PDF 解析结果的结构修复器（linter
    - 列表项（-、•、①、(1) 等开头的行）之间绝不 merge——行尾无标点是列表的常态，不是断句。
    - 但 page_artifact 证据若给出「已分类页眉/页脚同文佐证」，说明同文块在别处已被正确分类为页面家具，该块就是漏标的同款 → 应 drop，不要因「像标题」而 dismiss。
    - 同一文本的多处 page_artifact 疑点应裁决一致：要删都删，不要删一处留其余。
-4. 修复只许削减/重组（merge/split/demote/promote/reorder/drop/strip），系统会机器校验"不新增任何字符"，违规会被自动回滚。
+   - 跨页拆表裁决看【内容】而非形式：B 无 caption、B 首行像 A 末行的延续（如首格为空、序号接续）→ 同一张表 → mergeTable；两表各有独立 caption/表头主题不同 → 不同表 → dismiss。
+4. 修复只许削减/重组（merge/split/demote/promote/reorder/drop/strip/mergeTable/mergeList），系统会机器校验"不新增任何字符、表格行不被篡改"，违规会被自动回滚。
 5. 每个疑点最终以【一个】变更 op 或 dismiss 收尾。`;
 
 // ── 观察工具实现（确定性，只读）──
@@ -209,7 +246,19 @@ function fmtItem(r: RefItem, maxText = 600): string {
   }
   if (Array.isArray(it.list_items)) fields.push(`list_items=${JSON.stringify(it.list_items).slice(0, 300)}`);
   if (Array.isArray(it.table_caption)) fields.push(`table_caption=${JSON.stringify(it.table_caption)}`);
-  if (typeof it.table_body === "string") fields.push(`table_body=(${it.table_body.length} bytes HTML，不可修改)`);
+  if (typeof it.table_body === "string") {
+    // 表格只给首末行摘要：足够判断跨页连续性（mergeTable），又不撑爆上下文
+    const rows = tableRows(it.table_body);
+    if (rows.length === 0) {
+      fields.push(`table_body=(空壳，0 行)`);
+    } else {
+      const summary =
+        rows.length === 1
+          ? `首行「${rows[0]!.slice(0, 200)}」`
+          : `首行「${rows[0]!.slice(0, 200)}」 末行「${rows[rows.length - 1]!.slice(0, 200)}」`;
+      fields.push(`table_body=(${rows.length} 行) ${summary}`);
+    }
+  }
   if (typeof it.img_path === "string") fields.push(`img_path=${it.img_path}`);
   return fields.join(" | ");
 }
@@ -274,12 +323,16 @@ function toOpCall(name: string, args: Record<string, unknown>): OpCall {
       return { op: "drop", id: String(args.id) };
     case "strip":
       return { op: "strip", id: String(args.id), pattern: String(args.pattern) as StripPattern };
+    case "mergeTable":
+      return { op: "mergeTable", idA: String(args.idA), idB: String(args.idB) };
+    case "mergeList":
+      return { op: "mergeList", idA: String(args.idA), idB: String(args.idB), joinSeam: Boolean(args.joinSeam) };
     default:
       throw new Error(`未知 op: ${name}`);
   }
 }
 
-/** 防震荡（§10）：禁止刚做过的逆操作。merge 产物禁 split；split 产物对禁 merge。 */
+/** 防震荡：禁止刚做过的逆操作。merge 产物禁 split；split 产物对禁 merge。 */
 class OscillationGuard {
   private bannedSplitIds = new Set<string>(); // merge 产物
   private bannedMergePairs = new Set<string>(); // split 产物对 "idA+idB"
@@ -317,7 +370,7 @@ export async function runLoop(initial: RefItem[], nextId: IdGen, opts: LoopOptio
   // → 替换 state.items）是原子的；并行对话间的冲突（目标 ID 已被别的 op 吃掉）表现为
   // invalid_args，作为工具结果反馈给 LLM，由它改判或 dismiss。
   const state = { items: initial };
-  const dismissedKeys = new Set<string>(); // 误报裁决集（§10 防永不终止）
+  const dismissedKeys = new Set<string>(); // 误报裁决集（防永不终止）
   const guard = new OscillationGuard();
   const opCounts: Record<string, number> = {};
   const removedSpans: RemovedSpan[] = [];
@@ -336,7 +389,17 @@ export async function runLoop(initial: RefItem[], nextId: IdGen, opts: LoopOptio
     const batch = actionable.slice(0, Math.min(concurrency, maxIterations - iterations));
     iterations += batch.length;
 
-    const ctx = { nextId, validPages, chatFn, maxRounds, guard, tokenUsage, log };
+    const ctx = {
+      nextId,
+      validPages,
+      chatFn,
+      maxRounds,
+      guard,
+      tokenUsage,
+      log,
+      loadImage: opts.loadImage,
+      visionFn: opts.visionFn ?? judgeSplitTable,
+    };
     const llmErrors: Error[] = [];
     await Promise.all(
       batch.map(async (target) => {
@@ -362,11 +425,11 @@ export async function runLoop(initial: RefItem[], nextId: IdGen, opts: LoopOptio
         }
       }),
     );
-    // LLM 整体不可用（全程一次都没成功过）→ 上抛，由 refine() fail-open（§2 失败行为）
+    // LLM 整体不可用（全程一次都没成功过）→ 上抛，由 refine() fail-open（原样返回输入）
     if (llmErrors.length > 0 && llmSuccesses === 0) throw llmErrors[0];
   }
 
-  if (iterations >= maxIterations) log(`到达 maxIterations=${maxIterations}，强停（§10）`);
+  if (iterations >= maxIterations) log(`到达 maxIterations=${maxIterations}，守卫强停`);
 
   return {
     items: state.items,
@@ -383,36 +446,100 @@ type SuspectOutcome =
   | { kind: "applied"; opName: string; removedSpans: RemovedSpan[] }
   | { kind: "dismissed"; reason: string; violations: number };
 
+type SuspectCtx = {
+  nextId: IdGen;
+  validPages: ReadonlySet<number>;
+  chatFn: ChatFn;
+  maxRounds: number;
+  guard: OscillationGuard;
+  tokenUsage: { prompt: number; completion: number };
+  log: (m: string) => void;
+  loadImage?: LoadImageFn;
+  visionFn: VisionJudgeFn;
+};
+
+/**
+ * split_table 的视觉裁决（优先路径）：把 A/B 两表的 MinerU 裁剪图交给 Qwen-VL 判
+ * "是否同一张表被分页拆开"。仅输出决策，merge 仍走 applyOpChecked 保真闸。
+ * 返回 null = 此路不通（无图/无 key/判决 op 被闸门拒），回退文本路径，绝不阻塞。
+ */
+async function tryVisionVerdict(
+  target: WorkItem,
+  state: { items: RefItem[] },
+  worklist: WorkItem[],
+  ctx: SuspectCtx,
+): Promise<SuspectOutcome | null> {
+  if (target.kind !== "split_table" || !ctx.loadImage) return null;
+  const idA = target.itemId;
+  const idB = /后块=(it_\d+)/.exec(target.evidence)?.[1];
+  if (!idB) return null;
+
+  const ia = indexOfId(state.items, idA);
+  const ib = indexOfId(state.items, idB);
+  if (ia < 0 || ib < 0) return null; // 块已被并行对话吃掉，交给文本路径按最新状态裁
+  const pathA = state.items[ia]!.item.img_path;
+  const pathB = state.items[ib]!.item.img_path;
+  if (typeof pathA !== "string" || !pathA || typeof pathB !== "string" || !pathB) return null;
+
+  let outcome: SuspectOutcome | null = null;
+  try {
+    const [imgA, imgB] = await Promise.all([ctx.loadImage(pathA), ctx.loadImage(pathB)]);
+    if (!imgA || !imgB) return null;
+    const v = await ctx.visionFn(imgA, imgB);
+    ctx.tokenUsage.prompt += v.usage.prompt_tokens;
+    ctx.tokenUsage.completion += v.usage.completion_tokens;
+
+    if (v.verdict === "dismiss") {
+      ctx.log(`视觉 dismiss [split_table] ${idA}+${idB}: ${v.reason}`);
+      outcome = { kind: "dismissed", reason: "llm_dismiss", violations: 0 };
+    } else {
+      const result = applyOpChecked(state.items, { op: "mergeTable", idA, idB }, {
+        nextId: ctx.nextId,
+        validPages: ctx.validPages,
+        droppableIds: droppableIds(worklist),
+      });
+      if (result.ok) {
+        state.items = result.items;
+        ctx.log(`视觉 mergeTable ${idA}+${idB}: ${v.reason}`);
+        outcome = { kind: "applied", opName: "mergeTable", removedSpans: result.removedSpans };
+      } else {
+        ctx.log(`视觉判 merge 但 op 被拒（${result.reason}），回退文本路径`);
+      }
+    }
+  } catch (e) {
+    ctx.log(`视觉裁决失败（${(e as Error).message}），回退文本路径`);
+  }
+  return outcome;
+}
+
 async function handleSuspect(
   target: WorkItem,
   state: { items: RefItem[] },
   worklist: WorkItem[],
-  ctx: {
-    nextId: IdGen;
-    validPages: ReadonlySet<number>;
-    chatFn: ChatFn;
-    maxRounds: number;
-    guard: OscillationGuard;
-    tokenUsage: { prompt: number; completion: number };
-    log: (m: string) => void;
-  },
+  ctx: SuspectCtx,
 ): Promise<SuspectOutcome> {
+  const visionOutcome = await tryVisionVerdict(target, state, worklist, ctx);
+  if (visionOutcome) return visionOutcome;
+
   const OP_HINTS: Partial<Record<WorkItem["kind"], string>> = {
     pseudo_heading: "确认是被误判的正文 → demote；确认是真标题 → dismiss",
     cross_page_break: "确认上下页内容连续 → merge；不连续 → dismiss",
     giant_block: "找到自然边界 → split；本就是一整段 → dismiss",
     page_artifact: "确认是页码/页眉/页脚/水印（非正文）→ drop；是正文 → dismiss。证据含「家具佐证」的基本可直接 drop",
     residual_markup: "确认是解析残留 → strip（选对 pattern：$...$ 用 latex_dollar、裸 \\命令{} 用 latex_command、\\$ 用 escaped_dollar）；本就该有 → dismiss",
+    empty_table: "确认是零内容空壳（无行无字无图）→ drop；探测器已验证为空，一般可直接 drop",
+    split_table: "确认两表是同一张被分页拆开（B 无独立 caption、内容/序号接续；列数不等可能是 rowspan 跨页携带或某页尾列全空被 MinerU 略去）→ mergeTable；是两张不同的表 → dismiss",
+    split_list: "确认两 list 是同一列表被分页拆开 → mergeList（A 尾项被截断、B 首项是其延续时 joinSeam=true）；各自独立 → dismiss",
   };
 
   // 上下文前置：把裁决最可能需要的观察结果直接放进首条消息，省掉 1-2 轮观察往返。
   // 跨页疑点预载整页上下文（等价 peekPage），其余预载 ±2 邻居（等价 getItems）。
+  const CROSS_PAGE_KINDS = new Set<WorkItem["kind"]>(["cross_page_break", "split_table", "split_list"]);
   let preload = "";
   try {
-    preload =
-      target.kind === "cross_page_break"
-        ? `所在页及上下页内容（peekPage 预载）：\n${execObserve("peekPage", { id: target.itemId }, state.items, worklist)}`
-        : `相邻上下文（getItems ±2 预载）：\n${execObserve("getItems", { id: target.itemId, before: 2, after: 2 }, state.items, worklist)}`;
+    preload = CROSS_PAGE_KINDS.has(target.kind)
+      ? `所在页及上下页内容（peekPage 预载）：\n${execObserve("peekPage", { id: target.itemId }, state.items, worklist)}`
+      : `相邻上下文（getItems ±2 预载）：\n${execObserve("getItems", { id: target.itemId, before: 2, after: 2 }, state.items, worklist)}`;
   } catch {
     preload = "（目标块已不存在，无法预载上下文）";
   }
@@ -441,7 +568,7 @@ async function handleSuspect(
         content: "观察轮数即将用完。请基于已有信息【现在就裁决】：给出一个变更 op，或拿不准就 dismiss。不要再调用观察工具。",
       });
     }
-    // LLM 异常直接上抛，由 refine() 的 fail-open 兜（§2 失败行为）
+    // LLM 异常直接上抛，由 refine() 的 fail-open 兜（原样返回输入）
     const r: ChatResult = await ctx.chatFn(messages, TOOLS, { toolChoice: "required" });
     ctx.tokenUsage.prompt += r.usage?.prompt_tokens ?? 0;
     ctx.tokenUsage.completion += r.usage?.completion_tokens ?? 0;
@@ -477,7 +604,7 @@ async function handleSuspect(
       }
 
       if (OP_NAMES.has(name)) {
-        // 无 op 的标记类疑点（D5）只能 dismiss——但变更类 op 若合法依然允许（LLM 可能顺手修别的可修项？不：钉死单疑点单 op 语义，仍执行闸门校验即可）
+        // 无 op 的标记类疑点（只标记不处理）只能 dismiss——但变更类 op 若合法依然允许（LLM 可能顺手修别的可修项？不：钉死单疑点单 op 语义，仍执行闸门校验即可）
         let opCall: OpCall;
         try {
           opCall = toOpCall(name, args);

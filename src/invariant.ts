@@ -1,10 +1,10 @@
-// 保真不变式（SPEC §5）：C_out ⊆ C_in（非空白内容字符多重集），
-// table_body 逐字节相等（多重集包含），几何可定位（§6）。
+// 保真不变式：C_out ⊆ C_in（非空白内容字符多重集），
+// table_body 逐字节相等（多重集包含；mergeTable 产物降级为行级逐字节），几何可定位。
 // 每个 op 后调用一次（违反→回滚），出口处对整篇再调用一次（违反→fail-open）。
 
 import type { MineruItem, RefItem } from "./types.ts";
 
-/** "内容字符" = text + list_items 拼接 + table_caption 拼接，仅计非空白字符（§5）。 */
+/** "内容字符" = text + list_items 拼接 + table_caption 拼接，仅计非空白字符。 */
 export function contentChars(items: readonly (MineruItem | RefItem)[]): Map<string, number> {
   const counts = new Map<string, number>();
   for (const entry of items) {
@@ -44,29 +44,71 @@ export function checkCharSubset(
   return { ok: true };
 }
 
-/** 未被 drop 的 table_body 逐字节相等：输出 table_body 多重集 ⊆ 输入多重集（§5）。 */
+/** table_body 的 <tr>…</tr> 行序列（MinerU 表格不嵌套，非贪婪匹配安全）。 */
+export function tableRows(body: string): string[] {
+  return body.match(/<tr[\s\S]*?<\/tr>/gi) ?? [];
+}
+
+/** table_body 去掉所有行后的"外壳"（<table>/<tbody> 包装等行外字节）。 */
+export function tableShell(body: string): string {
+  return body.replace(/<tr[\s\S]*?<\/tr>/gi, "");
+}
+
+function takeFromPool(pool: Map<string, number>, key: string): boolean {
+  const n = pool.get(key) ?? 0;
+  if (n <= 0) return false;
+  pool.set(key, n - 1);
+  return true;
+}
+
+/**
+ * 未被 drop 的 table_body 逐字节相等（多重集 ⊆）；唯一例外是 mergeTable 产物——
+ * 它必须能被行级证明：每个 <tr> 行逐字节来自输入行池、行外"外壳"逐字节命中某个输入外壳
+ * （即除"把若干输入行按原字节拼进某个输入表"外，没有任何字节被改动）。
+ */
 export function checkTableBodies(
   before: readonly (MineruItem | RefItem)[],
   after: readonly (MineruItem | RefItem)[],
 ): FidelityResult {
-  const pool = new Map<string, number>();
-  for (const entry of before) {
-    const item: MineruItem = "item" in entry ? (entry as RefItem).item : (entry as MineruItem);
-    if (typeof item.table_body === "string") pool.set(item.table_body, (pool.get(item.table_body) ?? 0) + 1);
+  const bodies = (entries: readonly (MineruItem | RefItem)[]) =>
+    entries
+      .map((e) => ("item" in e ? (e as RefItem).item : (e as MineruItem)).table_body)
+      .filter((b): b is string => typeof b === "string");
+
+  // 第一遍：整表逐字节撮合，被命中的输入表视为已消费
+  const inputPool = new Map<string, number>();
+  for (const b of bodies(before)) inputPool.set(b, (inputPool.get(b) ?? 0) + 1);
+  const unmatched: string[] = [];
+  for (const b of bodies(after)) {
+    if (!takeFromPool(inputPool, b)) unmatched.push(b);
   }
-  for (const entry of after) {
-    const item: MineruItem = "item" in entry ? (entry as RefItem).item : (entry as MineruItem);
-    if (typeof item.table_body !== "string") continue;
-    const n = pool.get(item.table_body) ?? 0;
-    if (n <= 0) {
-      return { ok: false, reason: `table_body 被篡改：输出中存在输入里没有的 table_body（前 80 字: ${item.table_body.slice(0, 80)}）` };
+  if (unmatched.length === 0) return { ok: true };
+
+  // 第二遍（mergeTable 产物）：行/外壳池只从【未被消费】的输入表构建——
+  // 防止同一输入行被"整表命中"和"行级命中"双重消费
+  const rowPool = new Map<string, number>();
+  const shellPool = new Map<string, number>();
+  for (const [body, n] of inputPool) {
+    for (let k = 0; k < n; k++) {
+      for (const row of tableRows(body)) rowPool.set(row, (rowPool.get(row) ?? 0) + 1);
+      const shell = tableShell(body);
+      shellPool.set(shell, (shellPool.get(shell) ?? 0) + 1);
     }
-    pool.set(item.table_body, n - 1);
+  }
+  for (const body of unmatched) {
+    if (!takeFromPool(shellPool, tableShell(body))) {
+      return { ok: false, reason: `table_body 被篡改：行外字节与所有输入表外壳都不符（前 80 字: ${body.slice(0, 80)}）` };
+    }
+    for (const row of tableRows(body)) {
+      if (!takeFromPool(rowPool, row)) {
+        return { ok: false, reason: `table_body 被篡改：输出中存在输入里没有的表格行（前 80 字: ${row.slice(0, 80)}）` };
+      }
+    }
   }
   return { ok: true };
 }
 
-/** 几何可定位（§6 软检查的硬化版）：bbox 为 4 个有限数、page_idx 落在输入页集合内。 */
+/** 几何可定位（软检查的硬化版）：bbox 为 4 个有限数、page_idx 落在输入页集合内。 */
 export function checkGeometry(
   after: readonly RefItem[],
   validPages: ReadonlySet<number>,

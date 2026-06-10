@@ -74,7 +74,7 @@ describe("观察工具往返", () => {
   });
 });
 
-describe("防震荡（§10）", () => {
+describe("防震荡", () => {
   test("merge 产物立刻被 split 拒绝，LLM 收到拒绝后 dismiss", async () => {
     const { ref, nextId } = assignIds(goldenInput());
     const rejections: string[] = [];

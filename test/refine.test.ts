@@ -1,10 +1,10 @@
-// M5：eval 六件套（SPEC §13）+ fail-open + 缓存 + schema 透明性。LLM 全程 mock，不打真 API。
+// eval 六件套 + fail-open + 缓存 + schema 透明性。LLM 全程 mock，不打真 API。
 
 import { beforeEach, describe, expect, test } from "bun:test";
 import { assignIds } from "../src/id.ts";
 import { detect } from "../src/detect.ts";
 import { checkCharSubset, checkTableBodies } from "../src/invariant.ts";
-import { clearRefineCache, refine } from "../src/refine.ts";
+import { adaptiveMaxIterations, clearRefineCache, refine } from "../src/refine.ts";
 import type { MineruItem } from "../src/types.ts";
 import { bbox, explodingChat, goldenExpected, goldenInput, makeMockChat } from "./helpers.ts";
 
@@ -18,7 +18,7 @@ describe("① golden fixtures", () => {
     expect(r.items).toEqual(goldenExpected());
     expect(r.report.opCounts).toEqual({ demote: 1, merge: 1, drop: 1, strip: 1 });
     expect(r.report.removedSpans.map((s) => s.reason).sort()).toEqual(["drop", "strip:md_link"]);
-    expect(r.provenance).toEqual([]); // D4=(c) 恒为空
+    expect(r.provenance).toEqual([]); // 纯削减模式下恒为空
   });
 });
 
@@ -75,7 +75,7 @@ describe("⑥ 幂等", () => {
   });
 });
 
-describe("fail-open（§2 失败行为）", () => {
+describe("fail-open（异常时原样返回输入）", () => {
   test("LLM 不可用 → 原样返回输入 + failOpen=true", async () => {
     const input = goldenInput();
     const r = await refine(input, { chatFn: explodingChat(), log: () => {} });
@@ -97,7 +97,7 @@ describe("fail-open（§2 失败行为）", () => {
   });
 });
 
-describe("缓存（§2：sha256 + 逻辑/模型/prompt 版本）", () => {
+describe("缓存（sha256 + 逻辑/模型/prompt 版本）", () => {
   test("同 sha256 第二次命中缓存，不再跑 loop", async () => {
     const mock1 = makeMockChat();
     const r1 = await refine(goldenInput(), { chatFn: mock1, sha256: "abc123" });
@@ -115,7 +115,7 @@ describe("缓存（§2：sha256 + 逻辑/模型/prompt 版本）", () => {
   });
 });
 
-describe("schema 透明性（§2/§4a）", () => {
+describe("schema 透明性", () => {
   test("输出不掺内部字段，未知字段原样透传，输入不被突变", async () => {
     const input: MineruItem[] = goldenInput();
     (input[0] as Record<string, unknown>).some_future_field = { x: 1 }; // MinerU 未来新增字段
@@ -138,7 +138,7 @@ describe("schema 透明性（§2/§4a）", () => {
   });
 });
 
-describe("守卫（§10）", () => {
+describe("守卫", () => {
   test("maxIterations 强停后仍走出口闸门", async () => {
     // mock 永远 dismiss 不掉：每次都给非法 op → 疑点被搁置进 dismissed 集，循环必然收敛
     const r = await refine(goldenInput(), { chatFn: makeMockChat(), maxIterations: 2, log: () => {} });
@@ -159,5 +159,189 @@ describe("并发容错", () => {
     expect(r.report.failOpen).toBe(false);
     expect(r.report.opCounts).toEqual({ demote: 1, drop: 1, strip: 1 }); // merge 缺席
     expect(r.report.dismissed).toBe(1); // 故障疑点被搁置
+  });
+});
+
+describe("跨页表格/列表（端到端，mock LLM）", () => {
+  /** 真实形态复刻：前表(p0) + 家具 + 续表(p1) + 空壳(p2) + 拆开的 list(p2/p3)。 */
+  function splitDocInput(): MineruItem[] {
+    return [
+      {
+        type: "table",
+        table_body: "<table><tbody><tr><td>序号</td><td>事项</td></tr><tr><td>1</td><td>启动</td></tr></tbody></table>",
+        table_caption: ["表1 安排"],
+        page_idx: 0,
+        bbox: [50, 100, 550, 800],
+      },
+      { type: "page_number", text: "1", page_idx: 0, bbox: bbox(820) },
+      { type: "header", text: "页眉", page_idx: 1, bbox: bbox(10) },
+      {
+        type: "table",
+        table_body: "<table><tbody><tr><td>2</td><td>评审</td></tr></tbody></table>",
+        table_caption: [],
+        page_idx: 1,
+        bbox: [50, 80, 550, 300],
+      },
+      { type: "table", img_path: "", table_caption: [], table_footnote: [], page_idx: 2, bbox: bbox(80) }, // 空壳
+      { type: "list", list_items: ["甲", "乙"], page_idx: 2, bbox: [50, 200, 550, 800] },
+      { type: "list", list_items: ["丙"], page_idx: 3, bbox: [50, 80, 550, 160] },
+    ];
+  }
+
+  test("mergeTable + 空壳 drop + mergeList 全链路，行级保真闸过、出口闸过", async () => {
+    const input = splitDocInput();
+    const r = await refine(input, { chatFn: makeMockChat() });
+    expect(r.report.failOpen).toBe(false);
+    expect(r.report.opCounts).toEqual({ mergeTable: 1, drop: 1, mergeList: 1 });
+
+    const tables = r.items.filter((it) => it.type === "table");
+    expect(tables).toHaveLength(1);
+    expect(tables[0]!.table_body).toBe(
+      "<table><tbody><tr><td>序号</td><td>事项</td></tr><tr><td>1</td><td>启动</td></tr><tr><td>2</td><td>评审</td></tr></tbody></table>",
+    );
+    expect(tables[0]!.table_caption).toEqual(["表1 安排"]);
+    expect(tables[0]!.page_idx).toBe(0);
+
+    const lists = r.items.filter((it) => it.type === "list");
+    expect(lists).toHaveLength(1);
+    expect(lists[0]!.list_items).toEqual(["甲", "乙", "丙"]);
+
+    // 家具原位保留；空壳 drop 留痕
+    expect(r.items.filter((it) => it.type === "page_number" || it.type === "header")).toHaveLength(2);
+    expect(r.report.removedSpans).toContainEqual({ itemId: "it_0005", text: "[table]", reason: "drop" });
+
+    expect(checkCharSubset(input, r.items).ok).toBe(true);
+    expect(checkTableBodies(input, r.items).ok).toBe(true);
+  });
+
+  test("幂等：清洗结果再跑一次是 no-op 且零 LLM 调用", async () => {
+    const first = await refine(splitDocInput(), { chatFn: makeMockChat() });
+    const second = makeMockChat();
+    const r2 = await refine(first.items, { chatFn: second });
+    expect(r2.items).toEqual(first.items);
+    expect(r2.report.opCounts).toEqual({});
+    expect(second.calls).toBe(0);
+  });
+
+  test("LLM 判两表是不同表 → dismiss，不动文档", async () => {
+    const input = splitDocInput();
+    const r = await refine(input, {
+      chatFn: makeMockChat({
+        split_table: (id) => ({ name: "dismiss", args: { id, reason: "两张不同的表" } }),
+        split_list: (id) => ({ name: "dismiss", args: { id, reason: "两个独立列表" } }),
+      }),
+    });
+    expect(r.report.failOpen).toBe(false);
+    expect(r.report.opCounts).toEqual({ drop: 1 }); // 只剩空壳被删
+    expect(r.items.filter((it) => it.type === "table")).toHaveLength(2);
+    expect(r.report.dismissed).toBe(2);
+  });
+});
+
+describe("split_table 视觉裁决（Qwen-VL mock）", () => {
+  const PNG = new Uint8Array([1, 2, 3]);
+  function visionDocInput(): MineruItem[] {
+    return [
+      {
+        type: "table",
+        table_body: "<table><tbody><tr><td>表头</td></tr><tr><td>甲</td></tr></tbody></table>",
+        table_caption: ["表1"],
+        img_path: "images/a.jpg",
+        page_idx: 0,
+        bbox: [50, 100, 550, 800],
+      },
+      { type: "page_number", text: "1", page_idx: 0, bbox: bbox(820) },
+      {
+        type: "table",
+        table_body: "<table><tbody><tr><td>乙</td></tr></tbody></table>",
+        table_caption: [],
+        img_path: "images/b.jpg",
+        page_idx: 1,
+        bbox: [50, 80, 550, 300],
+      },
+    ];
+  }
+  const loadImage = async (p: string) => (p.startsWith("images/") ? PNG : null);
+  /** split_table 不该落到文本路径时，文本 mock 一被调用就炸。 */
+  const chatMustNotSeeSplitTable = () =>
+    makeMockChat({
+      split_table: () => {
+        throw new Error("split_table 不应走文本路径");
+      },
+    });
+
+  test("视觉判 merge → mergeTable 落地，token 计入 report，不走文本路径", async () => {
+    let visionCalls = 0;
+    const r = await refine(visionDocInput(), {
+      chatFn: chatMustNotSeeSplitTable(),
+      loadImage,
+      visionFn: async (a, b) => {
+        visionCalls++;
+        expect(a).toBe(PNG);
+        expect(b).toBe(PNG);
+        return { verdict: "merge", reason: "同一张表", usage: { prompt_tokens: 1500, completion_tokens: 30 } };
+      },
+    });
+    expect(visionCalls).toBe(1);
+    expect(r.report.failOpen).toBe(false);
+    expect(r.report.opCounts).toEqual({ mergeTable: 1 });
+    expect(r.items.filter((it) => it.type === "table")).toHaveLength(1);
+    expect(r.items[0]!.table_body).toContain("<tr><td>甲</td></tr><tr><td>乙</td></tr>");
+    expect(r.report.tokenUsage.prompt).toBe(1500);
+  });
+
+  test("视觉判 dismiss → 不动文档，计入 dismissed", async () => {
+    const r = await refine(visionDocInput(), {
+      chatFn: chatMustNotSeeSplitTable(),
+      loadImage,
+      visionFn: async () => ({ verdict: "dismiss", reason: "两张不同的表", usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+    });
+    expect(r.report.opCounts).toEqual({});
+    expect(r.items.filter((it) => it.type === "table")).toHaveLength(2);
+    expect(r.report.dismissed).toBe(1);
+  });
+
+  test("图取不到（loadImage 回 null）→ 回退文本路径", async () => {
+    const chat = makeMockChat(); // 默认 split_table → mergeTable
+    const r = await refine(visionDocInput(), {
+      chatFn: chat,
+      loadImage: async () => null,
+      visionFn: async () => {
+        throw new Error("不该被调用：图都没取到");
+      },
+    });
+    expect(r.report.opCounts).toEqual({ mergeTable: 1 });
+    expect(chat.calls).toBeGreaterThan(0);
+  });
+
+  test("视觉 API 故障 → 回退文本路径，不 fail-open", async () => {
+    const chat = makeMockChat();
+    const r = await refine(visionDocInput(), {
+      chatFn: chat,
+      loadImage,
+      visionFn: async () => {
+        throw new Error("Qwen-VL 不可用（测试注入）");
+      },
+    });
+    expect(r.report.failOpen).toBe(false);
+    expect(r.report.opCounts).toEqual({ mergeTable: 1 });
+    expect(chat.calls).toBeGreaterThan(0);
+  });
+});
+
+describe("maxIterations 自适应默认", () => {
+  test("公式：min(max(48, 2N+16), 512)", () => {
+    expect(adaptiveMaxIterations(0)).toBe(48);
+    expect(adaptiveMaxIterations(16)).toBe(48);
+    expect(adaptiveMaxIterations(17)).toBe(50);
+    expect(adaptiveMaxIterations(60)).toBe(136); // JZY-001 实测 60 个初始疑点 → 136，足够其 ~100 的总工作量
+    expect(adaptiveMaxIterations(300)).toBe(512); // 病态文档封顶
+  });
+
+  test("显式 maxIterations 优先于自适应", async () => {
+    // golden 文档有 4 个疑点；maxIterations=1 应只裁 1 个就强停
+    const chat = makeMockChat();
+    const r = await refine(goldenInput(), { chatFn: chat, maxIterations: 1 });
+    expect(r.report.iterations).toBe(1);
   });
 });

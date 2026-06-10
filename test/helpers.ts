@@ -37,7 +37,7 @@ export function goldenInput(): MineruItem[] {
   ];
 }
 
-/** goldenInput 经正确清洗后的期望输出（golden fixture 断言目标，SPEC §13.1）。 */
+/** goldenInput 经正确清洗后的期望输出（golden fixture 断言目标）。 */
 export function goldenExpected(): MineruItem[] {
   const input = goldenInput();
   return [
@@ -76,6 +76,17 @@ export function makeMockChat(overrides: Partial<Record<SuspectKind, KindHandler>
     page_artifact: (id) => ({ name: "drop", args: { id } }),
     residual_markup: (id) => ({ name: "strip", args: { id, pattern: "md_link" } }),
     giant_block: (id) => ({ name: "dismiss", args: { id, reason: "mock 默认不拆" } }),
+    empty_table: (id) => ({ name: "drop", args: { id } }),
+    split_table: (id, evidence) => {
+      const idB = /后块=(it_\d+)/.exec(evidence)?.[1];
+      if (!idB) throw new Error(`mock 无法从证据解析后块 ID: ${evidence}`);
+      return { name: "mergeTable", args: { idA: id, idB } };
+    },
+    split_list: (id, evidence) => {
+      const idB = /后块=(it_\d+)/.exec(evidence)?.[1];
+      if (!idB) throw new Error(`mock 无法从证据解析后块 ID: ${evidence}`);
+      return { name: "mergeList", args: { idA: id, idB } };
+    },
   };
 
   const fn = async (messages: Message[], _tools: Tool[]): Promise<ChatResult> => {

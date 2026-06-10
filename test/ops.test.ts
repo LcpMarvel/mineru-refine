@@ -1,8 +1,8 @@
-// M3：7 个 op 的纯函数语义 + 固定 op 序列 replay + 保真闸回滚（不接 LLM）。
+// 各 op 的纯函数语义 + 固定 op 序列 replay + 保真闸回滚（不接 LLM）。
 
 import { describe, expect, test } from "bun:test";
 import { assignIds } from "../src/id.ts";
-import { inputPages } from "../src/invariant.ts";
+import { checkTableBodies, inputPages } from "../src/invariant.ts";
 import { applyOpChecked, type ApplyContext } from "../src/ops/index.ts";
 import type { MineruItem, OpCall, RefItem } from "../src/types.ts";
 import { bbox, goldenInput } from "./helpers.ts";
@@ -180,7 +180,7 @@ describe("保真闸回滚（fidelity_violation）", () => {
   });
 });
 
-describe("M3 固定 op 序列 replay（不接 LLM）", () => {
+describe("固定 op 序列 replay（不接 LLM）", () => {
   test("demote → merge → drop → strip 全链路 + C_out ⊆ C_in", () => {
     const { ref, ctx } = setup(goldenInput());
     let items = ref;
@@ -243,5 +243,269 @@ describe("html_tag 白名单（真实数据回归）", () => {
     ]);
     const r = applyOpChecked(ref, { op: "strip", id: "it_0001", pattern: "html_tag" }, ctx);
     expect(r.ok).toBe(false); // 无已知标签可匹配 → 拒绝空操作
+  });
+});
+
+describe("mergeTable（跨页拆表合并）", () => {
+  const A: MineruItem = {
+    type: "table",
+    table_body: "<table><tbody>\n<tr><td>表头</td><td>列2</td></tr>\n<tr><td>甲</td><td>1</td></tr>\n</tbody></table>",
+    table_caption: ["表1 示例"],
+    table_footnote: ["注：A 的脚注"],
+    page_idx: 0,
+    bbox: [50, 100, 550, 800],
+  };
+  const B: MineruItem = {
+    type: "table",
+    table_body: "<table><tbody><tr><td>乙</td><td>2</td></tr><tr><td>丙</td><td>3</td></tr></tbody></table>",
+    table_caption: ["（续）"],
+    page_idx: 1,
+    bbox: [50, 80, 550, 300],
+  };
+
+  test("B 行原字节追加到 A 末行后、A 外壳不动；caption/footnote 拼接；bbox 并集、page_idx 取首块；产新 ID", () => {
+    const { ref, ctx } = setup([
+      structuredClone(A),
+      { type: "page_number", text: "1", page_idx: 0, bbox: bbox(780) },
+      structuredClone(B),
+    ]);
+    const r = mustApply(ref, { op: "mergeTable", idA: "it_0001", idB: "it_0003" }, ctx);
+    expect(r.items).toHaveLength(2); // 合并块 + 原位保留的页码
+    const merged = r.items[0]!.item;
+    expect(r.newIds).toEqual([r.items[0]!.id]);
+    expect(merged.table_body).toBe(
+      "<table><tbody>\n<tr><td>表头</td><td>列2</td></tr>\n<tr><td>甲</td><td>1</td></tr><tr><td>乙</td><td>2</td></tr><tr><td>丙</td><td>3</td></tr>\n</tbody></table>",
+    );
+    expect(merged.table_caption).toEqual(["表1 示例", "（续）"]);
+    expect(merged.table_footnote).toEqual(["注：A 的脚注"]);
+    expect(merged.page_idx).toBe(0);
+    expect(merged.bbox).toEqual([50, 80, 550, 800]);
+    expect(r.items[1]!.item.type).toBe("page_number"); // 家具原位保留
+  });
+
+  test("B 首行与 A 首行逐字节相同（每页重印表头）→ 去重并留痕；近似相同不去", () => {
+    const dupB: MineruItem = {
+      ...structuredClone(B),
+      table_body: "<table><tbody><tr><td>表头</td><td>列2</td></tr><tr><td>乙</td><td>2</td></tr></tbody></table>",
+    };
+    const { ref, ctx } = setup([structuredClone(A), dupB]);
+    const r = mustApply(ref, { op: "mergeTable", idA: "it_0001", idB: "it_0002" }, ctx);
+    expect(r.items[0]!.item.table_body).toContain("<tr><td>甲</td><td>1</td></tr><tr><td>乙</td><td>2</td></tr>");
+    expect(r.items[0]!.item.table_body!.match(/表头/g)).toHaveLength(1);
+    expect(r.removedSpans).toEqual([
+      { itemId: "it_0002", text: "<tr><td>表头</td><td>列2</td></tr>", reason: "mergeTable:dup_header" },
+    ]);
+
+    // 近似但不逐字节相等（多一个空格）→ 不去重
+    const nearB: MineruItem = {
+      ...structuredClone(B),
+      table_body: "<table><tbody><tr><td>表头 </td><td>列2</td></tr><tr><td>乙</td><td>2</td></tr></tbody></table>",
+    };
+    const { ref: ref2, ctx: ctx2 } = setup([structuredClone(A), nearB]);
+    const r2 = mustApply(ref2, { op: "mergeTable", idA: "it_0001", idB: "it_0002" }, ctx2);
+    expect(r2.removedSpans).toHaveLength(0);
+    expect(r2.items[0]!.item.table_body!.match(/表头/g)).toHaveLength(2);
+  });
+
+  test("列数不等（rowspan/尾列空被略去）也允许合并——参差行原样保留", () => {
+    const ragged: MineruItem = {
+      ...structuredClone(B),
+      table_body: "<table><tbody><tr><td>乙</td><td>2</td><td>新列</td></tr></tbody></table>",
+    };
+    const { ref, ctx } = setup([structuredClone(A), ragged]);
+    const r = mustApply(ref, { op: "mergeTable", idA: "it_0001", idB: "it_0002" }, ctx);
+    expect(r.items[0]!.item.table_body).toContain("<tr><td>乙</td><td>2</td><td>新列</td></tr>");
+  });
+
+  test("空壳表 / 非 table / 隔内容块 → invalid_args", () => {
+    const husk: MineruItem = { type: "table", img_path: "", table_caption: [], page_idx: 1, bbox: bbox(0) };
+    const { ref, ctx } = setup([structuredClone(A), husk]);
+    const r = applyOpChecked(ref, { op: "mergeTable", idA: "it_0001", idB: "it_0002" }, ctx);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.kind).toBe("invalid_args");
+
+    const { ref: ref2, ctx: ctx2 } = setup([
+      structuredClone(A),
+      { type: "text", text: "中间的正文", page_idx: 0, bbox: bbox(500) },
+      structuredClone(B),
+    ]);
+    const r2 = applyOpChecked(ref2, { op: "mergeTable", idA: "it_0001", idB: "it_0003" }, ctx2);
+    expect(r2.ok).toBe(false);
+
+    const { ref: ref3, ctx: ctx3 } = setup([structuredClone(A), { type: "text", text: "x", page_idx: 1, bbox: bbox(0) }]);
+    const r3 = applyOpChecked(ref3, { op: "mergeTable", idA: "it_0001", idB: "it_0002" }, ctx3);
+    expect(r3.ok).toBe(false);
+  });
+});
+
+describe("mergeList（跨页拆列表合并）", () => {
+  const LA: MineruItem = { type: "list", list_items: ["第一项", "第二项未完"], page_idx: 0, bbox: [50, 600, 550, 800] };
+  const LB: MineruItem = { type: "list", list_items: ["的后半句。", "第三项"], page_idx: 1, bbox: [50, 80, 550, 200] };
+
+  test("默认纯拼接；joinSeam=true 缝合 A 尾项与 B 首项；bbox 并集、page_idx 取首块", () => {
+    const { ref, ctx } = setup([structuredClone(LA), structuredClone(LB)]);
+    const r = mustApply(ref, { op: "mergeList", idA: "it_0001", idB: "it_0002" }, ctx);
+    expect(r.items).toHaveLength(1);
+    expect(r.items[0]!.item.list_items).toEqual(["第一项", "第二项未完", "的后半句。", "第三项"]);
+
+    const { ref: ref2, ctx: ctx2 } = setup([structuredClone(LA), structuredClone(LB)]);
+    const r2 = mustApply(ref2, { op: "mergeList", idA: "it_0001", idB: "it_0002", joinSeam: true }, ctx2);
+    const merged = r2.items[0]!.item;
+    expect(merged.list_items).toEqual(["第一项", "第二项未完的后半句。", "第三项"]);
+    expect(merged.page_idx).toBe(0);
+    expect(merged.bbox).toEqual([50, 80, 550, 800]);
+  });
+
+  test("joinSeam 英文断词处补空格", () => {
+    const { ref, ctx } = setup([
+      { type: "list", list_items: ["item one and"], page_idx: 0, bbox: bbox(700) },
+      { type: "list", list_items: ["item two"], page_idx: 1, bbox: bbox(80) },
+    ]);
+    const r = mustApply(ref, { op: "mergeList", idA: "it_0001", idB: "it_0002", joinSeam: true }, ctx);
+    expect(r.items[0]!.item.list_items).toEqual(["item one and item two"]);
+  });
+
+  test("非 list / 空 list_items → invalid_args", () => {
+    const { ref, ctx } = setup([structuredClone(LA), { type: "text", text: "x", page_idx: 1, bbox: bbox(0) }]);
+    expect(applyOpChecked(ref, { op: "mergeList", idA: "it_0001", idB: "it_0002" }, ctx).ok).toBe(false);
+    const { ref: ref2, ctx: ctx2 } = setup([structuredClone(LA), { type: "list", list_items: [], page_idx: 1, bbox: bbox(0) }]);
+    expect(applyOpChecked(ref2, { op: "mergeList", idA: "it_0001", idB: "it_0002" }, ctx2).ok).toBe(false);
+  });
+});
+
+describe("drop 空壳表（白名单扩展）", () => {
+  test("零内容空壳表可 drop；有行的表仍不可", () => {
+    const { ref, ctx } = setup([
+      { type: "table", img_path: "", table_caption: [], table_footnote: [], page_idx: 0, bbox: bbox(0) },
+      { type: "table", table_body: "<table><tr><td>有内容</td></tr></table>", table_caption: [], page_idx: 0, bbox: bbox(300) },
+    ]);
+    const r = mustApply(ref, { op: "drop", id: "it_0001" }, ctx);
+    expect(r.items).toHaveLength(1);
+    expect(r.removedSpans).toEqual([{ itemId: "it_0001", text: "[table]", reason: "drop" }]);
+    expect(applyOpChecked(ref, { op: "drop", id: "it_0002" }, ctx).ok).toBe(false);
+  });
+
+  test("droppableIds 提供时空壳必须命中 empty_table 标记（双保险）", () => {
+    const { ref, ctx } = setup([
+      { type: "table", img_path: "", table_caption: [], page_idx: 0, bbox: bbox(0) },
+    ]);
+    const denied = applyOpChecked(ref, { op: "drop", id: "it_0001" }, { ...ctx, droppableIds: new Set() });
+    expect(denied.ok).toBe(false);
+    const allowed = applyOpChecked(ref, { op: "drop", id: "it_0001" }, { ...ctx, droppableIds: new Set(["it_0001"]) });
+    expect(allowed.ok).toBe(true);
+  });
+});
+
+describe("mergeTable 列参差矩阵（空列被 MinerU 略去/保留的各种形态）", () => {
+  /** 3 列逻辑表的第一页：尾列全空被 MinerU 略去 → 识别成 2 列。 */
+  const A_TAIL_DROPPED: MineruItem = {
+    type: "table",
+    table_body:
+      "<table><tbody><tr><td>名称</td><td>数量</td></tr><tr><td>甲</td><td>1</td></tr></tbody></table>",
+    table_caption: ["表X"],
+    page_idx: 0,
+    bbox: [50, 100, 550, 800],
+  };
+
+  function merge2(a: MineruItem, b: MineruItem) {
+    const { ref, ctx } = setup([structuredClone(a), structuredClone(b)]);
+    return mustApply(ref, { op: "mergeTable", idA: "it_0001", idB: "it_0002" }, ctx);
+  }
+
+  test("尾列空被略去：A 2列 + B 3列 → 参差合并，A/B 行逐字节保留，不补不裁", () => {
+    const b: MineruItem = {
+      type: "table",
+      table_body: "<table><tbody><tr><td>乙</td><td>2</td><td>备注B</td></tr></tbody></table>",
+      table_caption: [],
+      page_idx: 1,
+      bbox: [50, 80, 550, 200],
+    };
+    const r = merge2(A_TAIL_DROPPED, b);
+    const body = r.items[0]!.item.table_body!;
+    expect(body).toContain("<tr><td>甲</td><td>1</td></tr>"); // A 的 2 列行原样
+    expect(body).toContain("<tr><td>乙</td><td>2</td><td>备注B</td></tr>"); // B 的 3 列行原样
+    expect(body.match(/<td><\/td>/g)).toBeNull(); // 绝不发明空单元格去"对齐"
+  });
+
+  test("首格空但被保留为 <td></td>（真实形态 JZY idx326）：列天然对齐，逐字节保留", () => {
+    const b: MineruItem = {
+      type: "table",
+      table_body: "<table><tbody><tr><td></td><td>2</td></tr><tr><td>丙</td><td>3</td></tr></tbody></table>",
+      table_caption: [],
+      page_idx: 1,
+      bbox: [50, 80, 550, 200],
+    };
+    const r = merge2(A_TAIL_DROPPED, b);
+    expect(r.items[0]!.item.table_body).toContain("<tr><td>甲</td><td>1</td></tr><tr><td></td><td>2</td></tr>");
+  });
+
+  test("首列空被整个丢掉（B 行左移 1 格）：原样保留——错位是 MinerU 输入即有的，不引入新损伤", () => {
+    const b: MineruItem = {
+      type: "table",
+      // 逻辑上是「(空), 2」但 MinerU 只吐了一格
+      table_body: "<table><tbody><tr><td>2</td></tr></tbody></table>",
+      table_caption: [],
+      page_idx: 1,
+      bbox: [50, 80, 550, 200],
+    };
+    const r = merge2(A_TAIL_DROPPED, b);
+    expect(r.items[0]!.item.table_body).toContain("<tr><td>甲</td><td>1</td></tr><tr><td>2</td></tr>");
+  });
+
+  test("rowspan 跨页携带（真实形态 ZBZ-047 it_0193+it_0197）：首行列数 5≠4 仍可合并", () => {
+    const a: MineruItem = {
+      type: "table",
+      table_body:
+        "<table><tbody><tr><td rowspan=1 colspan=1>考核项目</td><td rowspan=1 colspan=1>权重</td><td rowspan=1 colspan=1>维度编号</td><td rowspan=1 colspan=1>评分标准</td><td rowspan=1 colspan=1>得分</td></tr><tr><td rowspan=1 colspan=1>评分依据：所直接关联的上级战略指标的达成情况。</td></tr></tbody></table>",
+      table_caption: ["报告评分表"],
+      page_idx: 13,
+      bbox: [50, 100, 550, 800],
+    };
+    const b: MineruItem = {
+      type: "table",
+      table_body:
+        "<table><tbody><tr><td rowspan=8 colspan=1>指标的战略协同与支撑</td><td rowspan=8 colspan=1></td><td rowspan=2 colspan=1></td><td></td></tr></tbody></table>",
+      table_caption: [],
+      page_idx: 14,
+      bbox: [50, 80, 550, 300],
+    };
+    const r = merge2(a, b);
+    const body = r.items[0]!.item.table_body!;
+    expect(body).toContain("评分依据：所直接关联的上级战略指标的达成情况。</td></tr><tr><td rowspan=8");
+    expect(r.items[0]!.item.table_caption).toEqual(["报告评分表"]);
+    // 行级保真：合并体能通过出口闸门
+    expect(
+      checkTableBodies([a, b], [r.items[0]!.item]).ok,
+    ).toBe(true);
+  });
+
+  test("colspan 行（如「文件状态」整行跨列）原样保留", () => {
+    const b: MineruItem = {
+      type: "table",
+      table_body: '<table><tbody><tr><td colspan="2">文件状态：受控</td></tr></tbody></table>',
+      table_caption: [],
+      page_idx: 1,
+      bbox: [50, 80, 550, 200],
+    };
+    const r = merge2(A_TAIL_DROPPED, b);
+    expect(r.items[0]!.item.table_body).toContain('<tr><td colspan="2">文件状态：受控</td></tr>');
+  });
+
+  test("参差行若被『修复』（发明空格子改行）→ 行级保真闸 fail（机器闸防住语义猜测）", () => {
+    const a = A_TAIL_DROPPED;
+    const b: MineruItem = {
+      type: "table",
+      table_body: "<table><tbody><tr><td>乙</td><td>2</td><td>备注B</td></tr></tbody></table>",
+      table_caption: [],
+      page_idx: 1,
+      bbox: [50, 80, 550, 200],
+    };
+    // 假想某实现把 A 的行补齐成 3 列：<tr><td>甲</td><td>1</td><td></td></tr>
+    const padded = {
+      type: "table",
+      table_body:
+        "<table><tbody><tr><td>名称</td><td>数量</td></tr><tr><td>甲</td><td>1</td><td></td></tr><tr><td>乙</td><td>2</td><td>备注B</td></tr></tbody></table>",
+    } as MineruItem;
+    expect(checkTableBodies([a, b], [padded]).ok).toBe(false);
   });
 });

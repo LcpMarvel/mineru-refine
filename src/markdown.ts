@@ -1,5 +1,5 @@
 // 从 content_list items 确定性重渲染 full.md（与 MinerU pipeline 的 markdown 拼接规则对齐，
-// 经真实产物对拍验证）。纯拼接、零生成——不违反 D4=(c) 不加字原则。
+// 经真实产物对拍验证）。纯拼接、零生成——不违反纯削减（不加字）原则。
 //
 // MinerU 规则（从真实 full.md 反推并对拍）：
 // - text + text_level=n  → "#"×n + 空格 + 文本

@@ -1,10 +1,10 @@
-// HTTP transport（SPEC §12 首选）：POST /refine 收 content_list JSON，回 { items, provenance, report }。
+// HTTP transport（首选）：POST /refine 收 content_list JSON，回 { items, provenance, report }。
 // docfuse(Python) 在 _parse_extracted_dir 解析 content_list.json 之前调一次。
 // fail-open 在 refine() 内已兜；transport 层再兜一层（坏请求 → 400，内部错 → 仍回原 items 不可能时 500）。
 //
 // 跑：  source ~/.ragent_profile && bun run src/server.ts
 
-import { refine } from "./refine.ts";
+import { imageDirLoader, refine } from "./refine.ts";
 import type { MineruItem } from "./types.ts";
 
 const PORT = Number(process.env.MINERU_REFINE_PORT ?? 8771);
@@ -14,6 +14,8 @@ type RefineRequest = {
   markdown?: string;
   sha256?: string;
   maxIterations?: number;
+  /** MinerU 产物目录绝对路径（须与本服务共享文件系统）；提供则 split_table 启用 Qwen-VL 视觉裁决。 */
+  imageDir?: string;
 };
 
 const server = Bun.serve({
@@ -40,6 +42,7 @@ const server = Bun.serve({
         markdown: body.markdown,
         sha256: body.sha256,
         maxIterations: body.maxIterations,
+        loadImage: body.imageDir ? imageDirLoader(body.imageDir) : undefined,
       });
       return Response.json(result);
     }

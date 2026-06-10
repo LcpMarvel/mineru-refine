@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { detect } from "../src/detect.ts";
 import { assignIds } from "../src/id.ts";
 import { renderMarkdown } from "../src/markdown.ts";
-import { refine } from "../src/refine.ts";
+import { imageDirLoader, refine } from "../src/refine.ts";
 import type { MineruItem } from "../src/types.ts";
 
 const MINERU_DIR = new URL("../test_data/mineru/", import.meta.url).pathname;
@@ -51,7 +51,9 @@ for (const stem of targets) {
   const t0 = Date.now();
   const r = await refine(items, {
     sha256: await sha256OfSource(stem),
-    maxIterations: Number(process.env.REFINE_MAX_ITERATIONS ?? 64),
+    // 不传则用自适应默认（随疑点数 48~512）；REFINE_MAX_ITERATIONS 仅作显式覆盖
+    maxIterations: process.env.REFINE_MAX_ITERATIONS ? Number(process.env.REFINE_MAX_ITERATIONS) : undefined,
+    loadImage: imageDirLoader(join(MINERU_DIR, stem)), // split_table 走 Qwen-VL 视觉裁决
   });
   const secs = ((Date.now() - t0) / 1000).toFixed(1);
 
