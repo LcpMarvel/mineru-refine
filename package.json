@@ -1,0 +1,23 @@
+{
+  "name": "mineru-refine",
+  "version": "0.0.0",
+  "description": "MinerU output linter/fixer — agent loop that restructures (never generates) MinerU content_list to be closer to the source document.",
+  "type": "module",
+  "module": "src/refine.ts",
+  "scripts": {
+    "m0": "bun run scripts/m0_smoke.ts",
+    "mineru:fetch": "bun run scripts/mineru_fetch.ts",
+    "refine:real": "bun run scripts/refine_real.ts",
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit",
+    "server": "bun run src/server.ts",
+    "cli": "bun run src/cli.ts"
+  },
+  "dependencies": {
+    "safe-json-repair": "latest"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}
