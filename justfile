@@ -49,7 +49,7 @@ js-test:
 # 三个生态各自独立发布；版本号先 `just bump <semver>` 一把梭。
 # 凭证：crates.io 用 `cargo login`；PyPI 用 MATURIN_PYPI_TOKEN（或 ~/.pypirc）；npm 用 `npm login`。
 
-# 统一改版本：workspace Cargo.toml + Cargo.lock + bindings/js/package.json
+# 统一改版本：workspace Cargo.toml + Cargo.lock + bindings/js 主包与平台子包
 bump version:
     python3 scripts/bump_version.py {{version}}
 
