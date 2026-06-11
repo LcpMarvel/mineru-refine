@@ -19,6 +19,7 @@ tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 base64.workspace = true
 thiserror.workspace = true
 safe-json-repair.workspace = true

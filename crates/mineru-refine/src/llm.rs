@@ -128,6 +128,16 @@ impl LoadImage for ImageDirLoader {
 
 const MAX_ATTEMPTS: u32 = 3;
 
+/// reqwest 用 rustls-no-provider 编译（aws-lc 在 napi 交叉工具链下编不过），
+/// 构建 Client 前必须装好进程级 ring provider，否则 reqwest 直接 panic。
+fn http_client() -> reqwest::Client {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // 并发竞争下另一线程先装好也是成功，Err 可忽略
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    reqwest::Client::new()
+}
+
 fn retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
@@ -160,7 +170,7 @@ impl DeepSeekClient {
             })?;
         Ok(Arc::new(Self {
             key,
-            http: reqwest::Client::new(),
+            http: http_client(),
         }))
     }
 }
@@ -274,7 +284,7 @@ impl QwenVlClient {
             base_url: std::env::var("QWEN_BASE_URL")
                 .unwrap_or_else(|_| QWEN_DEFAULT_BASE_URL.into()),
             model: std::env::var("QWEN_VISION_MODEL").unwrap_or_else(|_| QWEN_DEFAULT_MODEL.into()),
-            http: reqwest::Client::new(),
+            http: http_client(),
         }))
     }
 }

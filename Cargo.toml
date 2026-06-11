@@ -21,7 +21,10 @@ regex = "1.12.4"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "fs", "time", "io-std", "io-util", "sync"] }
 futures = "0.3.32"
 async-trait = "0.1.89"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "http2", "system-proxy"] }
+# rustls 不能走默认的 aws-lc-rs：aws-lc-sys 的 C 代码在 napi 交叉工具链下编不过
+#（缺 stdatomic.h），改用 ring provider；rustls-no-provider 要求运行时手动 install_default（见 llm.rs）
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider", "http2", "system-proxy"] }
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 base64 = "0.22.1"
 thiserror = "2.0.18"
 # 本地/CI 构建走 git（钉到 0.1.1 对应提交）；cargo publish 时自动剥掉 git、改用 crates.io 的 version——
