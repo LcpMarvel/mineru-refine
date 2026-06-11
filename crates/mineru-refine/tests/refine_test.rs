@@ -686,3 +686,36 @@ async fn explicit_max_iterations_overrides_adaptive() {
 fn _keep(_: &regex::Regex) {
     let _ = &*NEXT_ID_RE;
 }
+
+// ── ⑨ 新探测器端到端：漏标标题 promote + 段尾节标记 split + 机械清洗入报告 ──
+
+#[tokio::test]
+async fn missed_heading_trailing_marker_and_mechanical_cleanup_end_to_end() {
+    let input = items_of(json!([
+        { "type": "text", "text": "4.5核心组织绩效的考核方法", "text_level": 2, "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "4.6核心组织绩效的应用", "page_idx": 0, "bbox": bbox(40) },
+        { "type": "text", "text": "各部门按要求执行并存档备查[相关文件]", "page_idx": 0, "bbox": bbox(80) },
+        { "type": "text", "text": "文件编号：MN-ZY-001 《战略管理规范》", "page_idx": 0, "bbox": bbox(120) },
+        { "type": "table",
+          "table_body": "<table><tr><td>日期</td><td>内容</td></tr><tr><td></td><td></td></tr></table>",
+          "table_caption": ["更改情况"], "page_idx": 0, "bbox": bbox(160) },
+    ]));
+    let r = run(input, Arc::new(MockChat::new())).await;
+    assert!(!r.report.fail_open);
+
+    // 漏标标题被 promote 成与兄弟一致的 level
+    assert_eq!(r.items[1].text(), Some("4.6核心组织绩效的应用"));
+    assert_eq!(r.items[1].text_level(), Some(2));
+    // 段尾节标记被 split 成独立块
+    assert_eq!(r.items[2].text(), Some("各部门按要求执行并存档备查"));
+    assert_eq!(r.items[3].text(), Some("[相关文件]"));
+    // 表格尾部空行被机械清洗删除，统计并入 opCounts
+    assert_eq!(
+        r.items[5].table_body(),
+        Some("<table><tr><td>日期</td><td>内容</td></tr></table>")
+    );
+    assert_eq!(
+        op_counts_json(&r),
+        json!({ "promote": 1, "split": 1, "mechEmptyRow": 1 })
+    );
+}

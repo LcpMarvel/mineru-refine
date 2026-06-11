@@ -13,6 +13,7 @@ use crate::llm::{
     ChatClient, DeepSeekClient, ImageDirLoader, LlmError, LoadImage, QwenVlClient,
     SplitTableVerdict, VisionClient,
 };
+use crate::mechanical::mechanical_clean;
 use crate::types::{MineruItem, RefineReport, RefineResult, WorkItem};
 use futures::FutureExt;
 use std::collections::HashMap;
@@ -21,9 +22,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 
 // 0.5：split_table 视觉裁决；0.6：拆表检测放宽到链式 + split_table 仅视觉裁决；
-// 0.7：Rust 重写（逻辑对齐 0.6，实现换底）
-pub const REFINE_LOGIC_VERSION: &str = "0.7.0";
-pub const PROMPT_VERSION: &str = "p4"; // p4：system prompt 与工具集移除 mergeTable
+// 0.7：Rust 重写（逻辑对齐 0.6，实现换底）；
+// 0.8：机械清洗 pass + 三个新探测器（missed_heading/trailing_marker/separated_caption）
+pub const REFINE_LOGIC_VERSION: &str = "0.8.0";
+pub const PROMPT_VERSION: &str = "p5"; // p5：新疑点 op_hint + missed_heading 裁决规则
 /// 默认文本裁决模型;运行时可被 `DEEPSEEK_MODEL` 覆盖(见 `cache_key_for`)。
 pub const MODEL_ID: &str = crate::llm::DEEPSEEK_DEFAULT_MODEL;
 
@@ -137,7 +139,11 @@ async fn refine_inner(
     opts: &RefineOptions,
     log: &Logger,
 ) -> Result<RefineResult, String> {
-    let (ref_items, next_id) = assign_ids(snapshot);
+    let (mut ref_items, next_id) = assign_ids(snapshot);
+
+    // 机械清洗 pass（确定性、自校验、不打 LLM）。先于基线快照执行：
+    // 后续所有闸门（保真/异常数单调）都以清洗后的 items 为基准。
+    let mech = mechanical_clean(&mut ref_items, log);
 
     let load_image: Option<Arc<dyn LoadImage>> = opts.load_image.clone().or_else(|| {
         opts.image_dir
@@ -201,14 +207,22 @@ async fn refine_inner(
         ));
     }
 
+    // 机械清洗的统计并入报告：opCounts 用 mech* 前缀区分，removedSpans 置于最前
+    let mut op_counts = loop_result.op_counts;
+    for (k, v) in mech.counts {
+        *op_counts.entry(k).or_insert(0) += v;
+    }
+    let mut removed_spans = mech.removed_spans;
+    removed_spans.extend(loop_result.removed_spans);
+
     Ok(RefineResult {
         items: strip_ids(&loop_result.items), // 出口剥除内部 ID（schema 透明）
         provenance: vec![],                   // 纯削减模式（不加字）→ 恒为空，结构预留
         report: RefineReport {
             iterations: loop_result.iterations,
-            op_counts: loop_result.op_counts,
+            op_counts,
             dismissed: loop_result.dismissed,
-            removed_spans: loop_result.removed_spans,
+            removed_spans,
             violations: loop_result.violations,
             token_usage: loop_result.token_usage,
             fail_open: false,

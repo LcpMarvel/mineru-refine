@@ -468,16 +468,17 @@ fn op_drop(items: &[RefItem], id: &str, droppable: Option<&HashSet<String>>) -> 
 }
 
 // ── strip(id, pattern)：去残留符号，pattern 仅限白名单（不收任意 regex）。继承原 ID。──
-// 把公式体里的 LaTeX 命令残骸剥成内容字符：\mathsf { A i j } { = } 1 → A i j = 1。
-// 只删不增（命令名/花括号被移除，内容字符与空白保留），C_out ⊆ C_in 天然成立。
+// 把公式体里的 LaTeX 命令残骸剥成内容字符：\mathsf { A i j } { = } 1 → Aij=1。
+// 公式体里的空白全是 OCR/排版残骸（$...$ 内不存在正常词距），剥完后整体删除——
+// 否则留下「A i j ^ * A j i = 1」这种字符间隔空格的尸体（真实数据踩过）。
+// 只删不增（命令名/花括号/空白被移除，内容字符保留），C_out ⊆ C_in 天然成立。
 static LATEX_CMD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\[a-zA-Z]+").unwrap());
 static BRACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[{}]").unwrap());
-static MULTI_WS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 
 fn strip_latex_commands(body: &str) -> String {
     let s = LATEX_CMD.replace_all(body, " ");
     let s = BRACES.replace_all(&s, " ");
-    MULTI_WS.replace_all(&s, " ").trim().to_string()
+    s.chars().filter(|c| !is_js_whitespace(*c)).collect()
 }
 
 static STRIP_MD_LINK: LazyLock<Regex> =

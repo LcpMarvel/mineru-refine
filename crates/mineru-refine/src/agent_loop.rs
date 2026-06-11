@@ -187,6 +187,7 @@ const SYSTEM_PROMPT: &str = r#"你是 MinerU PDF 解析结果的结构修复器�
 2. 跨页 merge 前【必须】先 peekPage 确认上下页内容确实连续（中间无标题/表格/无关块）。
 3. 拿不准就 dismiss（宁可漏修，不可错改/误删真标题）。
    - 伪标题裁决前先看 outline：若存在结构平行的同级编号标题（如 4.1/4.2/4.3…，即使含逗号或表引用），通常是真标题 → dismiss。
+   - 漏标标题（missed_heading）promote 前先看 outline，level 必须与同级编号兄弟标题一致。
    - 列表项（-、•、①、(1) 等开头的行）之间绝不 merge——行尾无标点是列表的常态，不是断句。
    - 但 page_artifact 证据若给出「已分类页眉/页脚同文佐证」，说明同文块在别处已被正确分类为页面家具，该块就是漏标的同款 → 应 drop，不要因「像标题」而 dismiss。
    - 同一文本的多处 page_artifact 疑点应裁决一致：要删都删，不要删一处留其余。
@@ -796,6 +797,15 @@ fn op_hint(kind: SuspectKind) -> &'static str {
         }
         SuspectKind::SplitList => {
             "确认两 list 是同一列表被分页拆开 → mergeList（A 尾项被截断、B 首项是其延续时 joinSeam=true）；各自独立 → dismiss"
+        }
+        SuspectKind::MissedHeading => {
+            "先 outline 确认证据中的同级编号兄弟确实是标题 → promote（level 与兄弟标题一致）；本块其实是正文/列表项 → dismiss"
+        }
+        SuspectKind::TrailingMarker => {
+            "确认段尾的「[相关文件]」类标记是被粘连的独立结构块 → split（offset 用证据中的建议值）；标记本属句子内容 → dismiss"
+        }
+        SuspectKind::SeparatedCaption => {
+            "用 getItems/peekPage 判断表格归属：表格属于 caption 所在小节 → reorder 把表格挪到标题之前；caption 与表格都属新小节 → reorder 把 caption 挪到标题之后；拿不准 → dismiss"
         }
         _ => "无对应 op，只能 dismiss（仅标记类）",
     }

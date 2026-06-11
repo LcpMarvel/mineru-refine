@@ -55,6 +55,115 @@ re!(
     PAGE_NUMBER_CHARS,
     r"^[\s\d\-–—一二三四五六七八九十之/\\.()（）页第共]+$"
 );
+// 段尾粘连的节标记（跨页 merge 把「[相关文件]」这类独立结构块吸进了上一段的结尾）
+re!(TRAILING_MARKER, r"[\[【]相关[^\]】\n]{0,6}[\]】]\s*$");
+// 编号前缀（漏标标题探测用，按数制分三类，括号编号「(1)」是列表标记不参与）
+re!(
+    NUM_CHAPTER,
+    r"^\s*第\s*([0-9一二三四五六七八九十百]+)\s*[章节条款部分篇]"
+);
+re!(NUM_CHINESE, r"^\s*([一二三四五六七八九十]+)\s*[、.．]");
+re!(NUM_ARABIC, r"^\s*([0-9]+(?:[.．][0-9]+)*)");
+
+// ── 编号解析（missed_heading / separated_caption 用）──
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumStyle {
+    Chapter,
+    Chinese,
+    Arabic,
+}
+
+fn cn_digit(c: char) -> Option<u64> {
+    Some(match c {
+        '一' => 1,
+        '二' => 2,
+        '三' => 3,
+        '四' => 4,
+        '五' => 5,
+        '六' => 6,
+        '七' => 7,
+        '八' => 8,
+        '九' => 9,
+        _ => return None,
+    })
+}
+
+/// 中文数字 → 数值（一 ~ 九十九，编号场景够用）。
+fn cn_value(s: &str) -> Option<u64> {
+    let cs: Vec<char> = s.chars().collect();
+    match cs.as_slice() {
+        ['十'] => Some(10),
+        [c] => cn_digit(*c),
+        ['十', b] => Some(10 + cn_digit(*b)?),
+        [a, '十'] => Some(cn_digit(*a)? * 10),
+        [a, '十', b] => Some(cn_digit(*a)? * 10 + cn_digit(*b)?),
+        _ => None,
+    }
+}
+
+/// 解析行首编号 → (编号路径, 数制, 编号在 text 中的字节终点)。
+/// 「4.6核心…」→ ([4,6], Arabic)；「二、范围」→ ([2], Chinese)；「第3章」→ ([3], Chapter)。
+/// 防误判：阿拉伯编号各段 ≤99（排除年份/日期），后随 % 的是数值不是编号。
+fn parse_numbering(text: &str) -> Option<(Vec<u64>, NumStyle, usize)> {
+    if let Some(c) = NUM_CHAPTER.captures(text) {
+        let raw = &c[1];
+        let v = raw.parse::<u64>().ok().or_else(|| cn_value(raw))?;
+        return Some((vec![v], NumStyle::Chapter, c.get(0).unwrap().end()));
+    }
+    if let Some(c) = NUM_CHINESE.captures(text) {
+        return Some((
+            vec![cn_value(&c[1])?],
+            NumStyle::Chinese,
+            c.get(0).unwrap().end(),
+        ));
+    }
+    if let Some(c) = NUM_ARABIC.captures(text) {
+        let m = c.get(1).unwrap();
+        if matches!(text[m.end()..].chars().next(), Some('%') | Some('％')) {
+            return None;
+        }
+        let mut path = Vec::new();
+        for part in c[1].split(['.', '．']) {
+            let v = part.parse::<u64>().ok()?;
+            if v > 99 {
+                return None;
+            }
+            path.push(v);
+        }
+        return Some((path, NumStyle::Arabic, m.end()));
+    }
+    None
+}
+
+/// 去掉编号及紧随的分隔符/空白后的正文。
+fn numbering_body(text: &str, num_end: usize) -> &str {
+    text[num_end..]
+        .trim_start_matches(|c: char| matches!(c, '、' | '.' | '．') || c.is_whitespace())
+}
+
+/// 标题候选的表面特征：去编号后正文短（≤30 内容字）、无逗号/分号、无句末标点。
+fn promote_candidate(item: &MineruItem) -> Option<(Vec<u64>, NumStyle)> {
+    if item.item_type() != "text" || item.text_level().is_some() {
+        return None;
+    }
+    let text = item.text()?;
+    let (path, style, num_end) = parse_numbering(text)?;
+    let body = numbering_body(text, num_end);
+    let blen = non_ws_len(body);
+    if blen == 0 || blen > 30 || COMMA_SEMI.is_match(text) || SENTENCE_END.is_match(text) {
+        return None;
+    }
+    Some((path, style))
+}
+
+/// caption 表面特征：短（≤30 内容字）、无句末标点、以「表/图」收尾。
+fn caption_like(text: &str) -> bool {
+    let n = non_ws_len(text);
+    (2..=30).contains(&n)
+        && !SENTENCE_END.is_match(text)
+        && matches!(text.trim_end().chars().last(), Some('表') | Some('图'))
+}
 
 fn suspect(kind: SuspectKind, item_id: &str, evidence: String, has_op: bool) -> WorkItem {
     WorkItem {
@@ -124,6 +233,36 @@ pub fn detect(items: &[RefItem]) -> Vec<WorkItem> {
         .map(|(t, _)| t.as_str())
         .collect();
     corroborated.sort_by_key(|x| std::cmp::Reverse(x.chars().count()));
+
+    // 全文编号块索引（missed_heading 的兄弟查找用）：text 块且行首可解析出编号。
+    struct Numbered {
+        idx: usize,
+        path: Vec<u64>,
+        style: NumStyle,
+        heading: bool,
+    }
+    let numbered: Vec<Numbered> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            let it = &r.item;
+            if it.item_type() != "text" {
+                return None;
+            }
+            let (path, style, _) = parse_numbering(it.text()?)?;
+            Some(Numbered {
+                idx: i,
+                path,
+                style,
+                heading: it.text_level().is_some(),
+            })
+        })
+        .collect();
+    let numbered_at: HashMap<usize, usize> = numbered
+        .iter()
+        .enumerate()
+        .map(|(k, n)| (n.idx, k))
+        .collect();
 
     // text 是否完全由已分类家具文本拼成；是则返回命中的家具文本列表。
     let furniture_leak = |text: &str| -> Option<Vec<&str>> {
@@ -308,6 +447,94 @@ pub fn detect(items: &[RefItem]) -> Vec<WorkItem> {
                         "残留符号: {}。text=「{}」",
                         hits.join("、"),
                         char_prefix(text, 100)
+                    ),
+                    true,
+                ));
+            }
+        }
+
+        // ── 漏标标题（→ promote）：同级编号兄弟（同数制、同深度、同父编号）的最近一个
+        // 是标题且编号恰好相邻（±1），而本块是正文 → 大概率是漏标的标题。
+        // 表面闸：去编号后 ≤30 内容字、无逗号/分号、无句末标点（正文段落天然不命中）。──
+        if let Some((path, style)) = promote_candidate(item) {
+            let depth = path.len();
+            let parent = &path[..depth - 1];
+            let same_group = |n: &Numbered| {
+                n.style == style && n.path.len() == depth && &n.path[..depth - 1] == parent
+            };
+            let k = numbered_at[&i];
+            let prev = numbered[..k].iter().rev().find(|n| same_group(n));
+            let next = numbered[k + 1..].iter().find(|n| same_group(n));
+            let last = path[depth - 1];
+            let sibling = prev
+                .filter(|n| n.heading && n.path[depth - 1] + 1 == last)
+                .or_else(|| next.filter(|n| n.heading && last + 1 == n.path[depth - 1]));
+            if let Some(sib) = sibling {
+                let sib_ref = &items[sib.idx];
+                let level = sib_ref.item.text_level().unwrap_or(1);
+                out.push(suspect(
+                    SuspectKind::MissedHeading,
+                    id,
+                    format!(
+                        "同级编号兄弟 {}「{}」是标题（level={level}），而本块是正文 → 疑似漏标标题。text=「{}」",
+                        sib_ref.id,
+                        char_prefix(sib_ref.item.text().unwrap_or(""), 40),
+                        char_prefix(text, 60)
+                    ),
+                    true,
+                ));
+            }
+        }
+
+        // ── 段尾粘连节标记（→ split）：跨页 merge 把「[相关文件]」类独立结构块
+        // 吸进了上一段结尾。建议 offset 直接给出，split 可一步到位。──
+        if item.item_type() == "text"
+            && item.text_level().is_none()
+            && let Some(m) = TRAILING_MARKER.find(text)
+            && non_ws_len(&text[..m.start()]) >= 10
+        {
+            let offset = text[..m.start()].chars().count();
+            out.push(suspect(
+                SuspectKind::TrailingMarker,
+                id,
+                format!(
+                    "段尾粘连节标记「{}」，疑似被跨页合并进上一段，建议 split(offset={offset}) 拆成独立块。段尾=「…{}」",
+                    m.as_str().trim(),
+                    char_suffix(text, 50)
+                ),
+                true,
+            ));
+        }
+
+        // ── caption 与表格被标题隔开（→ reorder）：caption 样短文本后紧跟一个标题
+        //（或漏标标题候选），标题后紧跟有体表格 → 三块顺序疑似错排。──
+        if item.item_type() == "text" && item.text_level().is_none() && caption_like(text) {
+            let next_content = |from: usize| -> Option<usize> {
+                (from..items.len()).find(|&j| !is_page_furniture(items[j].item.item_type()))
+            };
+            if let Some(jh) = next_content(i + 1)
+                && items[jh].item.item_type() == "text"
+                && (items[jh].item.text_level().is_some()
+                    || promote_candidate(&items[jh].item).is_some())
+                && let Some(jt) = next_content(jh + 1)
+                && items[jt].item.item_type() == "table"
+                && !is_empty_table_husk(&items[jt].item)
+            {
+                let (h, t) = (&items[jh], &items[jt]);
+                out.push(suspect(
+                    SuspectKind::SeparatedCaption,
+                    id,
+                    format!(
+                        "短文本「{}」疑似表格 caption，但与表格 {} 之间隔着标题块 {}「{}」。\
+                         若表格属于 caption 所在小节 → reorder([{}, {}, {}])；\
+                         若 caption 与表格都属于新小节 → reorder([{}, {}, {}])；拿不准 → dismiss。标题={} 表格={}",
+                        text.trim(),
+                        t.id,
+                        h.id,
+                        char_prefix(h.item.text().unwrap_or(""), 40),
+                        id, t.id, h.id,
+                        h.id, id, t.id,
+                        h.id, t.id
                     ),
                     true,
                 ));

@@ -107,6 +107,12 @@ pub enum SuspectKind {
     SplitList,
     /// 零内容空壳表（MinerU 自行跨页合并后留下的占位）→ drop
     EmptyTable,
+    /// 同级编号兄弟是标题而本块是正文（漏标标题）→ promote / dismiss
+    MissedHeading,
+    /// 段尾粘连了「[相关文件]」类节标记 → split / dismiss
+    TrailingMarker,
+    /// caption 与其表格之间隔了一个标题块（跨页/排版错序）→ reorder / dismiss
+    SeparatedCaption,
     // 只标记、无 op（标记后不做处理）
     CaptionIssue,
 }
@@ -122,6 +128,9 @@ impl SuspectKind {
             SuspectKind::SplitTable => "split_table",
             SuspectKind::SplitList => "split_list",
             SuspectKind::EmptyTable => "empty_table",
+            SuspectKind::MissedHeading => "missed_heading",
+            SuspectKind::TrailingMarker => "trailing_marker",
+            SuspectKind::SeparatedCaption => "separated_caption",
             SuspectKind::CaptionIssue => "caption_issue",
         }
     }

@@ -10,6 +10,7 @@ pub mod id;
 pub mod invariant;
 pub mod llm;
 pub mod markdown;
+pub mod mechanical;
 pub mod ops;
 pub mod refine;
 pub mod types;
@@ -30,7 +31,8 @@ pub use llm::{
     ToolCall, Usage, VisionClient,
 };
 
-// 独立可用的工具件：探测器（疑点统计）与 full.md 确定性重渲染
+// 独立可用的工具件：探测器（疑点统计）、机械清洗与 full.md 确定性重渲染
 pub use detect::{detect, detect_items, droppable_ids};
 pub use id::{assign_ids, strip_ids};
 pub use markdown::render_markdown;
+pub use mechanical::{MechOutcome, mechanical_clean};

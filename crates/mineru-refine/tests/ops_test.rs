@@ -371,7 +371,7 @@ fn strip_latex_dollar_also_strips_command_residue() {
     );
     assert_eq!(
         r.items[0].item.text(),
-        Some("每个元素均大于零，且 A i j ^ * A j i = 1 。")
+        Some("每个元素均大于零，且 Aij^*Aji=1 。") // 公式体内空白是 OCR 残骸，剥离后整体删除
     );
     assert_eq!(
         r.removed_spans[0].text,

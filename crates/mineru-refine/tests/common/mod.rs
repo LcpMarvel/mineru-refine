@@ -82,6 +82,8 @@ static SUSPECT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"当前疑点：\[(\w+)\] item (it_\d+)").unwrap());
 static EVIDENCE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"证据：(.+)").unwrap());
 pub static NEXT_ID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"后块=(it_\d+)").unwrap());
+static LEVEL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"level=(\d+)").unwrap());
+static OFFSET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"offset=(\d+)").unwrap());
 
 pub type KindHandler = Box<dyn Fn(&str, &str) -> Result<(String, Value), LlmError> + Send + Sync>;
 
@@ -161,6 +163,24 @@ impl MockChat {
                 )));
             }
             SuspectKind::SplitList => ("mergeList".into(), json!({ "idA": id, "idB": id_b()? })),
+            SuspectKind::MissedHeading => {
+                let level = LEVEL_RE
+                    .captures(evidence)
+                    .and_then(|c| c[1].parse::<i64>().ok())
+                    .unwrap_or(2);
+                ("promote".into(), json!({ "id": id, "level": level }))
+            }
+            SuspectKind::TrailingMarker => {
+                let offset = OFFSET_RE
+                    .captures(evidence)
+                    .and_then(|c| c[1].parse::<i64>().ok())
+                    .ok_or_else(|| LlmError(format!("mock 无法从证据解析 offset: {evidence}")))?;
+                ("split".into(), json!({ "id": id, "offset": offset }))
+            }
+            SuspectKind::SeparatedCaption => (
+                "dismiss".into(),
+                json!({ "id": id, "reason": "mock 默认不重排" }),
+            ),
             SuspectKind::CaptionIssue => {
                 return Err(LlmError("mock 未定义 caption_issue 的处理".into()));
             }

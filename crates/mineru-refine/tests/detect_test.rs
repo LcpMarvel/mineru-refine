@@ -301,3 +301,92 @@ fn adjacent_bullet_lines_across_pages_not_cross_page_break() {
     ])));
     assert!(m.is_empty());
 }
+
+// ── 漏标标题 / 段尾节标记 / caption 被标题隔开（hasOp）──
+
+#[test]
+fn missed_heading_flagged_when_prev_numbered_sibling_is_heading() {
+    let m = kinds_of(&items_of(json!([
+        { "type": "text", "text": "4.5核心组织绩效的考核方法", "text_level": 2, "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "4.6核心组织绩效的应用", "page_idx": 0, "bbox": bbox(40) },
+    ])));
+    assert!(!m.contains_key("it_0001"));
+    assert_eq!(m["it_0002"], vec![SuspectKind::MissedHeading]);
+}
+
+#[test]
+fn missed_heading_flagged_via_following_sibling_and_evidence_has_level() {
+    // 4.6（正文）的最近同组前块不存在、后块 4.7 也是正文 → 不标；
+    // 4.7 的最近同组后块 4.8 是标题且编号 +1 → 标。
+    let wl = detect_of(&items_of(json!([
+        { "type": "text", "text": "4.6核心组织绩效的应用", "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "4.7公司十大核心指标", "page_idx": 0, "bbox": bbox(40) },
+        { "type": "text", "text": "4.8部门核心指标", "text_level": 3, "page_idx": 0, "bbox": bbox(80) },
+    ])));
+    let hits: Vec<_> = wl
+        .iter()
+        .filter(|w| w.kind == SuspectKind::MissedHeading)
+        .collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].item_id, "it_0002");
+    assert!(hits[0].evidence.contains("level=3"), "{}", hits[0].evidence);
+}
+
+#[test]
+fn numbered_paragraph_with_comma_or_sentence_end_not_missed_heading() {
+    let m = kinds_of(&items_of(json!([
+        { "type": "text", "text": "3.5根据评价结果优化", "text_level": 2, "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "3.6每季度回顾，并由管代统计汇总。", "page_idx": 0, "bbox": bbox(40) },
+    ])));
+    assert!(!m.contains_key("it_0002"));
+}
+
+#[test]
+fn year_and_percent_prefixes_are_not_numbering() {
+    let m = kinds_of(&items_of(json!([
+        { "type": "text", "text": "2025总体回顾", "text_level": 2, "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "2026工作计划", "page_idx": 0, "bbox": bbox(40) },
+        { "type": "text", "text": "82.36%达标线", "page_idx": 0, "bbox": bbox(80) },
+    ])));
+    assert!(!m.contains_key("it_0002")); // 年份不是编号
+    assert!(!m.contains_key("it_0003")); // 百分数不是编号
+}
+
+#[test]
+fn trailing_marker_flagged_with_suggested_offset() {
+    let wl = detect_of(&items_of(json!([
+        { "type": "text", "text": "负责人按任务项未完成考核（-20元）[相关文件]", "page_idx": 0, "bbox": bbox(0) },
+    ])));
+    assert_eq!(wl[0].kind, SuspectKind::TrailingMarker);
+    assert!(wl[0].evidence.contains("offset=18"), "{}", wl[0].evidence);
+}
+
+#[test]
+fn standalone_marker_not_flagged() {
+    let m = kinds_of(&items_of(json!([
+        { "type": "text", "text": "[相关文件]", "page_idx": 0, "bbox": bbox(0) },
+    ])));
+    assert!(m.is_empty());
+}
+
+#[test]
+fn caption_separated_from_table_by_heading_flagged() {
+    let m = kinds_of(&items_of(json!([
+        { "type": "text", "text": "报告评分表", "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "4.6核心组织绩效的应用", "page_idx": 0, "bbox": bbox(40) },
+        { "type": "table", "table_body": "<table><tr><td>考核项目</td></tr></table>",
+          "table_caption": ["评分"], "page_idx": 0, "bbox": bbox(80) },
+    ])));
+    // 中间块此时还是正文，但是漏标标题候选 → 同样要标（promote 之后疑点不会凭空冒出，保证异常数单调）
+    assert!(m["it_0001"].contains(&SuspectKind::SeparatedCaption));
+}
+
+#[test]
+fn caption_directly_before_table_not_flagged() {
+    let m = kinds_of(&items_of(json!([
+        { "type": "text", "text": "报告评分表", "page_idx": 0, "bbox": bbox(0) },
+        { "type": "table", "table_body": "<table><tr><td>考核项目</td></tr></table>",
+          "table_caption": ["评分"], "page_idx": 0, "bbox": bbox(40) },
+    ])));
+    assert!(!m.contains_key("it_0001"));
+}
