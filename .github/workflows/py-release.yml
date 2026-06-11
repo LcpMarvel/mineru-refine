@@ -1,0 +1,121 @@
+# PyPI 发布：打 tag（v*）触发，四平台并行构建 abi3 wheel + sdist → 测试 → Trusted Publishing 发布。
+# 前置（一次性）：在 PyPI 上登记 Trusted Publisher——
+#   pypi.org → 项目/Pending publisher → owner: LcpMarvel, repo: mineru-refine,
+#   workflow: py-release.yml, environment: pypi。无需任何 token/secret。
+# 手动跑 workflow_dispatch 默认只构建+测试；勾选 publish 输入可强制发布（首发/补发用）。
+name: Python Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: '构建后发布到 PyPI（tag 触发时总是发布，无视此项）'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build ${{ matrix.platform.target }}
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          # arm 用原生 runner + manylinux 容器，绕开交叉工具链（js-release 在那上面踩过坑）
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.target }}
+          path: bindings/python/dist
+          if-no-files-found: error
+
+  sdist:
+    name: build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: bindings/python/dist
+          if-no-files-found: error
+
+  # 在能跑原生二进制的 runner 上冒烟验证 wheel（darwin-x64 没有对应免费 runner，跳过）
+  test:
+    name: test ${{ matrix.platform.target }}
+    needs: build
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.target }}
+          path: dist
+      - name: Smoke test
+        run: |
+          pip install dist/*.whl
+          python -c "import mineru_refine; print(mineru_refine.REFINE_LOGIC_VERSION, mineru_refine.__all__)"
+
+  publish:
+    name: publish pypi
+    needs:
+      - build
+      - sdist
+      - test
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mineru-refine
+    permissions:
+      id-token: write # PyPI Trusted Publishing（OIDC）
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
