@@ -229,11 +229,19 @@ LLM 全部走裸 HTTP(`reqwest`),零 SDK 依赖。
 
 | 变量 | 必需 | 用途 |
 |---|---|---|
-| `DEEPSEEK_APIKEY` | 是 | 文本裁决主力(`deepseek-v4-pro`)。也接受 `RAGENT_DEEPSEEK_APIKEY`。缺失时 refine 直接 fail-open |
+| `DEEPSEEK_APIKEY` | 是 | 文本裁决主力。也接受 `RAGENT_DEEPSEEK_APIKEY`。缺失时 refine 直接 fail-open |
+| `DEEPSEEK_BASE_URL` | 否 | 默认 `https://api.deepseek.com`;可指向私有化部署的 OpenAI 兼容端点 |
+| `DEEPSEEK_MODEL` | 否 | 默认 `deepseek-v4-pro`;换模型时进程内缓存自动按模型名隔离 |
 | `QWEN_APIKEY` | 视觉裁决需要 | 跨页拆表的 Qwen-VL 裁决;缺失则该类疑点搁置 |
 | `QWEN_BASE_URL` | 否 | 默认 DashScope OpenAI 兼容端点 |
 | `QWEN_VISION_MODEL` | 否 | 默认 `qwen-vl-max` |
 | `MINERU_REFINE_PORT` | 否 | HTTP server 端口,默认 8771 |
+
+**完全私有化部署**:文本与视觉两条链路的端点、模型名都可覆盖,文档不出内网。用 vLLM /
+SGLang 等 OpenAI 兼容框架自建服务,把 `DEEPSEEK_BASE_URL` / `QWEN_BASE_URL` 指过去即可。
+要求:文本端点须支持 **tool-call**(`tool_choice: "required"`),视觉端点须支持多图输入。
+裁决质量未在私有模型上基准测试过——保真闸与 fail-open 仍然兜底(改坏会被回滚,最差原样
+返回),但误报率/修复率可能与默认模型不同,建议先拿几份真实文档对比 `report`。
 
 CLI 与 HTTP server 启动时自动加载当前目录的 `.env`;作为库调用时请自行设置环境变量
 (或在宿主程序里加载 `.env`)。
@@ -249,6 +257,21 @@ CLI 与 HTTP server 启动时自动加载当前目录的 `.env`;作为库调用�
   (整轮零成功才 fail-open)。
 - **性能**:疑点默认 8 路并行裁决;常见疑点的上下文(±2 邻居、跨页整页)预载进首条消息,
   省去额外的观察轮次。
+
+### 成本参考
+
+三份真实文档的实测消耗(`report.tokenUsage`),按 DeepSeek-V4-Pro 现行价格
+(2026-06 起:输入缓存命中 ¥0.025 / 未命中 ¥3、输出 ¥6,均为每百万 token)估算:
+
+| 文档 | 裁决轮数 | prompt | completion | 估算花费 |
+|---|---|---|---|---|
+| 战略管理规范(大,content_list 334 KB) | 66 | 195 万 | 2.7 万 | ¥0.5 ~ 1.2(全不命中缓存封顶 ¥6) |
+| 组织绩效管理规范 | 8 | 7.7 万 | 0.1 万 | < ¥0.25 |
+| 管理评审程序 | 7 | 6.7 万 | 0.1 万 | < ¥0.25 |
+
+循环按命中 input cache 设计(system prompt 与 outline 是稳定前缀),多轮迭代里绝大部分
+prompt token 走命中价,实际花费通常远低于全未命中的上限。Qwen-VL 表格裁决单次约 2k
+token,可忽略。无疑点的文档零 LLM 调用,花费为零。
 
 ## CLI
 

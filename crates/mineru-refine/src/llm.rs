@@ -147,19 +147,29 @@ async fn backoff(attempt: u32) {
 }
 
 // ── DeepSeek 裸 API 客户端 ──
-// 接入约定：deepseek-v4-pro / thinking disabled / tool_choice required / temperature 0。
+// 接入约定：thinking disabled / tool_choice required / temperature 0。
+// 端点与模型名可经环境变量覆盖，指向任何 OpenAI 兼容、支持 tool-call 的服务（私有化部署）。
 
-const DEEPSEEK_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
-pub const DEEPSEEK_MODEL: &str = "deepseek-v4-pro";
+const DEEPSEEK_DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
+pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-pro";
+
+/// 实际生效的文本裁决模型名（`DEEPSEEK_MODEL` 覆盖，默认 deepseek-v4-pro）。
+/// 进 refine 缓存 key——换模型不能命中旧模型的缓存结果。
+pub fn effective_deepseek_model() -> String {
+    std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| DEEPSEEK_DEFAULT_MODEL.into())
+}
 
 pub struct DeepSeekClient {
     key: String,
+    base_url: String,
+    model: String,
     http: reqwest::Client,
 }
 
 impl DeepSeekClient {
     /// 早抛：缺 key 立即失败，不静默降级（项目约定）。
     /// .env 的 DEEPSEEK_APIKEY 或 RAGENT_DEEPSEEK_APIKEY 均可。
+    /// `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` 可指向私有化部署的 OpenAI 兼容端点。
     pub fn from_env() -> Result<Arc<Self>, LlmError> {
         let key = std::env::var("DEEPSEEK_APIKEY")
             .or_else(|_| std::env::var("RAGENT_DEEPSEEK_APIKEY"))
@@ -170,6 +180,9 @@ impl DeepSeekClient {
             })?;
         Ok(Arc::new(Self {
             key,
+            base_url: std::env::var("DEEPSEEK_BASE_URL")
+                .unwrap_or_else(|_| DEEPSEEK_DEFAULT_BASE_URL.into()),
+            model: effective_deepseek_model(),
             http: http_client(),
         }))
     }
@@ -194,7 +207,7 @@ struct ChatResponse {
 impl ChatClient for DeepSeekClient {
     async fn chat(&self, messages: &[Message], tools: &Value) -> Result<ChatResult, LlmError> {
         let body = serde_json::json!({
-            "model": DEEPSEEK_MODEL,
+            "model": self.model,
             "messages": messages,
             "tools": tools,
             "tool_choice": "required",
@@ -211,7 +224,7 @@ impl ChatClient for DeepSeekClient {
             }
             let res = match self
                 .http
-                .post(DEEPSEEK_ENDPOINT)
+                .post(format!("{}/chat/completions", self.base_url))
                 .bearer_auth(&self.key)
                 .json(&body)
                 .send()

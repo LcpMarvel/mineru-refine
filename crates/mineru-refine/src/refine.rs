@@ -24,7 +24,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 // 0.7：Rust 重写（逻辑对齐 0.6，实现换底）
 pub const REFINE_LOGIC_VERSION: &str = "0.7.0";
 pub const PROMPT_VERSION: &str = "p4"; // p4：system prompt 与工具集移除 mergeTable
-pub const MODEL_ID: &str = crate::llm::DEEPSEEK_MODEL;
+/// 默认文本裁决模型;运行时可被 `DEEPSEEK_MODEL` 覆盖(见 `cache_key_for`)。
+pub const MODEL_ID: &str = crate::llm::DEEPSEEK_DEFAULT_MODEL;
 
 #[derive(Default)]
 pub struct RefineOptions {
@@ -59,7 +60,10 @@ static CACHE: LazyLock<Mutex<HashMap<String, RefineResult>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn cache_key_for(sha256: &str) -> String {
-    format!("{sha256}:{REFINE_LOGIC_VERSION}:{MODEL_ID}:{PROMPT_VERSION}")
+    format!(
+        "{sha256}:{REFINE_LOGIC_VERSION}:{}:{PROMPT_VERSION}",
+        crate::llm::effective_deepseek_model()
+    )
 }
 
 /// 测试/运维用：清空进程内缓存。
