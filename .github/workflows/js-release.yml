@@ -129,6 +129,8 @@ jobs:
       - name: Publish
         run: |
           npm config set provenance true
+          # napi pre-publish 发平台子包时不带 --access public，新包 + provenance 会被 npm 拒绝
+          npm config set access public
           echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
           bunx napi pre-publish -t npm
           npm publish --access public
