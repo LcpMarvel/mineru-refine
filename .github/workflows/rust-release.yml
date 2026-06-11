@@ -1,0 +1,74 @@
+# crates.io 发布：打 tag（v*）触发，测试 + lint + 打包校验 → Trusted Publishing 发布。
+# 前置（一次性，顺序不能乱）：
+#   1. safe-json-repair 必须已发布到 crates.io（本地构建走 git 依赖，cargo publish 时自动改用 version）。
+#   2. mineru-refine 的首个版本必须本地手动发（crates.io 的 Trusted Publishing 不支持新建 crate）：
+#      cargo login 后跑 `just publish-rust`。
+#   3. crates.io → mineru-refine → Settings → Trusted Publishing → New GitHub config：
+#      owner: LcpMarvel, repo: mineru-refine, workflow: rust-release.yml, environment: crates-io。
+#      配好后即可删掉本地 token。
+# 手动跑 workflow_dispatch 默认只构建+校验；勾选 publish 输入可强制发布（补发用）。
+name: Rust Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: '校验后发布到 crates.io（tag 触发时总是发布，无视此项）'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test & package check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-rust-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-rust-release-
+      - name: Test
+        run: cargo test -p mineru-refine
+      - name: Lint
+        run: |
+          cargo clippy -p mineru-refine --all-targets --features bin -- -D warnings
+          cargo fmt --all --check
+      # 校验打包产物能脱离 git 依赖、用 crates.io 上的 safe-json-repair 编译通过
+      - name: Package check
+        run: cargo publish -p mineru-refine --dry-run
+
+  publish:
+    name: publish crates.io
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/mineru-refine
+    permissions:
+      id-token: write # crates.io Trusted Publishing（OIDC）
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish to crates.io
+        run: cargo publish -p mineru-refine
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

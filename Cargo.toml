@@ -27,9 +27,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 base64 = "0.22.1"
 thiserror = "2.0.18"
-# 本地/CI 构建走 git（钉到 0.1.1 对应提交）；cargo publish 时自动剥掉 git、改用 crates.io 的 version——
-# 因此发布 mineru-refine 前，safe-json-repair 必须先发布到 crates.io（just publish-rust 有前置检查）
-safe-json-repair = { git = "https://github.com/LcpMarvel/safe-json-repair", rev = "2aaaefdb9e3f12d1f96c4d5c06f2da46e4d79d14", version = "0.1.1" }
+safe-json-repair = "0.1.1"
 
 [profile.release]
 opt-level = 3

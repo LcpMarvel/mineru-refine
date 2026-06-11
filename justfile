@@ -58,11 +58,11 @@ publish-check:
     just test
     just check
     just js-build && just js-test
-    cargo publish -p mineru-refine --dry-run --allow-dirty || echo "⚠️  dry-run 失败多半是 safe-json-repair 还没上 crates.io（见 publish-rust 前置）"
+    cargo publish -p mineru-refine --dry-run --allow-dirty
 
-# crates.io。前置：safe-json-repair 必须已发布到 crates.io（本地构建走 git，发布时 cargo 自动改用 version）
+# crates.io。仅首发用——Trusted Publishing 不支持新建 crate；首发后配好 crates.io 的
+# Trusted Publisher，之后打 tag 由 CI（rust-release.yml）自动发布。
 publish-rust:
-    @cargo info safe-json-repair >/dev/null 2>&1 || { echo "❌ safe-json-repair 还没发布到 crates.io —— 先去那个仓库 cargo publish，再回来"; exit 1; }
     cargo publish -p mineru-refine
 
 # PyPI：当前平台 wheel + sdist（其它平台 pip 装 sdist 时本机编译；要预编译多平台 wheel 上 CI 矩阵）

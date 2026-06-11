@@ -1109,7 +1109,8 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "safe-json-repair"
 version = "0.1.1"
-source = "git+https://github.com/LcpMarvel/safe-json-repair?rev=2aaaefdb9e3f12d1f96c4d5c06f2da46e4d79d14#2aaaefdb9e3f12d1f96c4d5c06f2da46e4d79d14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "525efb4a08080acc1abd37802b329c9049d7c2c53514ef04fd1ffdd5c9b4d8a8"
 dependencies = [
  "serde_json",
 ]
