@@ -684,7 +684,7 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "mineru-refine"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "mineru-refine-node"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "mineru-refine",
  "napi",
@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "mineru-refine-py"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "mineru-refine",
  "pyo3",

@@ -1,6 +1,6 @@
 {
   "name": "mineru-refine",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "MinerU output linter/fixer — LLM tool-use loop that restructures (never generates) MinerU content_list. Machine-verified fidelity: C_out ⊆ C_in. Rust core via napi-rs.",
   "license": "MIT",
   "author": "LcpMarvel <lcpmarvel@gmail.com>",
