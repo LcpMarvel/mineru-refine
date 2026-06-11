@@ -16,6 +16,9 @@ concurrency:
 env:
   DEBUG: 'napi:*'
   MACOSX_DEPLOYMENT_TARGET: '10.13'
+  # napi 交叉工具链的老 gcc 汇编 ring 的 ARM .S 时不预定义 __ARM_ARCH，ring 会 #error；
+  # cc-rs 只对 aarch64-linux target 读这个变量，对其他 target 无副作用
+  CFLAGS_aarch64_unknown_linux_gnu: '-D__ARM_ARCH=8'
 
 defaults:
   run:
