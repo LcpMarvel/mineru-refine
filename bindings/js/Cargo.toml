@@ -1,0 +1,22 @@
+[package]
+name = "mineru-refine-node"
+description = "napi-rs wrapper over the mineru-refine core — powers the npm package."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mineru-refine-core = { package = "mineru-refine", path = "../../crates/mineru-refine" }
+serde_json.workspace = true
+napi = { version = "3.9.1", default-features = false, features = ["napi8", "serde-json", "async"] }
+napi-derive = "3.5.6"
+
+[build-dependencies]
+napi-build = "2.3.0"

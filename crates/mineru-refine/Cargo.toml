@@ -1,0 +1,54 @@
+[package]
+name = "mineru-refine"
+description = "MinerU output linter/fixer — LLM tool-use loop that restructures (never generates) MinerU content_list. Machine-verified fidelity: C_out ⊆ C_in."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords = ["mineru", "pdf", "llm", "linter", "postprocess"]
+categories = ["text-processing"]
+readme = "README.md"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+base64.workspace = true
+thiserror.workspace = true
+safe-json-repair.workspace = true
+
+# server 二进制专用
+axum = { version = "0.8.9", optional = true }
+dotenvy = { version = "0.15.7", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default = []
+bin = ["dep:axum", "dep:dotenvy"]
+
+[[bin]]
+name = "mineru-refine"
+path = "src/bin/cli.rs"
+required-features = ["bin"]
+
+# 真实数据工作流（需要 .env 的真 key 与 test_data 产物）
+[[example]]
+name = "qwen_smoke"
+required-features = ["bin"]
+
+[[example]]
+name = "refine_real"
+required-features = ["bin"]
+
+[[bin]]
+name = "mineru-refine-server"
+path = "src/bin/server.rs"
+required-features = ["bin"]

@@ -8,6 +8,17 @@ LaTeX / 链接残留——只做**削减与重组，绝不新增一个字**。�
 由一个 LLM tool-use 循环驱动：确定性探测器找疑点，LLM（DeepSeek v4-pro 裸 API）只负责
 "对这个疑点选哪个修复 op，或裁定误报"；**是否合格由机器闸门裁决，不由 LLM 自评**。
 
+**Rust core + 按语言出 bindings**（结构同 [safe-json-repair](https://github.com/LcpMarvel/safe-json-repair)）：
+核心逻辑、LLM 客户端、保真闸全部在 `crates/mineru-refine`；Python 经 PyO3、JS/TS 经 napi-rs
+直接 import 同一份实现，另有 CLI 与 HTTP server 两个跨语言 transport。
+
+| 语言 | 位置 | 安装 | 形态 |
+|------|------|------|------|
+| **Rust** | `crates/mineru-refine/` | `cargo add mineru-refine` | core |
+| **Python** | [`bindings/python/`](bindings/python/) | `pip install mineru-refine` | PyO3 原生扩展 |
+| **JS/TS** | [`bindings/js/`](bindings/js/) | `bun add mineru-refine` | napi-rs 原生插件（Bun / Node ≥18） |
+| **任意语言** | HTTP server / CLI | `cargo install` 或源码跑 | transport
+
 ## 硬保证
 
 - **保真 `C_out ⊆ C_in`**：内容字符（`text` + `list_items` + `table_caption`，仅计非空白）
@@ -112,44 +123,37 @@ Qwen-VL 视觉裁决**：把 A/B 两表的 MinerU 裁剪图（content_list 的 `
 - 出口合格判定全部是机器检查：worklist 空 ∧ `C_out ⊆ C_in` ∧ 异常数 ≤ 输入 ∧ 几何可定位；
   任一不满足 → fail-open。
 
-## 安装
+## 安装与使用
 
-```bash
-bun add mineru-refine
-```
+各语言入口是同一份 Rust 实现，**选项与返回值完全同构**：`items`（同 schema content_list）
++ `report`。装哪个、怎么调，看对应目录的 README：
 
-> **运行时要求 Bun ≥ 1.1**（直接发布 TS 源码，且使用了 `Bun.file` / `Bun.serve` 等
-> Bun API,不支持纯 Node）。环境变量见下文 [LLM 接入](#llm-接入全部裸-api零-sdk)。
+- **Rust**：[`crates/mineru-refine/`](crates/mineru-refine/) — `cargo add mineru-refine`；
+  CLI / HTTP server 也在这个 crate（`--features bin`）
+- **Python**：[`bindings/python/`](bindings/python/) — `pip install mineru-refine`（PyO3）
+- **JS/TS**：[`bindings/js/`](bindings/js/) — `bun add mineru-refine`（napi-rs，Bun / Node ≥18）
 
-## 使用
+公共选项语义（各语言只是命名风格不同）：
 
-### 作为库（收/发内存对象，不读写文件）
-
-```ts
-import { refine, imageDirLoader } from "mineru-refine";
-
-const { items, report } = await refine(contentList, {
-  sha256,          // 可选；提供则启用进程内缓存
-  maxIterations,   // 外层循环硬上限；不传则自适应：min(max(48, 2×疑点数+16), 512)
-  concurrency,     // 疑点并行裁决数，默认 8；1 = 严格串行
-  loadImage: imageDirLoader(mineruOutputDir), // 可选；不提供则 split_table 整体跳过（视觉是其唯一裁决路径）
-});
-```
-
-缓存 key = `sha256 + refineLogicVersion + model + promptVersion`——只用 SHA256 是错的，
-逻辑/prompt/模型一变旧结果会错误命中。
+| 选项 | 语义 |
+|---|---|
+| `sha256` | 可选；提供则启用进程内缓存。缓存 key = `sha256 + refineLogicVersion + model + promptVersion`——只用 SHA256 是错的，逻辑/prompt/模型一变旧结果会错误命中 |
+| `maxIterations` | 外层循环硬上限；不传则自适应 `min(max(48, 2×疑点数+16), 512)` |
+| `concurrency` | 疑点并行裁决数，默认 8；1 = 严格串行 |
+| `imageDir` | MinerU 产物目录；提供则 split_table 启用 Qwen-VL 视觉裁决，不提供则该类疑点整体跳过（视觉是其唯一裁决路径） |
 
 `report` 字段：`iterations` / `opCounts` / `dismissed` / `removedSpans` / `violations` /
 `tokenUsage` / `failOpen`。
 
 性能：疑点默认 8 路并行裁决，常见疑点的上下文（±2 邻居 / 跨页整页）预载进首条消息省观察
 轮次；DeepSeek 调用对网络错误/429/5xx 自动重试，单疑点故障只搁置自身不毁全局（全程零成功
-才 fail-open）。实测 71 页 / 1004 items / 46 疑点：~86s（串行 ~622s）。
+才 fail-open）。
 
 ### HTTP 服务（跨语言消费方首选）
 
 ```bash
-bunx mineru-refine-server       # 或源码仓内 bun run server；默认端口 8771，MINERU_REFINE_PORT 可改
+cargo run -p mineru-refine --features bin --release --bin mineru-refine-server
+# 默认端口 8771，MINERU_REFINE_PORT 可改
 curl -X POST localhost:8771/refine -d '{"items":[...], "sha256":"...", "imageDir":"/abs/mineru/out"}'
 curl localhost:8771/health
 ```
@@ -164,12 +168,13 @@ CLI 同理（stdin 包对象里带 `imageDir` 字段）。
 ### CLI（备选）
 
 ```bash
-cat content_list.json | bunx mineru-refine      # stdin JSON → stdout JSON
+cat content_list.json | cargo run -p mineru-refine --features bin --release --bin mineru-refine
+# stdin JSON → stdout JSON；stdin 也可是 { "items": [...], "sha256"?, "maxIterations"?, "imageDir"? } 包对象
 ```
 
 ## LLM 接入（全部裸 API，零 SDK）
 
-**DeepSeek `deepseek-v4-pro`（文本裁决主力）**——裸 `fetch` 打 `POST https://api.deepseek.com/chat/completions`：
+**DeepSeek `deepseek-v4-pro`（文本裁决主力）**——裸 `reqwest` 打 `POST https://api.deepseek.com/chat/completions`：
 
 - 本库不碰 fs/bash/MCP，SDK 全是死重，且翻译层历史上吞过 tool-call。
 - key 取 `.env` 的 `DEEPSEEK_APIKEY`（或环境变量 `RAGENT_DEEPSEEK_APIKEY`），缺则启动即抛。
@@ -180,7 +185,7 @@ cat content_list.json | bunx mineru-refine      # stdin JSON → stdout JSON
 - 省钱：system prompt + 文档 outline 放 messages 前缀且每轮不变，吃 DeepSeek 的
   input cache hit（命中价约为 miss 的 1/120）。
 
-**Qwen `qwen-vl-max`（split_table 视觉裁决）**——裸 `fetch` 打 DashScope OpenAI 兼容端点：
+**Qwen `qwen-vl-max`（split_table 视觉裁决）**——裸 `reqwest` 打 DashScope OpenAI 兼容端点：
 
 - 环境变量：`QWEN_APIKEY`（必填）、`QWEN_BASE_URL` / `QWEN_VISION_MODEL`（有默认值）。
 - 图走 base64 data URL，`temperature: 0`，回复按 JSON 裁决解析（过 `safe-json-repair`）。
@@ -189,11 +194,11 @@ cat content_list.json | bunx mineru-refine      # stdin JSON → stdout JSON
 ## 开发
 
 ```bash
-bun install
-bun test                        # 全程 mock LLM，不打网络
-bun run typecheck
-bun run m0                      # 冒烟：验真实 DeepSeek 多轮 tool-call（需 key）
-bun run m0:vl                   # 冒烟：验真实 Qwen-VL 判表（三对真实表格图，需 key）
+just test         # cargo test：全程 mock LLM，不打网络（96 个测试）
+just check        # clippy -D warnings + fmt --check
+just smoke-vl     # 冒烟：验真实 Qwen-VL 判表（三对真实表格图，需 key）
+just js-build     # JS 绑定本地构建（napi）
+just py-dev       # Python 绑定构建并装进 .venv
 ```
 
 测试覆盖 eval 六件套：① golden fixtures ② `C_out ⊆ C_in` ③ table_body 逐字节不变
@@ -204,12 +209,12 @@ bun run m0:vl                   # 冒烟：验真实 Qwen-VL 判表（三对真�
 
 ```bash
 # .env 需有 MINERU_API_TOKEN
-bun run mineru:fetch            # 把 test_data/source/ 下的 PDF/DOC 交 MinerU 官方 API 解析，
+just mineru-fetch               # 把 test_data/source/ 下的 PDF/DOC 交 MinerU 官方 API 解析，
                                 # 产物落盘 test_data/mineru/<stem>/
                                 # （--force 重跑；--batch <id> 复用已完成的 batch）
-bun run refine:real             # 对全部真实 content_list 跑 refine（真 LLM），
+just refine-real                # 对全部真实 content_list 跑 refine（真 LLM），
                                 # 输出 test_data/refined/<stem>/，打印疑点前后对比
-bun run refine:real <stem>      # 只跑某个文档；REFINE_MAX_ITERATIONS 可调上限
+just refine-real <stem>         # 只跑某个文档；REFINE_MAX_ITERATIONS 可调上限
 ```
 
 `test_data/refined/<stem>/` 是对应 MinerU 产物目录的 **drop-in 替身**：images/、layout.json
@@ -219,19 +224,25 @@ items 确定性重渲染，另附 `refine_report.json`（审计：ops/dismissed/
 ## 目录结构
 
 ```
-src/types.ts      # MineruItem / WorkItem / OpCall / RefineReport
-src/id.ts         # 内部稳定 ID（出口剥除，绝不进输出 schema）
-src/detect.ts     # 确定性异常探测器 → worklist
-src/ops/index.ts  # 9 个削减/重组 op + 保真闸 + 回滚
-src/invariant.ts  # C_out ⊆ C_in / table_body / 几何校验
-src/loop.ts       # 确定性外层循环 + LLM tool-use + 守卫
-src/deepseek.ts   # 裸 fetch v4-pro（thinking disabled / tool_choice required / temp 0）
-src/qwen_vl.ts    # 裸 fetch qwen-vl-max（split_table 唯一裁决路径，失败搁置）
-src/markdown.ts   # 清洗后 items → full.md 确定性重渲染
-src/refine.ts     # 入口：fail-open + 缓存 + 出口闸门
-src/server.ts     # HTTP transport
-src/cli.ts        # stdin/stdout transport
+crates/mineru-refine/            # Rust core
+  src/types.rs                   #   MineruItem(保序 JSON 对象) / WorkItem / OpCall / RefineReport
+  src/id.rs                      #   内部稳定 ID（出口剥除，绝不进输出 schema）
+  src/detect.rs                  #   确定性异常探测器 → worklist
+  src/ops.rs                     #   9 个削减/重组 op + 保真闸 + 回滚
+  src/invariant.rs               #   C_out ⊆ C_in / table_body / 几何校验
+  src/agent_loop.rs              #   确定性外层循环 + LLM tool-use + 守卫
+  src/llm.rs                     #   裸 reqwest：DeepSeek + Qwen-VL（trait 注入，测试 mock）
+  src/markdown.rs                #   清洗后 items → full.md 确定性重渲染
+  src/refine.rs                  #   入口：fail-open + 缓存 + 出口闸门
+  src/bin/{cli,server}.rs        #   stdin/stdout 与 HTTP transport
+  examples/{qwen_smoke,refine_real}.rs   # 真实数据工作流
+  tests/                         #   eval 六件套 + 守卫/绑定回归（mock LLM）
+bindings/python/                 # PyO3 → pip install mineru-refine
+bindings/js/                     # napi-rs → bun add mineru-refine
+scripts/mineru_fetch.ts          # MinerU 官方 API 拉取测试产物（Bun）
 ```
+
+> TS 原实现（v0.6.0）已整体由 Rust 重写替代，历史可在 git `b87f698` 之前找回。
 
 ## 边界（有意不做的）
 

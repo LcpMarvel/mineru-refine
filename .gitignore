@@ -1,3 +1,15 @@
 node_modules/
 .env
 test_data/
+
+# Rust
+target/
+
+# Python binding
+bindings/python/.venv/
+bindings/python/dist/
+__pycache__/
+
+# JS binding 本地构建产物（CI 按平台出包）
+bindings/js/*.node
+bindings/js/npm/

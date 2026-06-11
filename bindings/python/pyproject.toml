@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "mineru-refine"
+description = "MinerU output linter/fixer — LLM tool-use loop that restructures (never generates) MinerU content_list. Machine-verified fidelity: C_out ⊆ C_in."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "LcpMarvel", email = "lcpmarvel@gmail.com" }]
+requires-python = ">=3.9"
+keywords = ["mineru", "pdf", "content-list", "postprocess", "linter", "llm"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/LcpMarvel/mineru-refine"
+
+[tool.maturin]
+exclude = ["dist/**", ".venv/**"]
+manifest-path = "Cargo.toml"
+module-name = "mineru_refine"
+features = ["pyo3/extension-module"]

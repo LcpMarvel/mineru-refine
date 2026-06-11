@@ -1,0 +1,58 @@
+{
+  "name": "mineru-refine",
+  "version": "0.7.0",
+  "description": "MinerU output linter/fixer — LLM tool-use loop that restructures (never generates) MinerU content_list. Machine-verified fidelity: C_out ⊆ C_in. Rust core via napi-rs.",
+  "license": "MIT",
+  "author": "LcpMarvel <lcpmarvel@gmail.com>",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "napi": {
+    "binaryName": "mineru-refine",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu"
+    ]
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "mineru",
+    "pdf",
+    "content-list",
+    "document-parsing",
+    "postprocess",
+    "linter",
+    "llm",
+    "deepseek",
+    "qwen-vl",
+    "napi-rs"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LcpMarvel/mineru-refine.git",
+    "directory": "bindings/js"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.4.0"
+  },
+  "optionalDependencies": {
+    "mineru-refine-darwin-arm64": "0.7.0",
+    "mineru-refine-darwin-x64": "0.7.0",
+    "mineru-refine-linux-x64-gnu": "0.7.0",
+    "mineru-refine-linux-arm64-gnu": "0.7.0"
+  }
+}

@@ -1,0 +1,21 @@
+[package]
+name = "mineru-refine-py"
+description = "PyO3 wrapper over the mineru-refine core — powers the PyPI package."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "mineru_refine"
+crate-type = ["cdylib"]
+
+[dependencies]
+mineru-refine-core = { package = "mineru-refine", path = "../../crates/mineru-refine" }
+serde_json.workspace = true
+tokio.workspace = true
+pyo3 = { version = "0.28.3", features = ["extension-module"] }
+pythonize = "0.28.0"
