@@ -188,3 +188,73 @@ async fn broken_json_arguments_repaired_by_safe_json_repair() {
     .unwrap();
     assert_eq!(r.op_counts.get("demote"), Some(&1));
 }
+
+#[tokio::test]
+async fn contradictory_dismiss_plus_op_rejected_then_redecided() {
+    // 实测场景复现：LLM 把「应 drop」的分析写进 dismiss.reason，同响应又并行调 drop。
+    // 期望：两个调用全部驳回（不静默采纳先到者），回灌矛盾反馈，模型重裁后 drop 落地。
+    let (ref_items, next_id) = assign_ids(&golden_input());
+    let artifact_rounds = Arc::new(AtomicU64::new(0));
+    let ar = artifact_rounds.clone();
+    let chat = FnChat::new(move |messages: &[Message], _: &Value| {
+        let (kind, id, evidence) = parse_suspect(common::first_user_content(messages))?;
+        if kind == mineru_refine::types::SuspectKind::PageArtifact {
+            let round = ar.fetch_add(1, Ordering::Relaxed);
+            if round == 0 {
+                return Ok(common::multi_tool_reply(vec![
+                    (
+                        "dismiss",
+                        json!({ "id": id, "reason": "……证据充分，应 drop 而非 dismiss" }),
+                    ),
+                    ("drop", json!({ "id": id })),
+                ]));
+            }
+            // 第二轮：两个调用必须各收到一条「决策矛盾」反馈，缺了就是实现回归
+            let feedback_ok = messages
+                .iter()
+                .rev()
+                .take(2)
+                .all(|m| matches!(m, Message::Tool { content, .. } if content.contains("决策矛盾")));
+            if !feedback_ok {
+                return Err(mineru_refine::llm::LlmError(
+                    "矛盾决策未被驳回（缺少决策矛盾反馈）".into(),
+                ));
+            }
+            return Ok(call("drop", json!({ "id": id, "reason": "确认为页码，删除" })));
+        }
+        let (name, args) = common::MockChat::default_decision(kind, &id, &evidence)?;
+        Ok(call(&name, args))
+    });
+
+    let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+    let lg = logs.clone();
+    let r = run_loop(
+        ref_items,
+        next_id,
+        LoopOptions {
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+            max_rounds_per_suspect: DEFAULT_MAX_ROUNDS,
+            concurrency: 1,
+            chat: Arc::new(chat),
+            load_image: None,
+            vision: None,
+            log: Arc::new(move |s| lg.lock().unwrap().push(s.to_string())),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(artifact_rounds.load(Ordering::Relaxed), 2); // 驳回后确实重裁了一轮
+    assert_eq!(r.op_counts.get("drop"), Some(&1)); // 重裁后 drop 落地
+    assert!(!r.items.iter().any(|x| x.id == "it_0005")); // 页码真的删了
+    let logs = logs.lock().unwrap();
+    assert!(
+        logs.iter().any(|l| l.contains("决策矛盾 [page_artifact] it_0005")),
+        "矛盾驳回应有日志: {logs:?}"
+    );
+    assert!(
+        logs.iter()
+            .any(|l| l.contains("drop [page_artifact] it_0005: 确认为页码，删除")),
+        "op 落地应带 reason 审计日志: {logs:?}"
+    );
+}

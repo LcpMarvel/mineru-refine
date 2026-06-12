@@ -108,6 +108,34 @@ pub fn tool_reply(call_id: u64, name: &str, arguments: String) -> ChatResult {
     }
 }
 
+/// 一条响应里并行发多个 tool_call（矛盾决策守卫测试用）。
+pub fn multi_tool_reply(calls: Vec<(&str, Value)>) -> ChatResult {
+    static N: AtomicU64 = AtomicU64::new(0);
+    ChatResult {
+        message: AssistantMessage {
+            content: None,
+            tool_calls: Some(
+                calls
+                    .into_iter()
+                    .map(|(name, args)| ToolCall {
+                        id: format!("call_m{}", N.fetch_add(1, Ordering::Relaxed) + 1),
+                        call_type: "function".into(),
+                        function: ToolCallFunction {
+                            name: name.to_string(),
+                            arguments: args.to_string(),
+                        },
+                    })
+                    .collect(),
+            ),
+        },
+        finish_reason: "tool_calls".into(),
+        usage: Usage {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+        },
+    }
+}
+
 /// 从 user 消息解析疑点 kind/id，按 kind 直接回对应 op 的 tool_call。
 pub struct MockChat {
     pub calls: AtomicU64,
@@ -132,7 +160,7 @@ impl MockChat {
         self.calls.load(Ordering::Relaxed)
     }
 
-    fn default_decision(
+    pub fn default_decision(
         kind: SuspectKind,
         id: &str,
         evidence: &str,

@@ -61,6 +61,13 @@ static TOOLS: LazyLock<Value> = LazyLock::new(|| {
         p["description"] = Value::String(desc.to_string());
         p
     };
+    // 所有变更 op 共用的裁决依据参数：拆掉「只有 dismiss 能说话」的不对称
+    // （实测 LLM 想留下分析时会被吸到唯一带自由文本参数的 dismiss 上，酿成矛盾决策），
+    // 同时让 op 落地在日志里可审计。
+    let reason_param = serde_json::json!({
+        "type": "string",
+        "description": "一句话裁决依据（写入审计日志）"
+    });
     serde_json::json!([
         // 观察类（只读）
         { "type": "function", "function": {
@@ -103,6 +110,7 @@ static TOOLS: LazyLock<Value> = LazyLock::new(|| {
             "parameters": { "type": "object", "properties": {
                 "idA": id_a("前块 ID"),
                 "idB": id_a("紧随其后的块 ID"),
+                "reason": reason_param.clone(),
             }, "required": ["idA", "idB"] },
         }},
         { "type": "function", "function": {
@@ -111,12 +119,13 @@ static TOOLS: LazyLock<Value> = LazyLock::new(|| {
             "parameters": { "type": "object", "properties": {
                 "id": id_param,
                 "offset": { "type": "integer", "description": "切分点字符位置" },
+                "reason": reason_param.clone(),
             }, "required": ["id", "offset"] },
         }},
         { "type": "function", "function": {
             "name": "demote",
             "description": "把被误判为标题的块降级为正文（清除 text_level）。",
-            "parameters": { "type": "object", "properties": { "id": id_param }, "required": ["id"] },
+            "parameters": { "type": "object", "properties": { "id": id_param, "reason": reason_param.clone() }, "required": ["id"] },
         }},
         { "type": "function", "function": {
             "name": "promote",
@@ -124,6 +133,7 @@ static TOOLS: LazyLock<Value> = LazyLock::new(|| {
             "parameters": { "type": "object", "properties": {
                 "id": id_param,
                 "level": { "type": "integer", "description": "标题层级 1-6" },
+                "reason": reason_param.clone(),
             }, "required": ["id", "level"] },
         }},
         { "type": "function", "function": {
@@ -131,12 +141,13 @@ static TOOLS: LazyLock<Value> = LazyLock::new(|| {
             "description": "重排一段连续区间内的块顺序（修跨页错序）。传入这些块 ID 的正确顺序，它们必须在文档中本就连续。",
             "parameters": { "type": "object", "properties": {
                 "idsInOrder": { "type": "array", "items": { "type": "string" }, "description": "按正确顺序排列的稳定 ID 列表" },
+                "reason": reason_param.clone(),
             }, "required": ["idsInOrder"] },
         }},
         { "type": "function", "function": {
             "name": "drop",
             "description": "删除混入正文的页码/页眉/页脚/水印块。只允许删被探测器标记为 page_artifact 的块。",
-            "parameters": { "type": "object", "properties": { "id": id_param }, "required": ["id"] },
+            "parameters": { "type": "object", "properties": { "id": id_param, "reason": reason_param.clone() }, "required": ["id"] },
         }},
         { "type": "function", "function": {
             "name": "strip",
@@ -144,6 +155,7 @@ static TOOLS: LazyLock<Value> = LazyLock::new(|| {
             "parameters": { "type": "object", "properties": {
                 "id": id_param,
                 "pattern": { "type": "string", "enum": ["md_link", "latex_dollar", "latex_block", "latex_command", "escaped_dollar", "html_tag"] },
+                "reason": reason_param.clone(),
             }, "required": ["id", "pattern"] },
         }},
         { "type": "function", "function": {
@@ -152,6 +164,7 @@ static TOOLS: LazyLock<Value> = LazyLock::new(|| {
             "parameters": { "type": "object", "properties": {
                 "id": id_param,
                 "offset": { "type": "integer", "description": "待删字符的字符位置（疑点证据中给出）" },
+                "reason": reason_param.clone(),
             }, "required": ["id", "offset"] },
         }},
         // 注：mergeTable 不在文本工具集里——split_table 仅视觉裁决（try_vision_verdict），
@@ -163,6 +176,7 @@ static TOOLS: LazyLock<Value> = LazyLock::new(|| {
                 "idA": id_a("前 list ID"),
                 "idB": id_a("续 list ID"),
                 "joinSeam": { "type": "boolean", "description": "A 尾项与 B 首项是否缝成一项（断句跨页时 true），默认 false" },
+                "reason": reason_param.clone(),
             }, "required": ["idA", "idB"] },
         }},
     ])
@@ -201,7 +215,10 @@ const SYSTEM_PROMPT: &str = r#"你是 MinerU PDF 解析结果的结构修复器�
    - 但 page_artifact 证据若给出「已分类页眉/页脚同文佐证」，说明同文块在别处已被正确分类为页面家具，该块就是漏标的同款 → 应 drop，不要因「像标题」而 dismiss。
    - 同一文本的多处 page_artifact 疑点应裁决一致：要删都删，不要删一处留其余。
 4. 修复只许削减/重组（merge/split/demote/promote/reorder/drop/strip/deleteChar/mergeList），系统会机器校验"不新增任何字符、表格行不被篡改"，违规会被自动回滚。
-5. 每个疑点最终以【一个】变更 op 或 dismiss 收尾。"#;
+5. 每个疑点最终以【一个】变更 op 或 dismiss 收尾；绝不在同一条回复里同时调用 dismiss 和变更 op（矛盾决策会被整体驳回重裁）。变更 op 请在 reason 参数里给一句话依据。"#;
+
+/// 同一响应同时出现 dismiss 与变更 op 时回灌给 LLM 的驳回话术。
+const CONTRADICTION_FEEDBACK: &str = "决策矛盾：同一条回复同时调用了 dismiss 和变更 op，均未执行。请重新裁决，只给出【一个】变更 op 或 dismiss。";
 
 // ── 观察工具实现（确定性，只读）──
 
@@ -917,6 +934,21 @@ async fn handle_suspect(
             tool_calls: Some(calls.clone()),
         });
 
+        // 决策矛盾守卫：同一响应同时调用 dismiss 与变更 op（实测 LLM 会把「应 drop」的
+        // 完整分析写进 dismiss.reason 却落 dismiss）。顺序采纳任一方都可能错——
+        // 全部驳回，回灌错误显式重裁，而非静默采纳先到的那个。
+        let contradictory = calls.iter().any(|c| c.function.name == "dismiss")
+            && calls
+                .iter()
+                .any(|c| OP_NAMES.contains(&c.function.name.as_str()));
+        if contradictory {
+            (ctx.log)(&format!(
+                "决策矛盾 [{}] {}: 同响应同时调用 dismiss 与变更 op，全部驳回重裁",
+                target.kind.as_str(),
+                target.item_id
+            ));
+        }
+
         for call in &calls {
             let name = call.function.name.as_str();
             let Some(args) = parse_json_safe(&call.function.arguments) else {
@@ -944,6 +976,13 @@ async fn handle_suspect(
             }
 
             if name == "dismiss" {
+                if contradictory {
+                    messages.push(Message::Tool {
+                        tool_call_id: call.id.clone(),
+                        content: CONTRADICTION_FEEDBACK.into(),
+                    });
+                    continue;
+                }
                 let reason = args
                     .get("reason")
                     .and_then(Value::as_str)
@@ -960,6 +999,13 @@ async fn handle_suspect(
             }
 
             if OP_NAMES.contains(&name) {
+                if contradictory {
+                    messages.push(Message::Tool {
+                        tool_call_id: call.id.clone(),
+                        content: CONTRADICTION_FEEDBACK.into(),
+                    });
+                    continue;
+                }
                 let op_call = match to_op_call(name, &args) {
                     Ok(c) => c,
                     Err(e) => {
@@ -1008,6 +1054,16 @@ async fn handle_suspect(
                     }
                 };
                 if let Some(outcome) = outcome {
+                    // op 落地审计日志（与 dismiss 同格式，reason 来自工具调用的可选参数）
+                    let reason = args
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("（未给理由）");
+                    (ctx.log)(&format!(
+                        "{name} [{}] {}: {reason}",
+                        target.kind.as_str(),
+                        target.item_id
+                    ));
                     return Ok(outcome);
                 }
                 let (reason, kind) = rejected.unwrap();
