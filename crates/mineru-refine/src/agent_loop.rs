@@ -523,7 +523,8 @@ fn suspect_key(w: &WorkItem) -> String {
 
 // ── 裁决单元（兄弟组归并）──
 
-/// 裁决单元：单疑点，或一组结构平行的 missed_heading 编号兄弟（一次对话联合裁决）。
+/// 裁决单元：单疑点，或一组需一致裁决的同类疑点（一次对话联合裁决）——
+/// missed_heading 编号兄弟组 / page_artifact 同文组。
 enum Unit {
     Single(WorkItem),
     Group(Vec<WorkItem>),
@@ -532,7 +533,8 @@ enum Unit {
 /// 兄弟组单次对话的成员上限：组再大就切块，避免撑爆单对话上下文。
 const MAX_GROUP_SIZE: usize = 10;
 
-/// 把同一编号兄弟组的 missed_heading 疑点归并为一个联合裁决单元。
+/// 把需一致裁决的同类疑点归并为联合裁决单元：missed_heading 编号兄弟组 +
+/// page_artifact 同文组。
 /// 同组判据：同数制、同深度、同父编号，且按文档序末位编号严格递增
 /// （编号回落 = 新小节，断组）。组 ≥2 才联合，单个照走单疑点流程。
 /// 根治两类实测抖动：组内成员并行裁决互相不可见导致的节内不一致，
@@ -565,6 +567,23 @@ fn assemble_units(actionable: Vec<WorkItem>, items: &[RefItem]) -> Vec<Unit> {
             _ => runs.push(vec![*pos]),
         }
     }
+    // 同文 page_artifact 归并：同一文本的多处疑点合成一组（实测 11 处「问题导向：」
+    // 并行裁决互不可见，10 处 dismiss、1 处 drop，违反「同文裁决一致」规则）。
+    // 同文组不设上限：拆块会把不一致问题原样带回来，且成员行短、撑不爆上下文。
+    let mut by_text: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (pos, w) in actionable.iter().enumerate() {
+        if w.kind != SuspectKind::PageArtifact {
+            continue;
+        }
+        let Some(i) = index_of_id(items, &w.item_id) else {
+            continue;
+        };
+        let Some(text) = items[i].item.text() else {
+            continue;
+        };
+        by_text.entry(text.trim()).or_default().push(pos);
+    }
+    runs.extend(by_text.into_values().filter(|g| g.len() >= 2));
     let mut head_of: HashMap<usize, &[usize]> = HashMap::new(); // 组首位置 → 整组位置
     let mut tail_member: HashSet<usize> = HashSet::new(); // 非组首成员位置（跳过）
     for run in runs.iter().filter(|r| r.len() >= 2) {
@@ -834,7 +853,7 @@ pub async fn run_loop(
             break;
         }
 
-        // 兄弟组归并：同组 missed_heading 合成一个联合裁决单元，只占一个 iteration 槽位
+        // 组归并：编号兄弟组 / 同文 artifact 组合成联合裁决单元，只占一个 iteration 槽位
         let units = {
             let items = state.lock().unwrap();
             assemble_units(actionable, &items)
@@ -1296,59 +1315,93 @@ async fn handle_suspect(
     })
 }
 
-/// 编号兄弟组联合裁决：一次对话裁决整组 missed_heading 成员，要求组内一致
-/// （结构平行的同级编号要么都是标题，要么都是正文）。逐成员以 promote/dismiss
-/// 收尾，全部裁完或轮数耗尽（剩余成员搁置）才结束。
+/// 组联合裁决：一次对话裁决整组同类成员，要求组内一致。两种组形态：
+/// - missed_heading 编号兄弟组（结构平行的同级编号要么都是标题，要么都是正文）；
+/// - page_artifact 同文组（同一文本的多处疑点要删都删，不删都留）。
+///
+/// 逐成员以变更 op/dismiss 收尾，全部裁完或轮数耗尽（剩余成员搁置）才结束。
 async fn handle_group(
     members: &[WorkItem],
     state: &Arc<Mutex<Vec<RefItem>>>,
     worklist: &[WorkItem],
     ctx: &SuspectCtx,
 ) -> Result<Vec<(WorkItem, SuspectOutcome)>, LlmError> {
+    let kind = members[0].kind;
+    let kind_label = kind.as_str();
+    let group_label = match kind {
+        SuspectKind::PageArtifact => "同文组联合裁决",
+        _ => "兄弟组联合裁决",
+    };
     let ids: Vec<&str> = members.iter().map(|w| w.item_id.as_str()).collect();
     (ctx.log)(&format!(
-        "兄弟组联合裁决 [missed_heading] {} 个成员: {}",
+        "{group_label} [{kind_label}] {} 个成员: {}",
         members.len(),
         ids.join(", ")
     ));
 
-    let (member_block, outline) = {
+    let (member_block, preload) = {
         let items = state.lock().unwrap();
         let block = members
             .iter()
             .enumerate()
             .map(|(n, w)| {
-                let current = index_of_id(&items, &w.item_id)
-                    .map(|i| fmt_item(&items[i], 600))
-                    .unwrap_or_else(|| "（已不存在）".into());
+                // 同文组的成员文本全同，逐成员给 ±1 邻居上下文（裁决「正文引导语还是
+                // 页面家具」靠的是各处的落点环境）；兄弟组给成员自身全文即可。
+                let current = if kind == SuspectKind::PageArtifact {
+                    exec_observe(
+                        "getItems",
+                        &serde_json::json!({ "id": w.item_id, "before": 1, "after": 1 }),
+                        &items,
+                        worklist,
+                    )
+                    .unwrap_or_else(|_| "（已不存在）".into())
+                } else {
+                    index_of_id(&items, &w.item_id)
+                        .map(|i| fmt_item(&items[i], 600))
+                        .unwrap_or_else(|| "（已不存在）".into())
+                };
                 format!(
                     "{}. {} 证据：{}\n   {}",
                     n + 1,
                     w.item_id,
                     w.evidence,
-                    current
+                    current.replace('\n', "\n   ")
                 )
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let outline = exec_observe("outline", &serde_json::json!({}), &items, worklist)
-            .unwrap_or_else(|e| format!("（outline 获取失败: {e}）"));
-        (block, outline)
+        let preload = match kind {
+            SuspectKind::PageArtifact => String::new(), // 同文组用不上标题骨架
+            _ => format!(
+                "\n\n全文标题骨架（outline 预载）：\n{}",
+                exec_observe("outline", &serde_json::json!({}), &items, worklist)
+                    .unwrap_or_else(|e| format!("（outline 获取失败: {e}）"))
+            ),
+        };
+        (block, preload)
     };
 
+    let instruction = match kind {
+        SuspectKind::PageArtifact => format!(
+            "当前疑点组：[page_artifact] 同文组联合裁决（同一文本的 {} 处疑点）。\n\
+             同一文本的多处疑点裁决必须一致：确认是页眉/页脚/页码/水印 → 逐个 drop；是正文（如各小节反复出现的引导语、模板句式）→ 逐个 dismiss。仅当有明确证据某成员确属例外（如首页真标题 vs 其余页漏标页眉）才允许分歧。\n\
+             请对每个成员各调用一次 drop 或 dismiss（可在同一条回复里并行多个调用），绝不对同一成员同时调用两者。",
+            members.len()
+        ),
+        _ => format!(
+            "当前疑点组：[missed_heading] 编号兄弟组联合裁决（{} 个结构平行的同级编号块）。\n\
+             组内裁决必须一致：要么全部 promote 为标题（level 一致，与 outline 中同深度编号标题对齐），要么全部 dismiss 为正文；除非有明确证据某成员确属例外。\n\
+             请对每个成员各调用一次 promote 或 dismiss（可在同一条回复里并行多个调用），绝不对同一成员同时调用两者。",
+            members.len()
+        ),
+    };
     let mut messages: Vec<Message> = vec![
         Message::System {
             content: SYSTEM_PROMPT.to_string(),
         },
         Message::User {
             content: format!(
-                "当前疑点组：[missed_heading] 编号兄弟组联合裁决（{} 个结构平行的同级编号块）。\n\
-                 组内裁决必须一致：要么全部 promote 为标题（level 一致，与 outline 中同深度编号标题对齐），要么全部 dismiss 为正文；除非有明确证据某成员确属例外。\n\
-                 请对每个成员各调用一次 promote 或 dismiss（可在同一条回复里并行多个调用），绝不对同一成员同时调用两者。\n\n\
-                 成员列表：\n{member_block}\n\n\
-                 全文标题骨架（outline 预载）：\n{outline}\n\n\
-                 若以上信息已足够请直接逐成员裁决；不够再调观察工具。",
-                members.len()
+                "{instruction}\n\n成员列表：\n{member_block}{preload}\n\n若以上信息已足够请直接逐成员裁决；不够再调观察工具。"
             ),
         },
     ];
@@ -1361,7 +1414,7 @@ async fn handle_group(
         if round + 2 == ctx.max_rounds {
             messages.push(Message::User {
                 content: format!(
-                    "观察轮数即将用完。请基于已有信息【现在就】对剩余成员逐一裁决（promote 或 dismiss）：{}。不要再调用观察工具。",
+                    "观察轮数即将用完。请基于已有信息【现在就】对剩余成员逐一裁决（变更 op 或 dismiss）：{}。不要再调用观察工具。",
                     pending
                         .iter()
                         .map(|w| w.item_id.as_str())
@@ -1389,7 +1442,7 @@ async fn handle_group(
         let contradicted = contradicted_ids(&calls);
         if !contradicted.is_empty() {
             (ctx.log)(&format!(
-                "决策矛盾 [missed_heading] {}: 同响应对同一成员同时调用 dismiss 与变更 op，相关调用全部驳回重裁",
+                "决策矛盾 [{kind_label}] {}: 同响应对同一成员同时调用 dismiss 与变更 op，相关调用全部驳回重裁",
                 contradicted.iter().cloned().collect::<Vec<_>>().join(", ")
             ));
         }
@@ -1440,7 +1493,7 @@ async fn handle_group(
                     .get("reason")
                     .and_then(Value::as_str)
                     .unwrap_or("（未给理由）");
-                (ctx.log)(&format!("dismiss [missed_heading] {id}: {reason}"));
+                (ctx.log)(&format!("dismiss [{kind_label}] {id}: {reason}"));
                 resolved.push((
                     pending.remove(k),
                     SuspectOutcome::Dismissed {
@@ -1479,7 +1532,7 @@ async fn handle_group(
                 match apply_op_call(
                     name,
                     &args,
-                    "missed_heading",
+                    kind_label,
                     &log_id,
                     state,
                     worklist,

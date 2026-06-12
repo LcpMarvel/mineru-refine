@@ -495,3 +495,63 @@ async fn stale_outline_dismissal_rechallenged_once() {
         "重裁后的 dismiss 应被采纳: {logs:?}"
     );
 }
+
+#[tokio::test]
+async fn same_text_page_artifacts_jointly_adjudicated() {
+    // 同一文本「问题导向：」出现在 3 个不同页被各标 page_artifact，
+    // 应合成一个同文组联合裁决单元（实测 11 处并行裁决出现 10 dismiss + 1 drop 的不一致）。
+    let input = items_of(json!([
+        { "type": "text", "text": "问题导向：", "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "正文甲。", "page_idx": 0, "bbox": bbox(40) },
+        { "type": "text", "text": "问题导向：", "page_idx": 1, "bbox": bbox(0) },
+        { "type": "text", "text": "正文乙。", "page_idx": 1, "bbox": bbox(40) },
+        { "type": "text", "text": "问题导向：", "page_idx": 2, "bbox": bbox(0) },
+        { "type": "text", "text": "正文丙。", "page_idx": 2, "bbox": bbox(40) },
+    ]));
+    let (ref_items, next_id) = assign_ids(&input);
+    let chat = FnChat::new(move |messages: &[Message], _: &Value| {
+        let content = common::first_user_content(messages);
+        assert!(
+            content.contains("同文组联合裁决"),
+            "应是同文组联合裁决 prompt: {content}"
+        );
+        for id in ["it_0001", "it_0003", "it_0005"] {
+            assert!(content.contains(id), "组 prompt 应含成员 {id}");
+        }
+        // 一致裁决：全部 drop（同文要删都删）
+        Ok(common::multi_tool_reply(vec![
+            ("drop", json!({ "id": "it_0001", "reason": "同文页面家具" })),
+            ("drop", json!({ "id": "it_0003", "reason": "同文页面家具" })),
+            ("drop", json!({ "id": "it_0005", "reason": "同文页面家具" })),
+        ]))
+    });
+    let (logs, log) = capturing_log();
+    let r = run_loop(
+        ref_items,
+        next_id,
+        LoopOptions {
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+            max_rounds_per_suspect: DEFAULT_MAX_ROUNDS,
+            concurrency: DEFAULT_CONCURRENCY,
+            chat: Arc::new(chat),
+            load_image: None,
+            vision: None,
+            log,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(r.iterations, 1); // 整组一个槽位
+    assert_eq!(r.op_counts.get("drop"), Some(&3));
+    assert_eq!(r.items.len(), 3); // 三处同文全删，正文保留
+    assert!(r.items.iter().all(|x| x.item.text() != Some("问题导向：")));
+    assert_eq!(r.removed_spans.len(), 3);
+    let logs = logs.lock().unwrap();
+    assert!(
+        logs.iter()
+            .any(|l| l
+                .contains("同文组联合裁决 [page_artifact] 3 个成员: it_0001, it_0003, it_0005")),
+        "缺同文组日志: {logs:?}"
+    );
+}
