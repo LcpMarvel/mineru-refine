@@ -1,6 +1,7 @@
 ---
 name: release
 description: 发布新版本：根据上一个 tag 以来的提交自动推导下一个版本号（feat→minor，否则 patch），bump 三端版本、体检、commit、打 tag 推到 GitHub，由 CI 自动发布 crates.io/PyPI/npm。当用户说"发布一个版本"、"发版"、"release"时使用。不监听 CI 结果。
+model: opus
 ---
 
 # 发布版本：自动推版本号 → bump → 体检 → tag 推送
