@@ -29,8 +29,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 // 0.7：Rust 重写（逻辑对齐 0.6，实现换底）；
 // 0.8：机械清洗 pass + 三个新探测器（missed_heading/trailing_marker/separated_caption）；
 // 0.9：赘字/衍字删除（extra_char 探测器 + deleteChar op，全走 LLM 裁决）；
-// 0.10：重度乱码表视觉重转写层（rewrite_garbled_tables，opt-in）
-pub const REFINE_LOGIC_VERSION: &str = "0.10.0";
+// 0.10：重度乱码表视觉重转写层（rewrite_garbled_tables，opt-in）;
+// 0.11：矛盾决策守卫 + 兄弟组/同文 page_artifact 联合裁决 + dismiss 时序竞争守卫 + promote 层级锚点校正
+pub const REFINE_LOGIC_VERSION: &str = "0.11.0";
 pub const PROMPT_VERSION: &str = "p6"; // p6：extra_char 疑点 op_hint + deleteChar 工具
 /// 默认文本裁决模型;运行时可被 `DEEPSEEK_MODEL` 覆盖(见 `cache_key_for`)。
 pub const MODEL_ID: &str = crate::llm::DEEPSEEK_DEFAULT_MODEL;

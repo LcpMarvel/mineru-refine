@@ -3,10 +3,10 @@
 /** 测试/运维用：清空进程内缓存。 */
 export declare function clearRefineCache(): void
 
+export const CONFUSION_PROMPT_VERSION: string
+
 /** 探测器独立调用：返回疑点列表（kind/itemId/evidence/hasOp），不打 LLM。 */
 export declare function detectSuspects(items: any): any
-
-export const CONFUSION_PROMPT_VERSION: string
 
 export const GARBLED_PROMPT_VERSION: string
 
