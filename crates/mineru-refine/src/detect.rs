@@ -68,7 +68,7 @@ re!(NUM_ARABIC, r"^\s*([0-9]+(?:[.．][0-9]+)*)");
 // ── 编号解析（missed_heading / separated_caption 用）──
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NumStyle {
+pub(crate) enum NumStyle {
     Chapter,
     Chinese,
     Arabic,
@@ -105,7 +105,7 @@ fn cn_value(s: &str) -> Option<u64> {
 /// 解析行首编号 → (编号路径, 数制, 编号在 text 中的字节终点)。
 /// 「4.6核心…」→ ([4,6], Arabic)；「二、范围」→ ([2], Chinese)；「第3章」→ ([3], Chapter)。
 /// 防误判：阿拉伯编号各段 ≤99（排除年份/日期），后随 % 的是数值不是编号。
-fn parse_numbering(text: &str) -> Option<(Vec<u64>, NumStyle, usize)> {
+pub(crate) fn parse_numbering(text: &str) -> Option<(Vec<u64>, NumStyle, usize)> {
     if let Some(c) = NUM_CHAPTER.captures(text) {
         let raw = &c[1];
         let v = raw.parse::<u64>().ok().or_else(|| cn_value(raw))?;
@@ -493,14 +493,11 @@ pub fn detect(items: &[RefItem]) -> Vec<WorkItem> {
                 }
                 let child = items.get(j).filter(|n| {
                     n.item.item_type() == "text"
-                        && n.item
-                            .text()
-                            .and_then(parse_numbering)
-                            .is_some_and(|(cpath, cstyle, _)| {
-                                cstyle == style
-                                    && cpath.len() > depth
-                                    && cpath[..depth] == path[..]
-                            })
+                        && n.item.text().and_then(parse_numbering).is_some_and(
+                            |(cpath, cstyle, _)| {
+                                cstyle == style && cpath.len() > depth && cpath[..depth] == path[..]
+                            },
+                        )
                 });
                 if let Some(ch) = child {
                     let dotted = |p: &[u64]| {

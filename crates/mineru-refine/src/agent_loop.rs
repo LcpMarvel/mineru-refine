@@ -2,15 +2,17 @@
 // LLM 回一个 op 或 dismiss → 执行（保真闸+回滚）→ 重探测。loop-until-dry + 守卫。
 // LLM 不当司机：每个疑点一个独立小对话，工具集固定，tool_choice:required。
 
-use crate::detect::{detect, droppable_ids};
+use crate::detect::{NumStyle, detect, droppable_ids, parse_numbering};
 use crate::id::{IdGen, index_of_id, must_index_of_id};
 use crate::invariant::{input_pages, table_rows};
-use crate::llm::{ChatClient, LlmError, LoadImage, Message, VisionClient, parse_json_safe};
+use crate::llm::{
+    ChatClient, LlmError, LoadImage, Message, ToolCall, VisionClient, parse_json_safe,
+};
 use crate::ops::{ApplyContext, ApplyResult, RejectKind, apply_op_checked};
 use crate::types::{OpCall, RefItem, RemovedSpan, StripPattern, SuspectKind, TokenUsage, WorkItem};
 use regex::Regex;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -215,7 +217,7 @@ const SYSTEM_PROMPT: &str = r#"你是 MinerU PDF 解析结果的结构修复器�
    - 但 page_artifact 证据若给出「已分类页眉/页脚同文佐证」，说明同文块在别处已被正确分类为页面家具，该块就是漏标的同款 → 应 drop，不要因「像标题」而 dismiss。
    - 同一文本的多处 page_artifact 疑点应裁决一致：要删都删，不要删一处留其余。
 4. 修复只许削减/重组（merge/split/demote/promote/reorder/drop/strip/deleteChar/mergeList），系统会机器校验"不新增任何字符、表格行不被篡改"，违规会被自动回滚。
-5. 每个疑点最终以【一个】变更 op 或 dismiss 收尾；绝不在同一条回复里同时调用 dismiss 和变更 op（矛盾决策会被整体驳回重裁）。变更 op 请在 reason 参数里给一句话依据。"#;
+5. 每个疑点最终以【一个】变更 op 或 dismiss 收尾；绝不对同一个块既 dismiss 又调变更 op（矛盾决策会被整体驳回重裁）。变更 op 请在 reason 参数里给一句话依据。"#;
 
 /// 同一响应同时出现 dismiss 与变更 op 时回灌给 LLM 的驳回话术。
 const CONTRADICTION_FEEDBACK: &str = "决策矛盾：同一条回复同时调用了 dismiss 和变更 op，均未执行。请重新裁决，只给出【一个】变更 op 或 dismiss。";
@@ -519,6 +521,207 @@ fn suspect_key(w: &WorkItem) -> String {
     format!("{}:{}", w.kind.as_str(), w.item_id)
 }
 
+// ── 裁决单元（兄弟组归并）──
+
+/// 裁决单元：单疑点，或一组结构平行的 missed_heading 编号兄弟（一次对话联合裁决）。
+enum Unit {
+    Single(WorkItem),
+    Group(Vec<WorkItem>),
+}
+
+/// 兄弟组单次对话的成员上限：组再大就切块，避免撑爆单对话上下文。
+const MAX_GROUP_SIZE: usize = 10;
+
+/// 把同一编号兄弟组的 missed_heading 疑点归并为一个联合裁决单元。
+/// 同组判据：同数制、同深度、同父编号，且按文档序末位编号严格递增
+/// （编号回落 = 新小节，断组）。组 ≥2 才联合，单个照走单疑点流程。
+/// 根治两类实测抖动：组内成员并行裁决互相不可见导致的节内不一致，
+/// 以及大组逐个烧 iteration 预算导致末位成员被 max_iterations 饿死。
+fn assemble_units(actionable: Vec<WorkItem>, items: &[RefItem]) -> Vec<Unit> {
+    // (actionable 下标, 编号路径, 数制)，仅 missed_heading 且行首编号可解析的
+    let parsed: Vec<(usize, Vec<u64>, NumStyle)> = actionable
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w.kind == SuspectKind::MissedHeading)
+        .filter_map(|(pos, w)| {
+            let i = index_of_id(items, &w.item_id)?;
+            let (path, style, _) = parse_numbering(items[i].item.text()?)?;
+            Some((pos, path, style))
+        })
+        .collect();
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    for (k, (pos, path, style)) in parsed.iter().enumerate() {
+        let extends = k > 0
+            && {
+                let (_, ppath, pstyle) = &parsed[k - 1];
+                pstyle == style
+                    && ppath.len() == path.len()
+                    && ppath[..ppath.len() - 1] == path[..path.len() - 1]
+                    && ppath[ppath.len() - 1] < path[path.len() - 1]
+            }
+            && runs.last().is_some_and(|r| r.len() < MAX_GROUP_SIZE);
+        match runs.last_mut() {
+            Some(run) if extends => run.push(*pos),
+            _ => runs.push(vec![*pos]),
+        }
+    }
+    let mut head_of: HashMap<usize, &[usize]> = HashMap::new(); // 组首位置 → 整组位置
+    let mut tail_member: HashSet<usize> = HashSet::new(); // 非组首成员位置（跳过）
+    for run in runs.iter().filter(|r| r.len() >= 2) {
+        head_of.insert(run[0], run);
+        tail_member.extend(run[1..].iter().copied());
+    }
+    actionable
+        .iter()
+        .enumerate()
+        .filter(|(pos, _)| !tail_member.contains(pos))
+        .map(|(pos, w)| match head_of.get(&pos) {
+            Some(run) => Unit::Group(run.iter().map(|&p| actionable[p].clone()).collect()),
+            None => Unit::Single(w.clone()),
+        })
+        .collect()
+}
+
+// ── promote 层级确定性校正 ──
+
+/// 由现存编号标题推举 promote 应得的 level，消除 LLM 对同型编号给出 L2/L3 横跳的抖动：
+/// 同数制同深度标题的 level 众数（平局取更小 level，保证确定性）；
+/// 无同级锚点 → 父编号标题 level+1；锚点全无 → None（沿用 LLM 给的 level）。
+fn expected_heading_level(items: &[RefItem], target_id: &str) -> Option<i64> {
+    let i = index_of_id(items, target_id)?;
+    let (path, style, _) = parse_numbering(items[i].item.text()?)?;
+    let depth = path.len();
+    let mut counts: BTreeMap<i64, u64> = BTreeMap::new();
+    let mut parent_level: Option<i64> = None;
+    for r in items {
+        let Some(level) = r.item.text_level() else {
+            continue;
+        };
+        let Some((p, s, _)) = r.item.text().and_then(parse_numbering) else {
+            continue;
+        };
+        if s != style {
+            continue;
+        }
+        if p.len() == depth {
+            *counts.entry(level).or_insert(0) += 1;
+        } else if depth >= 2 && p.len() == depth - 1 && p[..] == path[..depth - 1] {
+            parent_level = Some(level);
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|&(level, n)| (n, std::cmp::Reverse(level)))
+        .map(|(level, _)| level)
+        .or(parent_level.map(|l| l + 1))
+}
+
+// ── 共用裁决件 ──
+
+/// 工具调用的主目标 id（id 或 idA）。
+fn primary_id(args: &Value) -> Option<String> {
+    args.get("id")
+        .or_else(|| args.get("idA"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// 同一响应里既被 dismiss 又被变更 op 指向的 id 集（矛盾决策，相关调用全部驳回）。
+/// 兄弟组对话里 dismiss(A)+promote(B) 是合法的逐成员裁决，矛盾必须按 id 判。
+fn contradicted_ids(calls: &[ToolCall]) -> HashSet<String> {
+    let id_of = |c: &ToolCall| parse_json_safe(&c.function.arguments).and_then(|a| primary_id(&a));
+    let dismissed: HashSet<String> = calls
+        .iter()
+        .filter(|c| c.function.name == "dismiss")
+        .filter_map(id_of)
+        .collect();
+    calls
+        .iter()
+        .filter(|c| OP_NAMES.contains(&c.function.name.as_str()))
+        .filter_map(id_of)
+        .filter(|id| dismissed.contains(id))
+        .collect()
+}
+
+/// 解析并落地一个变更 op（参数校验 → 防震荡 → promote 层级校正 → 保真闸 → 持锁原子替换）。
+/// 成功返回 Applied 并写审计日志；任何拒绝返回应回灌给 LLM 的反馈文本。
+#[allow(clippy::too_many_arguments)] // 单/组两条裁决路径的共用收口，参数即全部依赖
+fn apply_op_call(
+    name: &str,
+    args: &Value,
+    kind_label: &str,
+    log_id: &str,
+    state: &Arc<Mutex<Vec<RefItem>>>,
+    worklist: &[WorkItem],
+    ctx: &SuspectCtx,
+    violation_count: &mut u64,
+) -> Result<SuspectOutcome, String> {
+    let mut op_call = to_op_call(name, args).map_err(|e| format!("参数错误: {e}"))?;
+    if let Some(banned) = ctx.guard.rejects(&op_call) {
+        return Err(format!("被拒（{banned}）。请 dismiss 或换别的 op。"));
+    }
+    let droppable = droppable_ids(worklist);
+    let mut items = state.lock().unwrap();
+    if let OpCall::Promote { id, level } = &op_call
+        && let Some(exp) = expected_heading_level(&items, id)
+        && exp != *level
+    {
+        (ctx.log)(&format!(
+            "promote level 校正 {level}→{exp} [{kind_label}] {id}（同级编号锚点）"
+        ));
+        op_call = OpCall::Promote {
+            id: id.clone(),
+            level: exp,
+        };
+    }
+    match apply_op_checked(
+        &items,
+        &op_call,
+        &ApplyContext {
+            next_id: &ctx.next_id,
+            valid_pages: &ctx.valid_pages,
+            droppable_ids: Some(&droppable),
+        },
+    ) {
+        ApplyResult::Ok {
+            items: new_items,
+            removed_spans,
+            new_ids,
+        } => {
+            ctx.guard.record(&op_call, &new_ids);
+            *items = new_items; // 持锁原子落地
+            drop(items);
+            if matches!(op_call, OpCall::Promote { .. } | OpCall::Demote { .. }) {
+                ctx.outline_version.fetch_add(1, Ordering::Relaxed);
+            }
+            // op 落地审计日志（与 dismiss 同格式，reason 来自工具调用的可选参数）
+            let reason = args
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("（未给理由）");
+            (ctx.log)(&format!("{name} [{kind_label}] {log_id}: {reason}"));
+            Ok(SuspectOutcome::Applied {
+                op_name: name.to_string(),
+                removed_spans,
+            })
+        }
+        ApplyResult::Rejected { reason, kind } => {
+            if kind == RejectKind::FidelityViolation {
+                *violation_count += 1;
+                (ctx.log)(&format!("保真闸回滚 {name}({args}): {reason}"));
+            }
+            Err(format!(
+                "op 被拒绝（{}）: {reason}。请观察后换 op 或 dismiss。",
+                if kind == RejectKind::FidelityViolation {
+                    "保真闸门回滚"
+                } else {
+                    "参数非法"
+                }
+            ))
+        }
+    }
+}
+
 /// 无视觉模型（未提供 load_image）时 split_table 不裁决：
 /// 表格行级保真只信图像证据，不让纯文本路径做 mergeTable。
 pub fn skipped_without_vision(w: &WorkItem, has_load_image: bool) -> bool {
@@ -542,6 +745,9 @@ struct SuspectCtx {
     log: Logger,
     load_image: Option<Arc<dyn LoadImage>>,
     vision: Option<Arc<dyn VisionClient>>,
+    /// 标题结构版本号：promote/demote 落地即自增。并行对话在 dismiss 前比对它，
+    /// 发现结构已被别的对话改过就驳回一次、回灌最新 outline 重裁（时序竞争守卫）。
+    outline_version: AtomicU64,
 }
 
 enum SuspectOutcome {
@@ -586,6 +792,7 @@ pub async fn run_loop(
         log: log.clone(),
         load_image: opts.load_image,
         vision: opts.vision,
+        outline_version: AtomicU64::new(0),
     });
     let mut op_counts: BTreeMap<String, u64> = BTreeMap::new();
     let mut removed_spans: Vec<RemovedSpan> = Vec::new();
@@ -627,29 +834,47 @@ pub async fn run_loop(
             break;
         }
 
-        // 一批最多 concurrency 个疑点并行裁决（不同位置的块相互独立，这是主要提速来源）
+        // 兄弟组归并：同组 missed_heading 合成一个联合裁决单元，只占一个 iteration 槽位
+        let units = {
+            let items = state.lock().unwrap();
+            assemble_units(actionable, &items)
+        };
+        // 一批最多 concurrency 个单元并行裁决（不同位置的块相互独立，这是主要提速来源）
         let batch_size = concurrency.min((max_iterations - iterations) as usize);
-        let batch: Vec<WorkItem> = actionable.into_iter().take(batch_size).collect();
+        let batch: Vec<Unit> = units.into_iter().take(batch_size).collect();
         iterations += batch.len() as u64;
 
         let worklist = Arc::new(worklist);
         let futures = batch
-            .iter()
-            .map(|target| {
-                let target = target.clone();
+            .into_iter()
+            .map(|unit| {
                 let state = state.clone();
                 let worklist = worklist.clone();
                 let ctx = ctx.clone();
                 async move {
-                    let outcome = handle_suspect(&target, &state, &worklist, &ctx).await;
-                    (target, outcome)
+                    match unit {
+                        Unit::Single(target) => {
+                            let outcome = handle_suspect(&target, &state, &worklist, &ctx).await;
+                            vec![(target, outcome)]
+                        }
+                        Unit::Group(members) => {
+                            match handle_group(&members, &state, &worklist, &ctx).await {
+                                Ok(v) => v.into_iter().map(|(w, o)| (w, Ok(o))).collect(),
+                                // 整组 LLM 故障：全员搁置（与单疑点故障处理一致）
+                                Err(e) => members
+                                    .into_iter()
+                                    .map(|w| (w, Err(LlmError(e.0.clone()))))
+                                    .collect(),
+                            }
+                        }
+                    }
                 }
             })
             .collect::<Vec<_>>();
         let results = futures::future::join_all(futures).await;
 
         let mut llm_errors: Vec<LlmError> = Vec::new();
-        for (target, outcome) in results {
+        for (target, outcome) in results.into_iter().flatten() {
             match outcome {
                 Err(e) => {
                     // 单疑点 LLM 故障（重试耗尽）：搁置该疑点，不毁全局（其它并行对话照常收尾）
@@ -905,6 +1130,9 @@ async fn handle_suspect(
     ];
 
     let mut violation_count: u64 = 0;
+    // 时序竞争守卫基线：对话开始时的标题结构版本
+    let outline_v0 = ctx.outline_version.load(Ordering::Relaxed);
+    let mut outline_challenged = false;
 
     for round in 0..ctx.max_rounds {
         // 倒数第二轮起强制收敛：实测大文档上 LLM 容易反复观察不裁决，烧满轮数被搁置
@@ -983,6 +1211,34 @@ async fn handle_suspect(
                     });
                     continue;
                 }
+                // 时序竞争守卫：本对话期间并行裁决改过标题结构（实测两例 dismiss 理由
+                // 引用了 promote 落地前的过期 outline）→ 驳回一次，回灌最新骨架重裁。
+                if !outline_challenged
+                    && matches!(
+                        target.kind,
+                        SuspectKind::MissedHeading | SuspectKind::PseudoHeading
+                    )
+                    && ctx.outline_version.load(Ordering::Relaxed) != outline_v0
+                {
+                    outline_challenged = true;
+                    let outline = {
+                        let items = state.lock().unwrap();
+                        exec_observe("outline", &serde_json::json!({}), &items, worklist)
+                            .unwrap_or_else(|e| format!("（outline 获取失败: {e}）"))
+                    };
+                    (ctx.log)(&format!(
+                        "dismiss 暂缓 [{}] {}: 标题结构已被并行裁决修改，回灌最新 outline 重裁",
+                        target.kind.as_str(),
+                        target.item_id
+                    ));
+                    messages.push(Message::Tool {
+                        tool_call_id: call.id.clone(),
+                        content: format!(
+                            "暂缓采纳：本对话进行期间，并行裁决已修改文档标题结构，你的判断可能基于过期信息。最新标题骨架：\n{outline}\n请基于最新结构重新裁决（仍判误报就再次 dismiss，将被直接采纳）。"
+                        ),
+                    });
+                    continue;
+                }
                 let reason = args
                     .get("reason")
                     .and_then(Value::as_str)
@@ -1006,83 +1262,25 @@ async fn handle_suspect(
                     });
                     continue;
                 }
-                let op_call = match to_op_call(name, &args) {
-                    Ok(c) => c,
-                    Err(e) => {
+                match apply_op_call(
+                    name,
+                    &args,
+                    target.kind.as_str(),
+                    &target.item_id,
+                    state,
+                    worklist,
+                    ctx,
+                    &mut violation_count,
+                ) {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(feedback) => {
                         messages.push(Message::Tool {
                             tool_call_id: call.id.clone(),
-                            content: format!("参数错误: {e}"),
+                            content: feedback,
                         });
                         continue;
                     }
-                };
-                if let Some(banned) = ctx.guard.rejects(&op_call) {
-                    messages.push(Message::Tool {
-                        tool_call_id: call.id.clone(),
-                        content: format!("被拒（{banned}）。请 dismiss 或换别的 op。"),
-                    });
-                    continue;
                 }
-                let droppable = droppable_ids(worklist);
-                let (rejected, outcome) = {
-                    let mut items = state.lock().unwrap();
-                    match apply_op_checked(
-                        &items,
-                        &op_call,
-                        &ApplyContext {
-                            next_id: &ctx.next_id,
-                            valid_pages: &ctx.valid_pages,
-                            droppable_ids: Some(&droppable),
-                        },
-                    ) {
-                        ApplyResult::Ok {
-                            items: new_items,
-                            removed_spans,
-                            new_ids,
-                        } => {
-                            ctx.guard.record(&op_call, &new_ids);
-                            *items = new_items; // 持锁原子落地
-                            (
-                                None,
-                                Some(SuspectOutcome::Applied {
-                                    op_name: name.to_string(),
-                                    removed_spans,
-                                }),
-                            )
-                        }
-                        ApplyResult::Rejected { reason, kind } => ((Some((reason, kind))), None),
-                    }
-                };
-                if let Some(outcome) = outcome {
-                    // op 落地审计日志（与 dismiss 同格式，reason 来自工具调用的可选参数）
-                    let reason = args
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("（未给理由）");
-                    (ctx.log)(&format!(
-                        "{name} [{}] {}: {reason}",
-                        target.kind.as_str(),
-                        target.item_id
-                    ));
-                    return Ok(outcome);
-                }
-                let (reason, kind) = rejected.unwrap();
-                if kind == RejectKind::FidelityViolation {
-                    violation_count += 1;
-                    (ctx.log)(&format!("保真闸回滚 {name}({args}): {reason}"));
-                }
-                messages.push(Message::Tool {
-                    tool_call_id: call.id.clone(),
-                    content: format!(
-                        "op 被拒绝（{}）: {reason}。请观察后换 op 或 dismiss。",
-                        if kind == RejectKind::FidelityViolation {
-                            "保真闸门回滚"
-                        } else {
-                            "参数非法"
-                        }
-                    ),
-                });
-                continue;
             }
 
             messages.push(Message::Tool {
@@ -1096,4 +1294,234 @@ async fn handle_suspect(
         reason: "max_rounds_exhausted",
         violations: violation_count,
     })
+}
+
+/// 编号兄弟组联合裁决：一次对话裁决整组 missed_heading 成员，要求组内一致
+/// （结构平行的同级编号要么都是标题，要么都是正文）。逐成员以 promote/dismiss
+/// 收尾，全部裁完或轮数耗尽（剩余成员搁置）才结束。
+async fn handle_group(
+    members: &[WorkItem],
+    state: &Arc<Mutex<Vec<RefItem>>>,
+    worklist: &[WorkItem],
+    ctx: &SuspectCtx,
+) -> Result<Vec<(WorkItem, SuspectOutcome)>, LlmError> {
+    let ids: Vec<&str> = members.iter().map(|w| w.item_id.as_str()).collect();
+    (ctx.log)(&format!(
+        "兄弟组联合裁决 [missed_heading] {} 个成员: {}",
+        members.len(),
+        ids.join(", ")
+    ));
+
+    let (member_block, outline) = {
+        let items = state.lock().unwrap();
+        let block = members
+            .iter()
+            .enumerate()
+            .map(|(n, w)| {
+                let current = index_of_id(&items, &w.item_id)
+                    .map(|i| fmt_item(&items[i], 600))
+                    .unwrap_or_else(|| "（已不存在）".into());
+                format!(
+                    "{}. {} 证据：{}\n   {}",
+                    n + 1,
+                    w.item_id,
+                    w.evidence,
+                    current
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let outline = exec_observe("outline", &serde_json::json!({}), &items, worklist)
+            .unwrap_or_else(|e| format!("（outline 获取失败: {e}）"));
+        (block, outline)
+    };
+
+    let mut messages: Vec<Message> = vec![
+        Message::System {
+            content: SYSTEM_PROMPT.to_string(),
+        },
+        Message::User {
+            content: format!(
+                "当前疑点组：[missed_heading] 编号兄弟组联合裁决（{} 个结构平行的同级编号块）。\n\
+                 组内裁决必须一致：要么全部 promote 为标题（level 一致，与 outline 中同深度编号标题对齐），要么全部 dismiss 为正文；除非有明确证据某成员确属例外。\n\
+                 请对每个成员各调用一次 promote 或 dismiss（可在同一条回复里并行多个调用），绝不对同一成员同时调用两者。\n\n\
+                 成员列表：\n{member_block}\n\n\
+                 全文标题骨架（outline 预载）：\n{outline}\n\n\
+                 若以上信息已足够请直接逐成员裁决；不够再调观察工具。",
+                members.len()
+            ),
+        },
+    ];
+
+    let mut pending: Vec<WorkItem> = members.to_vec();
+    let mut resolved: Vec<(WorkItem, SuspectOutcome)> = Vec::new();
+    let mut violation_count: u64 = 0;
+
+    for round in 0..ctx.max_rounds {
+        if round + 2 == ctx.max_rounds {
+            messages.push(Message::User {
+                content: format!(
+                    "观察轮数即将用完。请基于已有信息【现在就】对剩余成员逐一裁决（promote 或 dismiss）：{}。不要再调用观察工具。",
+                    pending
+                        .iter()
+                        .map(|w| w.item_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+        let r = ctx.chat.chat(&messages, tools()).await?;
+        ctx.tokens
+            .prompt
+            .fetch_add(r.usage.prompt_tokens, Ordering::Relaxed);
+        ctx.tokens
+            .completion
+            .fetch_add(r.usage.completion_tokens, Ordering::Relaxed);
+
+        let Some(calls) = r.message.tool_calls.filter(|c| !c.is_empty()) else {
+            break; // 不再发工具调用 → 剩余成员搁置
+        };
+        messages.push(Message::Assistant {
+            content: r.message.content.clone(),
+            tool_calls: Some(calls.clone()),
+        });
+
+        let contradicted = contradicted_ids(&calls);
+        if !contradicted.is_empty() {
+            (ctx.log)(&format!(
+                "决策矛盾 [missed_heading] {}: 同响应对同一成员同时调用 dismiss 与变更 op，相关调用全部驳回重裁",
+                contradicted.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+
+        for call in &calls {
+            let name = call.function.name.as_str();
+            let Some(args) = parse_json_safe(&call.function.arguments) else {
+                messages.push(Message::Tool {
+                    tool_call_id: call.id.clone(),
+                    content: format!(
+                        "arguments 解析失败，请重试: {}",
+                        char_prefix(&call.function.arguments, 200)
+                    ),
+                });
+                continue;
+            };
+
+            if OBSERVE_NAMES.contains(&name) {
+                let content = {
+                    let items = state.lock().unwrap();
+                    exec_observe(name, &args, &items, worklist)
+                        .unwrap_or_else(|e| format!("观察失败: {e}"))
+                };
+                messages.push(Message::Tool {
+                    tool_call_id: call.id.clone(),
+                    content,
+                });
+                continue;
+            }
+
+            if name == "dismiss" {
+                let id = arg_str(&args, "id");
+                if contradicted.contains(&id) {
+                    messages.push(Message::Tool {
+                        tool_call_id: call.id.clone(),
+                        content: CONTRADICTION_FEEDBACK.into(),
+                    });
+                    continue;
+                }
+                let Some(k) = pending.iter().position(|w| w.item_id == id) else {
+                    messages.push(Message::Tool {
+                        tool_call_id: call.id.clone(),
+                        content: format!("{id} 不在本组待裁决成员中（或已裁决）。"),
+                    });
+                    continue;
+                };
+                let reason = args
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("（未给理由）");
+                (ctx.log)(&format!("dismiss [missed_heading] {id}: {reason}"));
+                resolved.push((
+                    pending.remove(k),
+                    SuspectOutcome::Dismissed {
+                        reason: "llm_dismiss",
+                        violations: std::mem::take(&mut violation_count),
+                    },
+                ));
+                messages.push(Message::Tool {
+                    tool_call_id: call.id.clone(),
+                    content: format!("已采纳 dismiss（{id}）。"),
+                });
+                continue;
+            }
+
+            if OP_NAMES.contains(&name) {
+                let pid = primary_id(&args);
+                if pid.as_deref().is_some_and(|id| contradicted.contains(id)) {
+                    messages.push(Message::Tool {
+                        tool_call_id: call.id.clone(),
+                        content: CONTRADICTION_FEEDBACK.into(),
+                    });
+                    continue;
+                }
+                // 组对话只许动组内成员：避免落了 op 却无成员可归账（op_counts 漏记）
+                let Some(k) = pid
+                    .as_deref()
+                    .and_then(|id| pending.iter().position(|w| w.item_id == id))
+                else {
+                    messages.push(Message::Tool {
+                        tool_call_id: call.id.clone(),
+                        content: "本组对话只允许对组内待裁决成员执行变更 op。".into(),
+                    });
+                    continue;
+                };
+                let log_id = pending[k].item_id.clone();
+                match apply_op_call(
+                    name,
+                    &args,
+                    "missed_heading",
+                    &log_id,
+                    state,
+                    worklist,
+                    ctx,
+                    &mut violation_count,
+                ) {
+                    Ok(outcome) => {
+                        resolved.push((pending.remove(k), outcome));
+                        messages.push(Message::Tool {
+                            tool_call_id: call.id.clone(),
+                            content: format!("已执行（{log_id}）。"),
+                        });
+                    }
+                    Err(feedback) => {
+                        messages.push(Message::Tool {
+                            tool_call_id: call.id.clone(),
+                            content: feedback,
+                        });
+                    }
+                }
+                continue;
+            }
+
+            messages.push(Message::Tool {
+                tool_call_id: call.id.clone(),
+                content: format!("未知工具 {name}。"),
+            });
+        }
+
+        if pending.is_empty() {
+            return Ok(resolved);
+        }
+    }
+
+    for w in pending {
+        resolved.push((
+            w,
+            SuspectOutcome::Dismissed {
+                reason: "max_rounds_exhausted",
+                violations: std::mem::take(&mut violation_count),
+            },
+        ));
+    }
+    Ok(resolved)
 }
