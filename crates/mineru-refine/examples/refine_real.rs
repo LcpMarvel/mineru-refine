@@ -7,6 +7,7 @@
 //      cargo run -p mineru-refine --example refine_real --features bin -- <stem> # 只跑某个文档
 //      REFINE_MAX_ITERATIONS=N 可显式覆盖外层循环上限
 //      REFINE_FIX_CONFUSION=1 开启 OCR 字符混淆修正层（opt-in，直接替换）
+//      REFINE_REWRITE_GARBLED=1 开启重度乱码表的视觉重转写层（opt-in，整格替换）
 
 use mineru_refine::types::MineruItem;
 use mineru_refine::{RefineOptions, detect_items, refine, render_markdown};
@@ -92,6 +93,9 @@ async fn main() {
                 fix_ocr_confusion: std::env::var("REFINE_FIX_CONFUSION")
                     .map(|v| v == "1" || v == "true")
                     .unwrap_or(false),
+                rewrite_garbled_tables: std::env::var("REFINE_REWRITE_GARBLED")
+                    .map(|v| v == "1" || v == "true")
+                    .unwrap_or(false),
                 ..RefineOptions::default()
             },
         )
@@ -117,6 +121,21 @@ async fn main() {
         for s in &r.report.removed_spans {
             let head: String = s.text.chars().take(60).collect();
             println!("  删除 [{}] {}: 「{head}」", s.reason, s.item_id);
+        }
+        if !r.report.table_rewrites.is_empty() || r.report.table_rewrite_rejected > 0 {
+            println!(
+                "重转写层: 落地 {} | 拒绝 {}",
+                r.report.table_rewrites.len(),
+                r.report.table_rewrite_rejected,
+            );
+            for f in &r.report.table_rewrites {
+                let before: String = f.before.chars().take(40).collect();
+                let after: String = f.after.chars().take(40).collect();
+                println!(
+                    "  重转写 {} r{}c{}: 「{before}」→「{after}」",
+                    f.item_id, f.row, f.col
+                );
+            }
         }
         if !r.report.confusion_fixes.is_empty() || r.report.confusion_rejected > 0 {
             println!(

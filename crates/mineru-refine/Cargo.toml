@@ -46,6 +46,10 @@ name = "qwen_smoke"
 required-features = ["bin"]
 
 [[example]]
+name = "garbled_smoke"
+required-features = ["bin"]
+
+[[example]]
 name = "refine_real"
 required-features = ["bin"]
 

@@ -10,11 +10,12 @@ use crate::confusion::{
     CONFUSION_PROMPT_VERSION, ConfusionOutcome, ConfusionTable, fix_confusions,
 };
 use crate::detect::detect;
+use crate::garbled::{GARBLED_PROMPT_VERSION, GarbledOutcome, rewrite_garbled_tables};
 use crate::id::{assign_ids, strip_ids};
 use crate::invariant::check_fidelity;
 use crate::llm::{
     ChatClient, DeepSeekClient, ImageDirLoader, LlmError, LoadImage, QwenVlClient,
-    SplitTableVerdict, VisionClient,
+    SplitTableVerdict, TableTranscription, VisionClient,
 };
 use crate::mechanical::mechanical_clean;
 use crate::types::{MineruItem, ProvenanceEntry, RefItem, RefineReport, RefineResult, WorkItem};
@@ -27,8 +28,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 // 0.5：split_table 视觉裁决；0.6：拆表检测放宽到链式 + split_table 仅视觉裁决；
 // 0.7：Rust 重写（逻辑对齐 0.6，实现换底）；
 // 0.8：机械清洗 pass + 三个新探测器（missed_heading/trailing_marker/separated_caption）；
-// 0.9：赘字/衍字删除（extra_char 探测器 + deleteChar op，全走 LLM 裁决）
-pub const REFINE_LOGIC_VERSION: &str = "0.9.0";
+// 0.9：赘字/衍字删除（extra_char 探测器 + deleteChar op，全走 LLM 裁决）；
+// 0.10：重度乱码表视觉重转写层（rewrite_garbled_tables，opt-in）
+pub const REFINE_LOGIC_VERSION: &str = "0.10.0";
 pub const PROMPT_VERSION: &str = "p6"; // p6：extra_char 疑点 op_hint + deleteChar 工具
 /// 默认文本裁决模型;运行时可被 `DEEPSEEK_MODEL` 覆盖(见 `cache_key_for`)。
 pub const MODEL_ID: &str = crate::llm::DEEPSEEK_DEFAULT_MODEL;
@@ -57,6 +59,10 @@ pub struct RefineOptions {
     /// 混淆准入名单的用户补充对：每项恰好 2 个不同字符（如 "0D" 表示 0↔D），
     /// 非法配置立即失败（fail-open + 大声 log），不静默吞。
     pub extra_confusion_pairs: Vec<String>,
+    /// 重度乱码表的视觉重转写层（opt-in）。机械检测器（词典覆盖率塌方）选定目标，
+    /// 视觉 LLM 对照 img_path 截图逐单元格重转写，闸门 + 全量 provenance，可程序化撤销。
+    /// 开启时必须提供 image_dir/load_image（取表格截图），否则按配置错误 fail-open。
+    pub rewrite_garbled_tables: bool,
     pub log: Option<Logger>,
 }
 
@@ -83,16 +89,19 @@ pub fn cache_key_for(sha256: &str) -> String {
 /// 否则开关不同的两次调用会互相污染缓存。关 flag 时与 cache_key_for 完全一致。
 /// 补充对先排序：语义相同但顺序不同的配置必须命中同一份缓存。
 pub fn cache_key_for_opts(sha256: &str, opts: &RefineOptions) -> String {
-    let base = cache_key_for(sha256);
-    if !opts.fix_ocr_confusion {
-        return base;
+    let mut key = cache_key_for(sha256);
+    if opts.fix_ocr_confusion {
+        let mut pairs = opts.extra_confusion_pairs.clone();
+        pairs.sort();
+        key = format!(
+            "{key}:confusion-{CONFUSION_PROMPT_VERSION}:{}",
+            pairs.join(",")
+        );
     }
-    let mut pairs = opts.extra_confusion_pairs.clone();
-    pairs.sort();
-    format!(
-        "{base}:confusion-{CONFUSION_PROMPT_VERSION}:{}",
-        pairs.join(",")
-    )
+    if opts.rewrite_garbled_tables {
+        key = format!("{key}:garbled-{GARBLED_PROMPT_VERSION}");
+    }
+    key
 }
 
 /// 测试/运维用：清空进程内缓存。
@@ -107,6 +116,10 @@ struct UnavailableVision(String);
 #[async_trait::async_trait]
 impl VisionClient for UnavailableVision {
     async fn judge_split_table(&self, _: &[u8], _: &[u8]) -> Result<SplitTableVerdict, LlmError> {
+        Err(LlmError(self.0.clone()))
+    }
+
+    async fn transcribe_table(&self, _: &[u8], _: &str) -> Result<TableTranscription, LlmError> {
         Err(LlmError(self.0.clone()))
     }
 }
@@ -189,6 +202,11 @@ async fn refine_inner(
     });
     let has_vision = load_image.is_some();
 
+    // 重转写层配置先验证（早抛）：没有图片访问器就无从对照图像，是调用方配置错误
+    if opts.rewrite_garbled_tables && !has_vision {
+        return Err("rewriteGarbledTables 需要 imageDir 或 loadImage（取表格截图对照）".into());
+    }
+
     // 无视觉模型时 split_table 整体跳过，不计入迭代预算，也不参与"异常数单调"闸门
     //（跳过的疑点原样留在输出里，按原计数会被误判为"修不动"触发 fail-open）
     let gate_countable =
@@ -222,8 +240,8 @@ async fn refine_inner(
             max_rounds_per_suspect: DEFAULT_MAX_ROUNDS,
             concurrency: opts.concurrency.unwrap_or(DEFAULT_CONCURRENCY),
             chat: chat.clone(),
-            load_image,
-            vision,
+            load_image: load_image.clone(),
+            vision: vision.clone(),
             log: log.clone(),
         },
     )
@@ -244,10 +262,22 @@ async fn refine_inner(
         ));
     }
 
+    // ── 乱码表视觉重转写层（opt-in）：出口闸门之后、混淆层之前运行——
+    // 整表重转写先把废表救回，混淆层再在干净文本上做稀疏定点修正。
+    let (items, garbled) = apply_garbled_layer(
+        opts.rewrite_garbled_tables,
+        loop_result.items,
+        vision,
+        load_image,
+        opts.concurrency.unwrap_or(DEFAULT_CONCURRENCY),
+        log,
+    )
+    .await;
+
     // ── 混淆修正层（opt-in）：出口闸门之后运行，核心承诺已经定格。
     let (items, confusion) = apply_confusion_layer(
         confusion_table,
-        loop_result.items,
+        items,
         chat,
         opts.concurrency.unwrap_or(DEFAULT_CONCURRENCY),
         log,
@@ -255,24 +285,37 @@ async fn refine_inner(
     .await;
 
     let mut token_usage = loop_result.token_usage;
-    token_usage.prompt += confusion.usage.prompt;
-    token_usage.completion += confusion.usage.completion;
+    token_usage.prompt += garbled.usage.prompt + confusion.usage.prompt;
+    token_usage.completion += garbled.usage.completion + confusion.usage.completion;
 
-    // 混淆修复逐条登记 provenance（层只产出 fixes，溯源条目格式由编排层统一）
-    let provenance: Vec<ProvenanceEntry> = confusion
+    // 两层修复逐条登记 provenance（层只产出 fixes，溯源条目格式由编排层统一）
+    let mut provenance: Vec<ProvenanceEntry> = garbled
         .fixes
         .iter()
         .map(|f| ProvenanceEntry {
             item_id: f.item_id.clone(),
-            field: f.field.clone(),
-            char_start: f.char_offset,
-            char_end: f.char_offset + 1,
-            origin: "ocr_confusion".into(),
-            op: "fixConfusion".into(),
+            field: "table_body".into(),
+            char_start: f.char_start,
+            char_end: f.char_end,
+            origin: "garbled_table".into(),
+            op: "rewriteCell".into(),
             confidence: 1.0,
-            note: Some(format!("「{}」→「{}」（{}）", f.before, f.after, f.note)),
+            note: Some(format!(
+                "r{}c{}「{}」→「{}」",
+                f.row, f.col, f.before, f.after
+            )),
         })
         .collect();
+    provenance.extend(confusion.fixes.iter().map(|f| ProvenanceEntry {
+        item_id: f.item_id.clone(),
+        field: f.field.clone(),
+        char_start: f.char_offset,
+        char_end: f.char_offset + 1,
+        origin: "ocr_confusion".into(),
+        op: "fixConfusion".into(),
+        confidence: 1.0,
+        note: Some(format!("「{}」→「{}」（{}）", f.before, f.after, f.note)),
+    }));
 
     // 机械清洗的统计并入报告：opCounts 用 mech* 前缀区分，removedSpans 置于最前
     let mut op_counts = loop_result.op_counts;
@@ -296,8 +339,45 @@ async fn refine_inner(
             confusion_fixes: confusion.fixes,
             confusion_rejected: confusion.rejected,
             confusion_observations: confusion.observations,
+            table_rewrites: garbled.fixes,
+            table_rewrite_rejected: garbled.rejected,
         },
     })
+}
+
+/// 乱码表视觉重转写层（opt-in）。flag 关 → 原样直通；层内 panic → 丢弃整层、保留核心产物。
+async fn apply_garbled_layer(
+    enabled: bool,
+    items: Vec<RefItem>,
+    vision: Option<Arc<dyn VisionClient>>,
+    load_image: Option<Arc<dyn LoadImage>>,
+    concurrency: usize,
+    log: &Logger,
+) -> (Vec<RefItem>, GarbledOutcome) {
+    if !enabled {
+        return (items, GarbledOutcome::default());
+    }
+    // refine_inner 已早抛校验过 has_vision；这里的 expect 只兜内部不变量
+    let vision = vision.expect("重转写层内部错误：vision 未构造");
+    let load_image = load_image.expect("重转写层内部错误：load_image 未构造");
+
+    // 进层前留快照：panic 时整层丢弃，原件返还
+    let attempt = AssertUnwindSafe(rewrite_garbled_tables(
+        items.clone(),
+        vision,
+        load_image,
+        concurrency,
+        log,
+    ))
+    .catch_unwind()
+    .await;
+    match attempt {
+        Ok((fixed, outcome)) => (fixed, outcome),
+        Err(_) => {
+            log("重转写层异常 —— 丢弃本层全部结果，保留核心产物");
+            (items, GarbledOutcome::default())
+        }
+    }
 }
 
 /// 混淆修正层（opt-in）。flag 关 → 原样直通；层内 panic → 丢弃整层、保留核心产物。

@@ -28,6 +28,10 @@ pub struct RefineOpts {
     pub fix_ocr_confusion: Option<bool>,
     /// 混淆准入名单补充对：每项恰好 2 个不同字符（如 "0D" 表示 0↔D 互换可直接落地）
     pub extra_confusion_pairs: Option<Vec<String>>,
+    /// 重度乱码表的视觉重转写层（opt-in，默认关）。机械检测（词典覆盖率塌方）选定目标，
+    /// Qwen-VL 对照 img_path 截图逐单元格重转写（全量进 report.tableRewrites，可程序化撤销）。
+    /// 开启时必须提供 imageDir。
+    pub rewrite_garbled_tables: Option<bool>,
 }
 
 /// MinerU content_list 清洗。fail-open：任何异常原样返回输入（report.failOpen=true）。
@@ -45,6 +49,7 @@ pub async fn refine(items: Value, opts: Option<RefineOpts>) -> Result<Value> {
             image_dir: opts.image_dir.map(Into::into),
             fix_ocr_confusion: opts.fix_ocr_confusion.unwrap_or(false),
             extra_confusion_pairs: opts.extra_confusion_pairs.unwrap_or_default(),
+            rewrite_garbled_tables: opts.rewrite_garbled_tables.unwrap_or(false),
             ..RefineOptions::default()
         },
     )
@@ -82,3 +87,6 @@ pub const PROMPT_VERSION: &str = mineru_refine_core::PROMPT_VERSION;
 
 #[napi]
 pub const CONFUSION_PROMPT_VERSION: &str = mineru_refine_core::CONFUSION_PROMPT_VERSION;
+
+#[napi]
+pub const GARBLED_PROMPT_VERSION: &str = mineru_refine_core::GARBLED_PROMPT_VERSION;

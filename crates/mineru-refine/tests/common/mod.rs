@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use mineru_refine::llm::{
     AssistantMessage, ChatClient, ChatResult, LlmError, LoadImage, Message, SplitTableVerdict,
-    ToolCall, ToolCallFunction, Usage, VisionClient,
+    TableTranscription, ToolCall, ToolCallFunction, Usage, VisionClient,
 };
 use mineru_refine::types::{MineruItem, SuspectKind};
 use regex::Regex;
@@ -272,6 +272,39 @@ where
 {
     async fn judge_split_table(&self, a: &[u8], b: &[u8]) -> Result<SplitTableVerdict, LlmError> {
         (self.0)(a, b)
+    }
+}
+
+/// 闭包式表格重转写 mock（garbled 层测试用）：split_table 走到它就是实现回归。
+/// 自带调用计数。
+pub struct FnTableVision<F>(pub F, pub AtomicU64);
+
+impl<F> FnTableVision<F> {
+    pub fn new(f: F) -> Self {
+        Self(f, AtomicU64::new(0))
+    }
+
+    pub fn call_count(&self) -> u64 {
+        self.1.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl<F> VisionClient for FnTableVision<F>
+where
+    F: Fn(&[u8], &str) -> Result<TableTranscription, LlmError> + Send + Sync,
+{
+    async fn judge_split_table(&self, _: &[u8], _: &[u8]) -> Result<SplitTableVerdict, LlmError> {
+        Err(LlmError("garbled 测试不期望 split_table 视觉裁决".into()))
+    }
+
+    async fn transcribe_table(
+        &self,
+        img: &[u8],
+        cells_render: &str,
+    ) -> Result<TableTranscription, LlmError> {
+        self.1.fetch_add(1, Ordering::Relaxed);
+        (self.0)(img, cells_render)
     }
 }
 

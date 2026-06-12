@@ -88,6 +88,22 @@ pub struct SplitTableVerdict {
     pub usage: Usage,
 }
 
+/// 乱码表视觉重转写：单元格级修正提案。
+#[derive(Clone, Debug)]
+pub struct TranscribedCell {
+    pub row: usize,
+    pub col: usize,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TableTranscription {
+    pub cells: Vec<TranscribedCell>,
+    /// 结构非法（缺 row/col/text）的提案数——解析期就拒
+    pub invalid: u64,
+    pub usage: Usage,
+}
+
 /// 视觉裁决客户端（依赖注入，测试用 mock）。
 #[async_trait]
 pub trait VisionClient: Send + Sync {
@@ -96,6 +112,16 @@ pub trait VisionClient: Send + Sync {
         img_a: &[u8],
         img_b: &[u8],
     ) -> Result<SplitTableVerdict, LlmError>;
+
+    /// 乱码表视觉重转写（rewrite_garbled_tables 层用）。默认不支持——
+    /// 只做 split_table 裁决的旧实现/测试 mock 无需关心。
+    async fn transcribe_table(
+        &self,
+        _img: &[u8],
+        _cells_render: &str,
+    ) -> Result<TableTranscription, LlmError> {
+        Err(LlmError("该视觉客户端未实现表格重转写".into()))
+    }
 }
 
 /// 只读图片访问器：img_path 是 content_list 里的相对路径（如 images/xxx.jpg），取不到回 None。
@@ -310,26 +336,9 @@ fn data_url(img: &[u8]) -> String {
     )
 }
 
-#[async_trait]
-impl VisionClient for QwenVlClient {
-    async fn judge_split_table(
-        &self,
-        img_a: &[u8],
-        img_b: &[u8],
-    ) -> Result<SplitTableVerdict, LlmError> {
-        let body = serde_json::json!({
-            "model": self.model,
-            "temperature": 0,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    { "type": "text", "text": QWEN_PROMPT },
-                    { "type": "image_url", "image_url": { "url": data_url(img_a) } },
-                    { "type": "image_url", "image_url": { "url": data_url(img_b) } },
-                ],
-            }],
-        });
-
+impl QwenVlClient {
+    /// 共用 POST + 瞬态重试：返回 (回复正文文本, usage)。
+    async fn post_with_retry(&self, body: &Value) -> Result<(String, Usage), LlmError> {
         let mut last_err: Option<LlmError> = None;
         for attempt in 1..=MAX_ATTEMPTS {
             if attempt > 1 {
@@ -339,7 +348,7 @@ impl VisionClient for QwenVlClient {
                 .http
                 .post(format!("{}/chat/completions", self.base_url))
                 .bearer_auth(&self.key)
-                .json(&body)
+                .json(body)
                 .send()
                 .await
             {
@@ -375,30 +384,91 @@ impl VisionClient for QwenVlClient {
             let content = json
                 .pointer("/choices/0/message/content")
                 .and_then(Value::as_str)
-                .unwrap_or("");
-            let parsed = extract_verdict_json(content);
-            let Some((verdict, reason)) = parsed else {
-                return Err(LlmError(format!(
-                    "Qwen-VL 回复不是合法裁决 JSON: {}",
-                    content.chars().take(200).collect::<String>()
-                )));
+                .unwrap_or("")
+                .to_string();
+            let usage = Usage {
+                prompt_tokens: json
+                    .pointer("/usage/prompt_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                completion_tokens: json
+                    .pointer("/usage/completion_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
             };
-            return Ok(SplitTableVerdict {
-                merge: verdict == "merge",
-                reason,
-                usage: Usage {
-                    prompt_tokens: json
-                        .pointer("/usage/prompt_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                    completion_tokens: json
-                        .pointer("/usage/completion_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                },
-            });
+            return Ok((content, usage));
         }
         Err(last_err.unwrap_or_else(|| LlmError("Qwen-VL 重试耗尽".into())))
+    }
+}
+
+const QWEN_TRANSCRIBE_PROMPT: &str = "图中是一张表格的截图。下面是 OCR 解析出的同一张表的单元格内容\
+（行列编号从 0 起，〈空〉表示空单元格），其中存在较多 OCR 乱码（形近字误认、词语错乱）。\
+请对照图片逐单元格校对：内容与图片不符的单元格，按图片上的真实内容重新转写。\
+只有列号带 ✎ 标记的单元格允许修正（未标 ✎ 的只作对照，提案也不会被采纳）。\
+只输出 JSON：{\"cells\":[{\"row\":行号,\"col\":列号,\"text\":\"图片上的真实内容\"}]}。\
+只列需要修正的单元格；在图片里找的是【同一格】的真实内容，对不上位置、看不清的不要猜、不要列；\
+数字、百分比、编号一律不要改。";
+
+#[async_trait]
+impl VisionClient for QwenVlClient {
+    async fn judge_split_table(
+        &self,
+        img_a: &[u8],
+        img_b: &[u8],
+    ) -> Result<SplitTableVerdict, LlmError> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "temperature": 0,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": QWEN_PROMPT },
+                    { "type": "image_url", "image_url": { "url": data_url(img_a) } },
+                    { "type": "image_url", "image_url": { "url": data_url(img_b) } },
+                ],
+            }],
+        });
+        let (content, usage) = self.post_with_retry(&body).await?;
+        let Some((verdict, reason)) = extract_verdict_json(&content) else {
+            return Err(LlmError(format!(
+                "Qwen-VL 回复不是合法裁决 JSON: {}",
+                content.chars().take(200).collect::<String>()
+            )));
+        };
+        Ok(SplitTableVerdict {
+            merge: verdict == "merge",
+            reason,
+            usage,
+        })
+    }
+
+    async fn transcribe_table(
+        &self,
+        img: &[u8],
+        cells_render: &str,
+    ) -> Result<TableTranscription, LlmError> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "temperature": 0,
+            "max_tokens": 4096,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": format!("{QWEN_TRANSCRIBE_PROMPT}\n\n{cells_render}") },
+                    { "type": "image_url", "image_url": { "url": data_url(img) } },
+                ],
+            }],
+        });
+        let (content, usage) = self.post_with_retry(&body).await?;
+        let Some(mut t) = extract_transcription_json(&content) else {
+            return Err(LlmError(format!(
+                "Qwen-VL 重转写回复不是合法 JSON: {}",
+                content.chars().take(200).collect::<String>()
+            )));
+        };
+        t.usage = usage;
+        Ok(t)
     }
 }
 
@@ -420,6 +490,47 @@ fn extract_verdict_json(content: &str) -> Option<(String, String)> {
         .unwrap_or("（未给依据）")
         .to_string();
     Some((verdict.to_string(), reason))
+}
+
+/// 从重转写回复中扒出修正列表并解析。兼容两种形态（模型实测会无视 prompt 回裸数组）：
+/// `{"cells":[...]}` 对象，或顶层就是 `[...]` 数组。
+/// 结构非法的条目计入 invalid（解析期就拒）。
+fn extract_transcription_json(content: &str) -> Option<TableTranscription> {
+    // 取最早出现的 JSON 起始符，配对各自的收尾符——内容常裹在 ```json 代码块里。
+    // 配不到收尾符 = 输出被 max_tokens 截断，整段交给 safe-json-repair 收口
+    //（尾部丢失的条目就是漏修，不会误修）。
+    let obj_start = content.find('{');
+    let arr_start = content.find('[');
+    let (start, closer) = match (obj_start, arr_start) {
+        (Some(o), Some(a)) if o < a => (o, '}'),
+        (Some(o), None) => (o, '}'),
+        (_, Some(a)) => (a, ']'),
+        (None, None) => return None,
+    };
+    let span = match content.rfind(closer) {
+        Some(end) if end > start => &content[start..=end],
+        _ => &content[start..],
+    };
+    let parsed = parse_json_safe(span)?;
+    let arr = match &parsed {
+        Value::Array(arr) => arr.clone(),
+        obj => obj.get("cells")?.as_array()?.clone(),
+    };
+    let mut t = TableTranscription::default();
+    for v in arr {
+        let row = v.get("row").and_then(Value::as_u64);
+        let col = v.get("col").and_then(Value::as_u64);
+        let text = v.get("text").and_then(Value::as_str);
+        match (row, col, text) {
+            (Some(row), Some(col), Some(text)) => t.cells.push(TranscribedCell {
+                row: row as usize,
+                col: col as usize,
+                text: text.to_string(),
+            }),
+            _ => t.invalid += 1,
+        }
+    }
+    Some(t)
 }
 
 /// 兜偶发坏 JSON：先 safe-json-repair 修复，再 serde 解析；修不出来回 None。

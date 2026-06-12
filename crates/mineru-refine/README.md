@@ -25,6 +25,8 @@ let result = refine(items, RefineOptions {
     max_iterations: None,                     // 可选:修复循环硬上限,默认随疑点数自适应
     concurrency: Some(8),                     // 可选:并行裁决的疑点数,1 = 严格串行
     image_dir: Some("/abs/mineru/out".into()),// 可选:MinerU 产物目录 → 启用跨页拆表的视觉裁决
+    fix_ocr_confusion: false,                 // 可选:opt-in 的 OCR 字符混淆修正层
+    rewrite_garbled_tables: false,            // 可选:opt-in 的重度乱码表视觉重转写层(需要 image_dir)
     ..Default::default()
 }).await;
 // 永不 Err、panic 不外漏:fail-open 内置,看 result.report.fail_open

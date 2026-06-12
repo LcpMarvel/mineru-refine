@@ -8,6 +8,8 @@ export declare function detectSuspects(items: any): any
 
 export const CONFUSION_PROMPT_VERSION: string
 
+export const GARBLED_PROMPT_VERSION: string
+
 export const MODEL_ID: string
 
 export const PROMPT_VERSION: string
@@ -36,6 +38,12 @@ export interface RefineOpts {
   fixOcrConfusion?: boolean
   /** 混淆准入名单补充对：每项恰好 2 个不同字符（如 "0D" 表示 0↔D 互换可直接落地） */
   extraConfusionPairs?: Array<string>
+  /**
+   * 重度乱码表的视觉重转写层（opt-in，默认关）。机械检测（词典覆盖率塌方）选定目标，
+   * Qwen-VL 对照 img_path 截图逐单元格重转写（全量进 report.tableRewrites，可程序化撤销）。
+   * 开启时必须提供 imageDir。
+   */
+  rewriteGarbledTables?: boolean
 }
 
 /** items → full.md 文本（确定性重渲染，与 MinerU pipeline 拼接规则对齐）。 */

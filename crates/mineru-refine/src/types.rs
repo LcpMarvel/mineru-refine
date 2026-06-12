@@ -242,6 +242,25 @@ pub struct ConfusionFix {
     pub note: String,
 }
 
+// ── 乱码表视觉重转写（opt-in，rewrite_garbled_tables=true 才会出现）──
+
+/// 重转写层落地的一条整单元格替换。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableCellRewrite {
+    pub item_id: String,
+    /// HTML 行列号（0 起，按 `<tr>`/`<td>` 计数，不解析 rowspan/colspan）
+    pub row: usize,
+    pub col: usize,
+    /// 原单元格内层 HTML（撤销凭据：写回该区间即可还原）
+    pub before: String,
+    /// 落地后的内层 HTML（重转写文本，`&` 已转义）
+    pub after: String,
+    /// after 在新 table_body 中的字符区间
+    pub char_start: usize,
+    pub char_end: usize,
+}
+
 // ── provenance（默认纯削减不加字、恒为空；混淆层开启时记录其每条替换）──
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -294,6 +313,12 @@ pub struct RefineReport {
     /// LLM 在裁决中顺带观察到的表外 OCR 质量问题（只记录，从未被应用）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub confusion_observations: Vec<String>,
+    // 乱码表视觉重转写层（rewrite_garbled_tables）产物。关 flag 时恒缺省，
+    // 序列化输出与旧版逐字节兼容。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub table_rewrites: Vec<TableCellRewrite>,
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub table_rewrite_rejected: u64,
 }
 
 fn u64_is_zero(n: &u64) -> bool {

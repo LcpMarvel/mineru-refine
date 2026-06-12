@@ -588,6 +588,8 @@ if (!nativeBinding) {
 module.exports = nativeBinding
 module.exports.clearRefineCache = nativeBinding.clearRefineCache
 module.exports.detectSuspects = nativeBinding.detectSuspects
+module.exports.CONFUSION_PROMPT_VERSION = nativeBinding.CONFUSION_PROMPT_VERSION
+module.exports.GARBLED_PROMPT_VERSION = nativeBinding.GARBLED_PROMPT_VERSION
 module.exports.MODEL_ID = nativeBinding.MODEL_ID
 module.exports.PROMPT_VERSION = nativeBinding.PROMPT_VERSION
 module.exports.refine = nativeBinding.refine

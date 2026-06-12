@@ -25,6 +25,8 @@ struct RefineRequest {
     fix_ocr_confusion: Option<bool>,
     /// 混淆准入名单补充对：每项恰好 2 个不同字符（如 "0D"）。
     extra_confusion_pairs: Option<Vec<String>>,
+    /// 重度乱码表的视觉重转写层（opt-in，默认关；需要 imageDir）。
+    rewrite_garbled_tables: Option<bool>,
 }
 
 async fn handle_refine(
@@ -44,6 +46,7 @@ async fn handle_refine(
             image_dir: req.image_dir.map(Into::into),
             fix_ocr_confusion: req.fix_ocr_confusion.unwrap_or(false),
             extra_confusion_pairs: req.extra_confusion_pairs.unwrap_or_default(),
+            rewrite_garbled_tables: req.rewrite_garbled_tables.unwrap_or(false),
             ..RefineOptions::default()
         },
     )

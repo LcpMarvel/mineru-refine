@@ -10,6 +10,7 @@ pub mod agent_loop;
 pub mod confusion;
 pub mod detect;
 pub mod extrachar;
+pub mod garbled;
 pub mod id;
 pub mod invariant;
 pub mod llm;
@@ -26,15 +27,16 @@ pub use refine::{
 
 pub use types::{
     ConfusionFix, MineruItem, OpCall, ProvenanceEntry, RefineReport, RefineResult, RemovedSpan,
-    StripPattern, SuspectKind, WorkItem,
+    StripPattern, SuspectKind, TableCellRewrite, WorkItem,
 };
 
 pub use confusion::CONFUSION_PROMPT_VERSION;
+pub use garbled::GARBLED_PROMPT_VERSION;
 
 pub use agent_loop::Logger;
 pub use llm::{
     ChatClient, ChatResult, ImageDirLoader, LlmError, LoadImage, Message, SplitTableVerdict,
-    ToolCall, Usage, VisionClient,
+    TableTranscription, ToolCall, TranscribedCell, Usage, VisionClient,
 };
 
 // 独立可用的工具件：探测器（疑点统计）、机械清洗与 full.md 确定性重渲染

@@ -34,6 +34,7 @@ const { items, report } = await refine(contentList, {
   imageDir: "/abs/mineru/out", // 可选:MinerU 产物目录,提供则启用跨页拆表的视觉裁决
   fixOcrConfusion: false,      // 可选:opt-in 的 OCR 字符混淆修正层(CE0→CEO 等)
   extraConfusionPairs: [],     // 可选:混淆准入名单补充对,如 ["0D"]
+  rewriteGarbledTables: false, // 可选:opt-in 的重度乱码表视觉重转写层(需要 imageDir)
 });
 
 items;    // 清洗后的 content_list(同 schema,未知字段原样透传)
@@ -45,6 +46,9 @@ report;   // 审计报告:iterations / opCounts / dismissed / removedSpans
 删除的每段内容都留痕于 `report.removedSpans`(itemId / 原文 / 原因),逐条可审计。
 `fixOcrConfusion: true` 开启混淆修正层(直接替换,LLM 提案 + 机械闸门),
 开启后输出契约从"只删不增"变为双契约——详见主 README 的「混淆修正层」一节。
+`rewriteGarbledTables: true` 开启重度乱码表的视觉重转写层(机械检测整表认废的表,
+Qwen-VL 对照截图逐单元格重转写,全量进 report.tableRewrites)——详见主 README 的
+「乱码表重转写层」一节。
 
 独立工具函数(都不调 LLM):
 

@@ -8,22 +8,27 @@
 > ① 赘字/衍字删除（extra_char 探测器 + deleteChar op，全走 LLM 裁决，无机械兜底）；
 > ② confusionObservations 闭环回灌（一轮二次候选，三道闸门照旧）；
 > ③ 中文形近字准入名单扩充（校较/酒源/军率）+ 全文频率投票（加白排误 + 拉丁 token 少数派投票）。
+>
+> 已完成（2026-06-12，core 0.10.0 / garbled g1）：
+> ④ 重度乱码表视觉重转写层（`rewriteGarbledTables`，opt-in，见下「1.」原案与实现差异）。
 
-## 1. 重度乱码表格的视觉重转写（opt-in，单独立项）
+## 1. 重度乱码表格的视觉重转写 ✅（core 0.10.0，`rewriteGarbledTables`）
 
-**单点价值最大，但契约影响大（整单元格替换），需独立 opt-in 层 + 全量 provenance。**
+实现为独立 opt-in 层（`garbled.rs`），跑在出口闸门后、混淆层前：
 
-证据：ZBZ-047 item109 一个表格 13+ 处乱码
-（代格/目择值/比校方式/数据来酒/数更来潭/楼心/蒙飚5/道术率/系计数据/合格军/Midhuel…），
-但其 `img_path` 对应的图像截图**完全清晰可读**（代码/目标值/核心/Michael 历历在目）。
-
-实现思路：
-
-- [ ] 机械检测「乱码密度超标」的表格：字典命中率低 + observation 密集
-- [ ] 复用现有 `imageDir` + 跨页拆表的视觉裁决基建，视觉 LLM 对照图像逐单元格重转写
-- [ ] 闸门 + provenance 全量留痕，可程序化撤销
-- [ ] 顺带解决 Midhuel→Michael 这类**词级**错误（超出单字符契约，
-      但在视觉重审语境里是自然产物）
+- [x] 机械检测：内嵌 6 万常用词词典（jieba top60k，`data/cn_words.txt`），对单元格汉字段
+      做正向最大匹配算词覆盖率。标定（三份真实文档）：乱码表 0.46，最差正常表 0.61，
+      阈值 0.55，全语料零误报。原案的「observation 密集」信号不需要——覆盖率单信号已分干净，
+      且让本层与混淆层解耦
+- [x] 复用 `imageDir`/`LoadImage` + Qwen-VL（`VisionClient::transcribe_table`），
+      对照 img_path 截图逐单元格重转写
+- [x] 三道机械闸门 + 全量留痕：①资格（空格/纯数值/短编号/词覆盖率正常的格不许动——
+      实测视觉模型在 33 列宽表上会行列错位张冠李戴，这道闸门拦下全部错位提案）；
+      ②结构（行列命中/无标签/长度上限/提案非纯数值/长度量级可比）；
+      ③整表回归（重转写后覆盖率必须严格升高，否则整表回退）。
+      每格进 `report.tableRewrites`（before 即撤销凭据）与 provenance（origin=garbled_table）
+- [x] Midhuel→Michael 词级错误顺带解决（实测 ZBZ-047：25 格落地，覆盖率 0.46→0.77，
+      含 Michael×2；冒烟入口 `cargo run --example garbled_smoke --features bin`）
 
 ## 2. 跨页段落粘连 / 漏标标题残留（探测器调优）
 
