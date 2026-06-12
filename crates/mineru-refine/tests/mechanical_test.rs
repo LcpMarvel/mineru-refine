@@ -174,6 +174,71 @@ fn escaped_dollar_and_star_unescaped_with_audit_trail() {
 }
 
 #[test]
+fn cell_pseudo_latex_stripped_with_symbol_mapping() {
+    // JZY-001 真实数据：判断矩阵表头的 λmi/λmax 被 MinerU 误转成 LaTeX
+    let body = "<table><tr><td>Wi</td><td> $\\lambda _ { m i }$ </td>\
+                <td> $\\lambda _ { m a x }$ </td><td>${A}$</td>\
+                <td>$\\mathsf { A i j } { = } 1$</td><td>$x \\times 10$</td></tr></table>";
+    let (items, o) = clean(items_of(json!([
+        { "type": "table", "table_body": body, "page_idx": 0, "bbox": bbox(0) },
+    ])));
+    let new_body = items[0].item.table_body().unwrap();
+    // cell 首尾的单个半角空格按设计保留（空白收紧只处理 ≥2 连续/全角）
+    assert!(new_body.contains("> λ_mi <"), "{new_body}");
+    assert!(new_body.contains("> λ_max <"), "{new_body}");
+    assert!(new_body.contains(">A<"), "{new_body}");
+    assert!(new_body.contains(">Aij=1<"), "{new_body}");
+    assert!(new_body.contains(">x×10<"), "{new_body}");
+    assert_eq!(count(&o, "mechCellLatex"), 5);
+    assert_eq!(count(&o, "mechReverted"), 0);
+    assert_eq!(table_shell(body), table_shell(new_body));
+    // 原 span 进 removedSpans 留撤销凭据，reason 携带替换文
+    assert!(
+        o.removed_spans
+            .iter()
+            .any(|s| s.text == "$\\lambda _ { m i }$" && s.reason == "mech:cell_latex→λ_mi")
+    );
+}
+
+#[test]
+fn real_formulas_and_dollar_amounts_in_cells_untouched() {
+    // 未知命令（\frac/\sum）= 真公式；裸 $...$ 无命令无花括号 = 可能是真美元金额
+    let body = "<table><tr>\
+        <td>$\\frac { a } { b }$</td>\
+        <td>$\\sum _ { i } x _ { i }$</td>\
+        <td>支出 $100 和 $200</td>\
+        <td>$100$</td></tr></table>";
+    let (items, o) = clean(items_of(json!([
+        { "type": "table", "table_body": body, "page_idx": 0, "bbox": bbox(0) },
+    ])));
+    assert_eq!(count(&o, "mechCellLatex"), 0);
+    assert_eq!(items[0].item.table_body().unwrap(), body);
+
+    // 转义定界符 \$...\$：latex 层不碰（先于 unescape 跑，不会被变出的 $ 对误伤），
+    // unescape 照常剥反斜杠
+    let escaped = "<table><tr><td>\\$100\\$</td></tr></table>";
+    let (items, o) = clean(items_of(json!([
+        { "type": "table", "table_body": escaped, "page_idx": 0, "bbox": bbox(0) },
+    ])));
+    assert!(items[0].item.table_body().unwrap().contains(">$100$<"));
+    assert_eq!(count(&o, "mechCellLatex"), 0);
+    assert_eq!(count(&o, "mechUnescape"), 2);
+}
+
+#[test]
+fn text_item_latex_left_to_llm_strip_path() {
+    // 独立 text 的 LaTeX 残留不归机械层：探测器 → LLM strip op 负责
+    let (items, o) = clean(items_of(json!([
+        { "type": "text", "text": "其中 $\\lambda _ { m a x }$ 为最大特征根", "page_idx": 0, "bbox": bbox(0) },
+    ])));
+    assert_eq!(count(&o, "mechCellLatex"), 0);
+    assert_eq!(
+        items[0].item.text().unwrap(),
+        "其中 $\\lambda _ { m a x }$ 为最大特征根"
+    );
+}
+
+#[test]
 fn clean_input_is_untouched_with_empty_counts() {
     let input = items_of(json!([
         { "type": "text", "text": "正常段落，无需清理。", "page_idx": 0, "bbox": bbox(0) },

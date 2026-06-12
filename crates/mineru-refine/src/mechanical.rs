@@ -7,10 +7,18 @@
 //   3. cell 内空白收紧（≥2 连续空白或含全角空格：两侧都是 CJK → 删除，否则收为单个空格）
 //   4. URL 内 OCR 空格删除（`https://www. x. com` → 空格紧跟 [./?=&] 且后随 ASCII 字母数字）
 //   5. markdown 转义残留删除（`\$APPEALS` → `$APPEALS`，`\*` → `*`；text/caption/list_items 同样处理）
+//   6. cell 内伪 LaTeX 包装剥除（`$\lambda _ { m a x }$` → `λ_max`、`${A}$` → `A`）：
+//      $...$ 里只允许出现已知符号命令（→ Unicode）与样式包装命令（→ 删除），
+//      命中任何未知命令（\frac/\sum/\begin…）即视为真公式，整段不动。
+//      独立文本 item 的 LaTeX 残留仍走探测器 → LLM strip op；cell 受
+//      「table_body 逐字节不变」保真闸约束，op 体系动不了，只能在本 pass（基线快照前）清。
 //
 // 保真：本 pass 自带逐项校验，与 op 体系的保真闸互不依赖——
 //   - 字符串字段：删除的字符只能是空白或转义反斜杠，绝不新增字符
-//   - 表格：shell（行外字节）逐字节不变，全体 cell 内容字符多重集不增、删除的只能是空白/反斜杠
+//   - 表格：shell（行外字节）逐字节不变，全体 cell 内容字符多重集不增、删除的只能是空白/反斜杠。
+//     伪 LaTeX 剥除是唯一允许"删内容字符/换符号"的项：每个 $...$ 替换对先过 span 级
+//     字符预算校验（产物字符 ⊆ 原 span 字符 + span 内命令映射出的符号），再把替换对
+//     代入旧值得到期望值，期望值与新值之间仍走严格校验
 // 任一校验不过 → 放弃该项变更、保留原值并记 mechReverted（防实现 bug，正常永不触发）。
 // 在 refine_inner 中先于基线快照执行，出口闸门以"机械清洗后的 items"为基准。
 
@@ -31,6 +39,9 @@ static ESCAPED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\([$*])").unwra
 // 句末标点（含分号）：上一行 cell 以它收尾说明记录完整，不做续行合并
 static CELL_SENTENCE_END: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[。．.!！?？;；…]\s*$").unwrap());
+// cell 内 $...$ 公式 span 与其中的 \命令（伪 LaTeX 剥除用）
+static DOLLAR_SPAN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$([^$\n]+)\$").unwrap());
+static LATEX_CMD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\([a-zA-Z]+)").unwrap());
 
 pub struct MechOutcome {
     pub counts: BTreeMap<String, u64>,
@@ -152,6 +163,149 @@ fn tighten_cell_ws(s: &str) -> (String, u64) {
     (out, hits)
 }
 
+// ── cell 内伪 LaTeX 剥除 ──
+
+/// 已知符号命令 → Unicode。只收"伪 LaTeX 包装"里会出现的排版符号；
+/// \frac/\sqrt/\sum/\begin 等结构性命令故意不在表内 → 整个 $...$ 判为真公式不动。
+fn latex_symbol(cmd: &str) -> Option<&'static str> {
+    Some(match cmd {
+        "alpha" => "α",
+        "beta" => "β",
+        "gamma" => "γ",
+        "delta" => "δ",
+        "epsilon" => "ε",
+        "zeta" => "ζ",
+        "eta" => "η",
+        "theta" => "θ",
+        "kappa" => "κ",
+        "lambda" => "λ",
+        "mu" => "μ",
+        "nu" => "ν",
+        "xi" => "ξ",
+        "pi" => "π",
+        "rho" => "ρ",
+        "sigma" => "σ",
+        "tau" => "τ",
+        "phi" => "φ",
+        "chi" => "χ",
+        "psi" => "ψ",
+        "omega" => "ω",
+        "Gamma" => "Γ",
+        "Delta" => "Δ",
+        "Theta" => "Θ",
+        "Lambda" => "Λ",
+        "Xi" => "Ξ",
+        "Pi" => "Π",
+        "Sigma" => "Σ",
+        "Phi" => "Φ",
+        "Psi" => "Ψ",
+        "Omega" => "Ω",
+        "times" => "×",
+        "cdot" => "·",
+        "div" => "÷",
+        "pm" => "±",
+        "le" | "leq" => "≤",
+        "ge" | "geq" => "≥",
+        "leqslant" => "⩽",
+        "geqslant" => "⩾",
+        "ne" | "neq" => "≠",
+        "approx" => "≈",
+        "infty" => "∞",
+        "circ" | "degree" => "°",
+        "permil" => "‰",
+        _ => return None,
+    })
+}
+
+/// 纯样式包装命令：删掉命令本身、保留花括号内容。
+fn is_style_cmd(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "mathsf"
+            | "mathrm"
+            | "mathbf"
+            | "mathit"
+            | "mathcal"
+            | "mathbb"
+            | "mathtt"
+            | "operatorname"
+            | "text"
+            | "textbf"
+            | "textit"
+            | "textrm"
+            | "boldsymbol"
+            | "bf"
+            | "it"
+            | "rm"
+            | "sf"
+            | "tt"
+    )
+}
+
+/// $...$ 内文 → 明文。None = 不够格（真公式/非 LaTeX/剥完出脏字符），整段不动。
+/// 资格：至少含一个已知命令或花括号（裸 `$100$` 不动——可能是真美元金额），
+/// 且所有 \命令 都已知。剥法与 ops::strip_latex_commands 同思路（命令/花括号/
+/// 公式内空白全删），区别是符号命令换成 Unicode 而非丢弃（`\lambda` 的 λ 不能丢）。
+fn rewrite_latex_inner(inner: &str) -> Option<String> {
+    let mut looks_latex = inner.contains('{');
+    let mut out = String::with_capacity(inner.len());
+    let mut last = 0usize;
+    for caps in LATEX_CMD.captures_iter(inner) {
+        let m = caps.get(0).unwrap();
+        out.push_str(&inner[last..m.start()]);
+        let name = &caps[1];
+        if let Some(sym) = latex_symbol(name) {
+            out.push_str(sym);
+        } else if !is_style_cmd(name) {
+            return None; // 未知命令 = 真公式
+        }
+        looks_latex = true;
+        last = m.end();
+    }
+    out.push_str(&inner[last..]);
+    if !looks_latex {
+        return None;
+    }
+    let cleaned: String = out
+        .chars()
+        .filter(|c| !is_js_whitespace(*c) && *c != '{' && *c != '}')
+        .collect();
+    // 剥完为空（应整段删除的场景，宁可不动）或残余 \ / $（转义定界符等没剥干净）→ 放弃
+    if cleaned.is_empty() || cleaned.contains(['\\', '$']) {
+        return None;
+    }
+    Some(cleaned)
+}
+
+/// cell 内伪 LaTeX 包装剥除。返回 (新串, [(原 span, 替换文)])。
+fn strip_cell_latex(s: &str) -> (String, Vec<(String, String)>) {
+    if !s.contains('$') {
+        return (s.to_string(), Vec::new());
+    }
+    let mut hits: Vec<(String, String)> = Vec::new();
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0usize;
+    for caps in DOLLAR_SPAN.captures_iter(s) {
+        let m = caps.get(0).unwrap();
+        if m.start() < last {
+            continue; // 理论上 captures_iter 不重叠，防御
+        }
+        out.push_str(&s[last..m.start()]);
+        // 开定界符是 `\$` 转义 → 不是公式，原样保留（交给 unescape 处理）
+        let escaped_open = s[..m.start()].ends_with('\\');
+        match (escaped_open, rewrite_latex_inner(&caps[1])) {
+            (false, Some(repl)) => {
+                hits.push((m.as_str().to_string(), repl.clone()));
+                out.push_str(&repl);
+            }
+            _ => out.push_str(m.as_str()),
+        }
+        last = m.end();
+    }
+    out.push_str(&s[last..]);
+    (out, hits)
+}
+
 // ── 校验件 ──
 
 fn char_counts(s: &str) -> HashMap<char, i64> {
@@ -248,6 +402,8 @@ struct TableStats {
     cell_ws: u64,
     url_ws: u64,
     unescapes: Vec<String>,
+    /// 伪 LaTeX 剥除的 (原 span, 替换文)，原 span 即撤销凭据
+    latex: Vec<(String, String)>,
 }
 
 /// 表格清理：续行合并 → 空行删除 → cell 内容清理。返回 None = 无变更。
@@ -272,6 +428,7 @@ fn clean_table_body(body: &str) -> Option<(String, TableStats)> {
         cell_ws: 0,
         url_ws: 0,
         unescapes: Vec::new(),
+        latex: Vec::new(),
     };
     let table_has_rowspan = has_rowspan_gt1(body);
     let mut removed = vec![false; rows.len()];
@@ -348,13 +505,16 @@ fn clean_table_body(body: &str) -> Option<(String, TableStats)> {
         }
     }
 
-    // 3) cell 内容清理：转义残留 → URL 空格 → 空白收紧
+    // 3) cell 内容清理：伪 LaTeX 剥除 → 转义残留 → URL 空格 → 空白收紧
+    //    （LaTeX 必须先于 unescape：`\$100\$` 经 unescape 会变出成对 $，再剥就误伤真美元）
     for (r, row) in rows.iter_mut().enumerate() {
         if removed[r] {
             continue;
         }
         for cell in &mut row.cells {
-            let (s, hits) = unescape(&cell.1);
+            let (s, latex_hits) = strip_cell_latex(&cell.1);
+            stats.latex.extend(latex_hits);
+            let (s, hits) = unescape(&s);
             stats.unescapes.extend(hits);
             let (s, url_fixes) = fix_url_ws(&s);
             stats.url_ws += url_fixes;
@@ -369,6 +529,7 @@ fn clean_table_body(body: &str) -> Option<(String, TableStats)> {
         && stats.cell_ws == 0
         && stats.url_ws == 0
         && stats.unescapes.is_empty()
+        && stats.latex.is_empty()
     {
         return None;
     }
@@ -384,8 +545,36 @@ fn clean_table_body(body: &str) -> Option<(String, TableStats)> {
     Some((out, stats))
 }
 
+/// 伪 LaTeX 替换对的 span 级预算校验（独立于 rewrite 的构造过程，防实现 bug）：
+/// 替换文不得含空白/定界符/命令残骸，且每个字符要么来自原 span，
+/// 要么是原 span 中某个已知命令映射出的符号。
+fn latex_pair_ok(span: &str, repl: &str) -> bool {
+    if repl
+        .chars()
+        .any(|c| is_js_whitespace(c) || matches!(c, '$' | '\\' | '{' | '}'))
+    {
+        return false;
+    }
+    let mut budget = char_counts(span);
+    for caps in LATEX_CMD.captures_iter(span) {
+        if let Some(sym) = latex_symbol(&caps[1]) {
+            for c in sym.chars() {
+                *budget.entry(c).or_insert(0) += 1;
+            }
+        }
+    }
+    repl.chars().all(|c| match budget.get_mut(&c) {
+        Some(n) if *n > 0 => {
+            *n -= 1;
+            true
+        }
+        _ => false,
+    })
+}
+
 /// 表格变更校验：shell 逐字节不变 + 全体 cell 内容字符多重集合法（不新增、只删空白/反斜杠）。
-fn verify_table(old: &str, new: &str) -> bool {
+/// 伪 LaTeX 替换对先逐对过预算校验，再代入旧值得到期望值参与严格比对。
+fn verify_table(old: &str, new: &str, latex: &[(String, String)]) -> bool {
     if table_shell(old) != table_shell(new) {
         return false;
     }
@@ -395,7 +584,15 @@ fn verify_table(old: &str, new: &str) -> bool {
             .collect::<Vec<_>>()
             .concat()
     };
-    diff_ok(&inners(old), &inners(new))
+    let mut expected = inners(old);
+    for (span, repl) in latex {
+        if !latex_pair_ok(span, repl) {
+            return false;
+        }
+        // diff_ok 按多重集比对，替换命中哪一处同串 span 不影响结果
+        expected = expected.replacen(span.as_str(), repl, 1);
+    }
+    diff_ok(&expected, &inners(new))
 }
 
 // ── 入口 ──
@@ -471,7 +668,7 @@ pub fn mechanical_clean(items: &mut [RefItem], log: &Logger) -> MechOutcome {
         if let Some(body) = r.item.table_body().map(str::to_string)
             && let Some((new_body, stats)) = clean_table_body(&body)
         {
-            if !verify_table(&body, &new_body) {
+            if !verify_table(&body, &new_body, &stats.latex) {
                 log(&format!("机械清洗校验不过（{id} table_body），保留原值"));
                 bump(&mut counts, "mechReverted", 1);
                 continue;
@@ -481,11 +678,19 @@ pub fn mechanical_clean(items: &mut [RefItem], log: &Logger) -> MechOutcome {
             bump(&mut counts, "mechCellWs", stats.cell_ws);
             bump(&mut counts, "mechUrlWs", stats.url_ws);
             bump(&mut counts, "mechUnescape", stats.unescapes.len() as u64);
+            bump(&mut counts, "mechCellLatex", stats.latex.len() as u64);
             for e in stats.unescapes {
                 removed_spans.push(RemovedSpan {
                     item_id: id.clone(),
                     text: e,
                     reason: "mech:unescape".into(),
+                });
+            }
+            for (span, repl) in stats.latex {
+                removed_spans.push(RemovedSpan {
+                    item_id: id.clone(),
+                    text: span,
+                    reason: format!("mech:cell_latex→{repl}"),
                 });
             }
             r.item.set("table_body", Value::String(new_body));

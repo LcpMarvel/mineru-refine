@@ -22,7 +22,7 @@ fn renders_headings_paragraphs_furniture_tables_images_equations_lists() {
             "table_body": "<table><tr><td>A</td></tr></table>",
             "table_footnote": ["注：略"],
         },
-        { "type": "image", "img_path": "images/a.jpg", "img_caption": ["图1：流程"], "img_footnote": [] },
+        { "type": "image", "img_path": "images/a.jpg", "image_caption": ["图1：流程"], "image_footnote": [] },
         { "type": "chart", "img_path": "images/b.jpg" },
         { "type": "equation", "text": "$$\nE=mc^2\n$$" },
         { "type": "list", "list_items": ["第一项", "第二项"] },

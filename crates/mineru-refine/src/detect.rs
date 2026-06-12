@@ -453,9 +453,12 @@ pub fn detect(items: &[RefItem]) -> Vec<WorkItem> {
             }
         }
 
-        // ── 漏标标题（→ promote）：同级编号兄弟（同数制、同深度、同父编号）的最近一个
-        // 是标题且编号恰好相邻（±1），而本块是正文 → 大概率是漏标的标题。
-        // 表面闸：去编号后 ≤30 内容字、无逗号/分号、无句末标点（正文段落天然不命中）。──
+        // ── 漏标标题（→ promote）：两路结构证据，命中任一即标。
+        // 表面闸（共用）：去编号后 ≤30 内容字、无逗号/分号、无句末标点（正文段落天然不命中）。
+        // ① 兄弟证据：同级编号兄弟（同数制、同深度、同父编号）的最近一个是标题且编号恰好相邻（±1）。
+        // ② 子项证据：下一个内容块的编号以本块编号为真前缀（同数制）。整组同级兄弟都被
+        //    MinerU 漏标时 ① 永不触发，子项前缀是唯一可靠的结构证据（真实数据：JZY-001
+        //    「2.1确定竞争对手：」「2.2竞争情报收集：」等 15 处全因此漏网）。──
         if let Some((path, style)) = promote_candidate(item) {
             let depth = path.len();
             let parent = &path[..depth - 1];
@@ -483,6 +486,42 @@ pub fn detect(items: &[RefItem]) -> Vec<WorkItem> {
                     ),
                     true,
                 ));
+            } else {
+                let mut j = i + 1;
+                while j < items.len() && is_page_furniture(items[j].item.item_type()) {
+                    j += 1;
+                }
+                let child = items.get(j).filter(|n| {
+                    n.item.item_type() == "text"
+                        && n.item
+                            .text()
+                            .and_then(parse_numbering)
+                            .is_some_and(|(cpath, cstyle, _)| {
+                                cstyle == style
+                                    && cpath.len() > depth
+                                    && cpath[..depth] == path[..]
+                            })
+                });
+                if let Some(ch) = child {
+                    let dotted = |p: &[u64]| {
+                        p.iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(".")
+                    };
+                    out.push(suspect(
+                        SuspectKind::MissedHeading,
+                        id,
+                        format!(
+                            "下一个内容块 {}「{}」的编号以本块编号 {} 为前缀（子项），而本块是短编号正文 → 疑似漏标标题。text=「{}」",
+                            ch.id,
+                            char_prefix(ch.item.text().unwrap_or(""), 40),
+                            dotted(&path),
+                            char_prefix(text, 60)
+                        ),
+                        true,
+                    ));
+                }
             }
         }
 
@@ -681,7 +720,7 @@ pub fn detect(items: &[RefItem]) -> Vec<WorkItem> {
             let caption_key = if item.item_type() == "table" {
                 "table_caption"
             } else {
-                "img_caption"
+                "image_caption"
             };
             let empty = match item
                 .0

@@ -62,8 +62,8 @@ fn render_item(item: &MineruItem) -> Vec<String> {
             {
                 out.push(format!("![]({img})"));
             }
-            push_array(&mut out, item, "img_caption");
-            push_array(&mut out, item, "img_footnote");
+            push_array(&mut out, item, "image_caption");
+            push_array(&mut out, item, "image_footnote");
         }
         "equation" => push_lines(&mut out, &[item.text()]),
         "list" => push_array(&mut out, item, "list_items"),

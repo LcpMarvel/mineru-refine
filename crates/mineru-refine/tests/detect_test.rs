@@ -302,6 +302,29 @@ fn adjacent_bullet_lines_across_pages_not_cross_page_break() {
     assert!(m.is_empty());
 }
 
+#[test]
+fn bullet_list_tail_before_next_page_heading_not_cross_page_break() {
+    // 真实数据回归（JZY-001 p38→p39，PDF 复核）：「---收割战」是五连项目符列表的末项
+    //（OCR 吃掉了部分短横），下一页「防御战的核心」是图示小标题——绝不是断句，merge 了就错。
+    let m = kinds_of(&items_of(json!([
+        { "type": "text", "text": "侧翼战", "page_idx": 38, "bbox": bbox(700) },
+        { "type": "text", "text": "--收割战", "page_idx": 38, "bbox": bbox(730) },
+        { "type": "text", "text": "防御战的核心", "text_level": 2, "page_idx": 39, "bbox": bbox(0) },
+    ])));
+    assert!(!m.contains_key("it_0002"), "{m:?}");
+}
+
+#[test]
+fn colon_intro_bullet_item_before_debulleted_list_not_cross_page_break() {
+    // 真实数据回归（JZY-001 p22→p23，PDF 复核）：前块是「②…：」列表项引出下一页的
+    // 子列表，子列表项的「–」项目符被 MinerU 吃掉成裸文本——仍不是断句。
+    let m = kinds_of(&items_of(json!([
+        { "type": "text", "text": "②行业政策分析，重点检索和分析国家出台的以下行业政策：", "page_idx": 22, "bbox": bbox(700) },
+        { "type": "text", "text": "对计量行业新技术发展的鼓励或引导政策", "page_idx": 23, "bbox": bbox(0) },
+    ])));
+    assert!(!m.contains_key("it_0001"), "{m:?}");
+}
+
 // ── 漏标标题 / 段尾节标记 / caption 被标题隔开（hasOp）──
 
 #[test]
@@ -330,6 +353,53 @@ fn missed_heading_flagged_via_following_sibling_and_evidence_has_level() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].item_id, "it_0002");
     assert!(hits[0].evidence.contains("level=3"), "{}", hits[0].evidence);
+}
+
+#[test]
+fn missed_heading_flagged_via_numbered_child_when_whole_sibling_group_unmarked() {
+    // 真实数据回归（JZY-001 p41）：2.1/2.2 整组兄弟都被 MinerU 漏标，
+    // ±1 兄弟信号永不触发；下一个内容块的编号以本块编号为真前缀（2.1 → 2.1.1）即标。
+    let wl = detect_of(&items_of(json!([
+        { "type": "text", "text": "2、雷达图分析：", "text_level": 2, "page_idx": 41, "bbox": bbox(0) },
+        { "type": "text", "text": "2.1确定竞争对手：", "page_idx": 41, "bbox": bbox(40) },
+        { "type": "text", "text": "2.1.1在开始竞争分析之前，首先确定本公司的标杆者和竞争对手。", "page_idx": 41, "bbox": bbox(80) },
+    ])));
+    let hits: Vec<_> = wl
+        .iter()
+        .filter(|w| w.kind == SuspectKind::MissedHeading)
+        .collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].item_id, "it_0002");
+    assert!(hits[0].evidence.contains("it_0003"), "{}", hits[0].evidence);
+    assert!(hits[0].evidence.contains("前缀"), "{}", hits[0].evidence);
+}
+
+#[test]
+fn missed_heading_numbered_child_works_across_page_furniture() {
+    // 真实数据回归（JZY-001 p41→p42）：「2.2竞争情报收集：」是页末块，
+    // 子项 2.2.1 在下一页、中间隔着页眉页码。跨页断句探测器也不许误标（后块编号是标题特征）。
+    let m = kinds_of(&items_of(json!([
+        { "type": "text", "text": "2.2竞争情报收集：", "page_idx": 41, "bbox": bbox(700) },
+        { "type": "header", "text": "附件5战略管理之“看自己”", "page_idx": 41, "bbox": bbox(750) },
+        { "type": "page_number", "text": "42 / 71", "page_idx": 41, "bbox": bbox(780) },
+        { "type": "text", "text": "2.2.1收集与竞争对手15要素分析数据，从15要素里再选取了9个要素进行分析。", "page_idx": 42, "bbox": bbox(0) },
+    ])));
+    assert_eq!(m["it_0001"], vec![SuspectKind::MissedHeading]);
+}
+
+#[test]
+fn numbered_child_signal_requires_true_prefix_and_same_style() {
+    // 非前缀编号（3.1 后跟 4.1）不算子项；中文数制父块 + 阿拉伯子编号也不算。
+    let m = kinds_of(&items_of(json!([
+        { "type": "text", "text": "3.1商业画布的过程和展开", "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "4.1按战略发展部要求收集数据", "page_idx": 0, "bbox": bbox(40) },
+    ])));
+    assert!(m.is_empty(), "{m:?}");
+    let m = kinds_of(&items_of(json!([
+        { "type": "text", "text": "一、总则", "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "1.1本规范适用于全公司各部门", "page_idx": 0, "bbox": bbox(40) },
+    ])));
+    assert!(!m.contains_key("it_0001"), "{m:?}");
 }
 
 #[test]
