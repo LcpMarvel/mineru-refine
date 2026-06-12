@@ -6,27 +6,40 @@
 // 权力结构：LLM 只有提案权，没有写入权——
 //   闸门 1（结构）：恰好 1 字符、与原字符不同、密度上限内（OCR 混淆是稀疏的）；
 //   闸门 2（准入）：(before, after) 同属混淆等价类 → 直接落地；
-//                   表外提案 → 对抗式二次裁决，通过才落地（source=second_opinion）。
+//                   定点频率投票候选命中多数派写法 → 直接落地（source=frequency_vote）；
+//                   其余表外提案 → 对抗式二次裁决，通过才落地（source=second_opinion）。
 // 层内任何 LLM 故障 → 搁置对应批次（漏修，不毁全局）；层级 panic 由调用方兜（丢弃整层）。
 //
 // table_body（Phase 2）：标签骨架与文本节点词法分离，只有 td/th 单元格内的文本
 // 可成为候选——标记字符（colspan=1 的 1）在构造上就不可能被替换，HTML 实体当黑盒跳过。
 // 表格候选用行列结构化上下文裁决（标题/表头/所在行），并多一道每表聚合密度闸门
 //（乱码表会诱发大量"修复"，整表按住——乱码表的归宿是整表裁决，不是逐字替换）。
+//
+// 频率投票（Phase 3）：全文频率做动态准入/排误——
+//   排误（加白）：候选字与邻字构成的高频词全文一致出现（≥5 次）且任何类内替代写法
+//   从未出现 → 大概率真术语（实证：「烟感」产品线 ×5），跳过送审；
+//   召回（拉丁 token 投票）：OGSTM×2 vs OGSMT×20 → 少数派写法生成定点候选，
+//   命中多数派写法的修复免二次裁决（差异本身就是全文实证）。
+//
+// observations 闭环（Phase 3）：本轮裁决顺带报告的「X 应为 Y」表外观察，解析出
+// 单字形近替换后生成定点候选做第二轮裁决（三道机械闸门照旧）——回收已花掉的 token。
+// 防循环：最多一轮回灌，第二轮的 observations 只记录不再回灌。
 
 use crate::agent_loop::Logger;
 use crate::llm::{ChatClient, ChatResult, LlmError, Message, Usage, parse_json_safe};
 use crate::types::{ConfusionFix, RefItem, TokenUsage};
 use futures::StreamExt;
+use regex::Regex;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
 /// 混淆层独立的 prompt 版本（与核心层 PROMPT_VERSION 分开演进，进缓存 key）。
 /// c2：table_body 进入处理范围 + 表格行列上下文 + 白名单实证扩充（扞杆/亭亨）。
-pub const CONFUSION_PROMPT_VERSION: &str = "c2";
+/// c3：中文形近对扩充（校较/酒源/军率）+ 全文频率投票 + observations 闭环回灌。
+pub const CONFUSION_PROMPT_VERSION: &str = "c3";
 
 /// 内置混淆等价类：每个字符串是一组互为 OCR 形近的字符，类内任意方向可换。
 /// rn↔m 这类多字符混淆超出一换一定点约束的能力范围，不收。
@@ -50,6 +63,10 @@ pub const BUILTIN_CONFUSION_CLASSES: &[&str] = &[
     // 实证扩充（Phase 1 真实文档 observations）：业界标扞→标杆、亭德森→亨德森
     "扞杆",
     "亭亨",
+    // 实证扩充（Phase 3 真实文档 observations）：比校→比较、数据来酒→来源、合格军→合格率
+    "校较",
+    "酒源",
+    "军率",
 ];
 
 /// 单次裁决调用最多带多少个候选（再多就分批，避免撑爆单次输出）。
@@ -58,6 +75,10 @@ const MAX_CANDIDATES_PER_CALL: usize = 40;
 const CONTEXT_WINDOW: usize = 40;
 /// observations 上限（LLM 顺带报告的表外问题，只记不改）。
 const MAX_OBSERVATIONS: usize = 50;
+/// observations 回灌生成的定点候选上限（防观察噪声撑爆第二轮）。
+const MAX_FEEDBACK_CANDS: usize = 40;
+/// 频率加白门槛：候选字所在词全文一致出现 ≥ 该次数（且无任何变体写法）→ 跳过送审。
+const VOTE_WHITELIST_MIN: u32 = 5;
 
 /// 单个字段单元内允许落地的替换密度上限：OCR 混淆是稀疏的，
 /// 超标说明 LLM 在做别的事（改写/批量替换），整单元拒绝。
@@ -85,6 +106,8 @@ fn non_ws_len(chars: &[char]) -> usize {
 /// 改不改本身 100% 由 LLM 判——表宽不增加误伤。
 pub struct ConfusionTable {
     class_of: HashMap<char, usize>,
+    /// 与 BUILTIN_CONFUSION_CLASSES 一一对应（alternatives 的确定性迭代源）。
+    classes: Vec<Vec<char>>,
     extra: HashSet<(char, char)>,
     /// 候选字符全集（class_of 的键 ∪ extra 两侧字符）：扫描热路径上每字符查一次。
     candidates: HashSet<char>,
@@ -95,10 +118,13 @@ impl ConfusionTable {
     /// 非法配置早抛——这是调用方的配置错误，不静默吞。
     pub fn build(extra_pairs: &[String]) -> Result<Self, String> {
         let mut class_of = HashMap::new();
+        let mut classes: Vec<Vec<char>> = Vec::new();
         for (idx, class) in BUILTIN_CONFUSION_CLASSES.iter().enumerate() {
-            for c in class.chars() {
-                class_of.insert(c, idx);
+            let members: Vec<char> = class.chars().collect();
+            for c in &members {
+                class_of.insert(*c, idx);
             }
+            classes.push(members);
         }
         let mut extra = HashSet::new();
         for pair in extra_pairs {
@@ -115,6 +141,7 @@ impl ConfusionTable {
         candidates.extend(extra.iter().map(|(a, _)| *a));
         Ok(Self {
             class_of,
+            classes,
             extra,
             candidates,
         })
@@ -132,6 +159,27 @@ impl ConfusionTable {
         }
         matches!((self.class_of.get(&before), self.class_of.get(&after)),
                  (Some(a), Some(b)) if a == b)
+    }
+
+    /// c 的全部形近替代字符（类内成员 + 补充对伙伴），确定性顺序。
+    fn alternatives(&self, c: char) -> Vec<char> {
+        let mut out: Vec<char> = Vec::new();
+        if let Some(&idx) = self.class_of.get(&c) {
+            out.extend(self.classes[idx].iter().copied().filter(|&x| x != c));
+        }
+        let mut partners: Vec<char> = self
+            .extra
+            .iter()
+            .filter(|(a, _)| *a == c)
+            .map(|(_, b)| *b)
+            .collect();
+        partners.sort_unstable();
+        for p in partners {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
     }
 }
 
@@ -176,6 +224,8 @@ struct Unit {
     chars: Vec<char>,
     /// 仅 Field::TableBody 有值
     table: Option<TablePos>,
+    /// HTML 实体的字符区间（仅 table 节点非空）：实体内字符不可成为候选
+    entities: Vec<(usize, usize)>,
 }
 
 /// 表格的行列文本（构造裁决上下文用）。
@@ -315,6 +365,10 @@ fn in_spans(i: usize, spans: &[(usize, usize)]) -> bool {
 struct Cand {
     unit: usize,
     offset: usize,
+    /// 附给裁决 prompt 的辅助证据（频率投票/前轮观察）
+    note: Option<String>,
+    /// 频率投票建议的多数派字符：LLM 提案与之一致时免二次裁决直接落地
+    vote_after: Option<char>,
 }
 
 /// LLM 提案（已过结构闸门的原始形态）。
@@ -322,6 +376,291 @@ struct Proposal {
     cand: usize,
     after: char,
     reason: String,
+}
+
+// ── 频率统计 ──
+
+fn is_hanzi(c: char) -> bool {
+    matches!(c, '\u{4e00}'..='\u{9fff}')
+}
+
+/// 拉丁/数字 token（连续 [A-Za-z0-9] 段）及其起始字符偏移。
+/// 只收 ≥4 字符、至多 1 个数字的 token：纯数字/短编号（年份、序号）天然多变体，
+/// 频率投票对它们就是灾难（2026 少数 ≠ 2025 写错）。
+fn latin_tokens(chars: &[char]) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i].is_ascii_alphanumeric() {
+            let start = i;
+            while i < chars.len() && chars[i].is_ascii_alphanumeric() {
+                i += 1;
+            }
+            let tok: String = chars[start..i].iter().collect();
+            let len = i - start;
+            let alpha = tok.chars().filter(|c| c.is_ascii_alphabetic()).count();
+            if len >= 4 && alpha >= len - 1 {
+                out.push((tok, start));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 全文频率统计：CJK 双字词频 + 拉丁 token 频次（候选筛选前对全部单元构建）。
+struct FreqStats {
+    bigrams: HashMap<(char, char), u32>,
+    tokens: HashMap<String, u32>,
+}
+
+impl FreqStats {
+    fn build(units: &[Unit]) -> Self {
+        let mut bigrams: HashMap<(char, char), u32> = HashMap::new();
+        let mut tokens: HashMap<String, u32> = HashMap::new();
+        for u in units {
+            for w in u.chars.windows(2) {
+                if is_hanzi(w[0]) && is_hanzi(w[1]) {
+                    *bigrams.entry((w[0], w[1])).or_insert(0) += 1;
+                }
+            }
+            for (tok, _) in latin_tokens(&u.chars) {
+                *tokens.entry(tok).or_insert(0) += 1;
+            }
+        }
+        Self { bigrams, tokens }
+    }
+
+    fn bigram(&self, a: char, b: char) -> u32 {
+        self.bigrams.get(&(a, b)).copied().unwrap_or(0)
+    }
+
+    /// 频率加白（排误）：候选字与紧邻汉字构成的词全文一致出现 ≥ VOTE_WHITELIST_MIN 次，
+    /// 且任何替代写法（alts 替换该字后的变体词）从未出现 → 大概率真术语，跳过送审。
+    fn whitelisted(&self, chars: &[char], offset: usize, alts: &[char]) -> bool {
+        let c = chars[offset];
+        let prev = (offset > 0)
+            .then(|| chars[offset - 1])
+            .filter(|p| is_hanzi(*p));
+        let next = chars.get(offset + 1).copied().filter(|n| is_hanzi(*n));
+        let own_l = prev.map(|p| self.bigram(p, c)).unwrap_or(0);
+        let own_r = next.map(|n| self.bigram(c, n)).unwrap_or(0);
+        if own_l < VOTE_WHITELIST_MIN && own_r < VOTE_WHITELIST_MIN {
+            return false;
+        }
+        for &a in alts {
+            if let Some(p) = prev
+                && self.bigram(p, a) > 0
+            {
+                return false;
+            }
+            if let Some(n) = next
+                && self.bigram(a, n) > 0
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 少数派注记（召回）：候选字所在词是全文少数派写法、且存在类内替代字构成的
+    /// 高频多数派写法 → 给裁决 prompt 附频率证据。
+    fn minority_note(&self, chars: &[char], offset: usize, alts: &[char]) -> Option<String> {
+        let c = chars[offset];
+        let sides = [
+            (offset > 0)
+                .then(|| chars[offset - 1])
+                .filter(|p| is_hanzi(*p))
+                .map(|p| (p, true)),
+            chars
+                .get(offset + 1)
+                .copied()
+                .filter(|n| is_hanzi(*n))
+                .map(|n| (n, false)),
+        ];
+        for side in sides.into_iter().flatten() {
+            let (nb, nb_is_prev) = side;
+            let word = |x: char| -> (String, u32) {
+                if nb_is_prev {
+                    (format!("{nb}{x}"), self.bigram(nb, x))
+                } else {
+                    (format!("{x}{nb}"), self.bigram(x, nb))
+                }
+            };
+            let (own_word, own) = word(c);
+            for &a in alts {
+                let (rival_word, rival) = word(a);
+                if rival >= 3 && rival >= 3 * own.max(1) {
+                    return Some(format!(
+                        "频率投票：全文「{own_word}」×{own}、「{rival_word}」×{rival}，少数派写法可疑"
+                    ));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// 少数派 token 内的单字替换：(token 内字符位置, 多数派字符)。
+type TokenSubs = Vec<(usize, char)>;
+
+/// 拉丁 token 频率投票：少数派 token 与高频多数派 token 仅差一处单字替换或
+/// 一处相邻换位（OGSTM vs OGSMT）→ 差异位生成定点候选，建议改成多数派字符。
+/// 返回 (unit, offset) → (建议字符, 注记)。
+fn latin_token_votes(units: &[Unit], stats: &FreqStats) -> HashMap<(usize, usize), (char, String)> {
+    // token 排序保证确定性输出
+    let mut sorted: Vec<(&str, u32)> = stats.tokens.iter().map(|(t, n)| (t.as_str(), *n)).collect();
+    sorted.sort_unstable();
+
+    // 少数派 token → 各差异位的 (位置, 多数派字符) + 注记
+    let mut corrections: HashMap<&str, (TokenSubs, String)> = HashMap::new();
+    for &(t, ct) in &sorted {
+        let tc: Vec<char> = t.chars().collect();
+        let mut best: Option<(&str, u32, TokenSubs)> = None;
+        for &(u, cu) in &sorted {
+            if u == t || cu < 4 || cu < 3 * ct {
+                continue;
+            }
+            let uc: Vec<char> = u.chars().collect();
+            if uc.len() != tc.len() {
+                continue;
+            }
+            let diffs: Vec<usize> = (0..tc.len()).filter(|&i| tc[i] != uc[i]).collect();
+            let subs: Option<TokenSubs> = match diffs.as_slice() {
+                [i] => Some(vec![(*i, uc[*i])]),
+                // 相邻换位：两处单字替换可恢复（每条仍是一换一）
+                [i, j] if *j == *i + 1 && tc[*i] == uc[*j] && tc[*j] == uc[*i] => {
+                    Some(vec![(*i, uc[*i]), (*j, uc[*j])])
+                }
+                _ => None,
+            };
+            if let Some(subs) = subs
+                && best.as_ref().map(|(_, bc, _)| cu > *bc).unwrap_or(true)
+            {
+                best = Some((u, cu, subs));
+            }
+        }
+        if let Some((u, cu, subs)) = best {
+            let note = format!("频率投票：全文「{u}」×{cu}、「{t}」×{ct}，疑为「{u}」的形误");
+            corrections.insert(t, (subs, note));
+        }
+    }
+    if corrections.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut out: HashMap<(usize, usize), (char, String)> = HashMap::new();
+    for (ui, unit) in units.iter().enumerate() {
+        for (tok, start) in latin_tokens(&unit.chars) {
+            if let Some((subs, note)) = corrections.get(tok.as_str()) {
+                for (pos, after) in subs {
+                    let offset = start + pos;
+                    if !in_spans(offset, &unit.entities) {
+                        out.insert((ui, offset), (*after, note.clone()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// ── observations 闭环 ──
+
+/// 观察文本里的「X 应为 Y」修正结构（兼容 「」/“”/" 三种引号与 →/-> 箭头）。
+static OBS_CORRECTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"[「“"]([^「」“”"]{2,20})[」”"]\s*(?:疑?似?应该?[为是]|实[为是]|当为|应?改为|→|->)\s*[「“"]([^「」“”"]{1,20})[」”"]"#,
+    )
+    .unwrap()
+});
+
+/// 对齐「错写 → 正写」为单字替换：返回 (错写中的差异位, 多数派字符) 列表。
+/// 等长 → 恰差 1 位才认；正写更短 → 在错写上滑窗找恰差 1 位的窗口（可能多个，
+/// 全部生成候选交 LLM 结合上下文裁决，闸门兜底）；正写更长（要加字）→ 超能力范围。
+fn align_corrections(wrong: &[char], right: &[char]) -> Vec<(usize, char)> {
+    let mut out = Vec::new();
+    if wrong.len() == right.len() {
+        let diffs: Vec<usize> = (0..wrong.len()).filter(|&i| wrong[i] != right[i]).collect();
+        if let [i] = diffs.as_slice() {
+            out.push((*i, right[*i]));
+        }
+        return out;
+    }
+    if right.len() >= 2 && right.len() < wrong.len() {
+        for start in 0..=(wrong.len() - right.len()) {
+            let diffs: Vec<usize> = (0..right.len())
+                .filter(|&k| wrong[start + k] != right[k])
+                .collect();
+            if let [k] = diffs.as_slice() {
+                out.push((start + *k, right[*k]));
+                if out.len() >= 3 {
+                    break; // 歧义窗口截断：再多就是噪声
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 从第一轮 observations 解析修正对，搜索全文生成定点候选（第二轮裁决用）。
+/// 排误：频率加白的位置（「烟感」反例）与第一轮已送审的位置都跳过。
+fn feedback_candidates(
+    observations: &[String],
+    units: &[Unit],
+    stats: &FreqStats,
+    judged: &HashSet<(usize, usize)>,
+) -> Vec<Cand> {
+    let mut out: Vec<Cand> = Vec::new();
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    for obs in observations {
+        for caps in OBS_CORRECTION.captures_iter(obs) {
+            let wrong: Vec<char> = caps[1].chars().collect();
+            let right: Vec<char> = caps[2].chars().collect();
+            let subs = align_corrections(&wrong, &right);
+            if subs.is_empty() {
+                continue;
+            }
+            for (ui, unit) in units.iter().enumerate() {
+                if unit.chars.len() < wrong.len() {
+                    continue;
+                }
+                for start in 0..=(unit.chars.len() - wrong.len()) {
+                    if unit.chars[start..start + wrong.len()] != wrong[..] {
+                        continue;
+                    }
+                    for &(di, after) in &subs {
+                        let offset = start + di;
+                        if unit.chars[offset] == after
+                            || in_spans(offset, &unit.entities)
+                            || judged.contains(&(ui, offset))
+                            || !seen.insert((ui, offset))
+                        {
+                            continue;
+                        }
+                        // 频率加白排误：该位置所在词是全文一致的高频写法 → 真术语，不回灌
+                        if stats.whitelisted(&unit.chars, offset, &[after]) {
+                            continue;
+                        }
+                        if out.len() >= MAX_FEEDBACK_CANDS {
+                            return out;
+                        }
+                        out.push(Cand {
+                            unit: ui,
+                            offset,
+                            note: Some(format!(
+                                "前轮观察：「{}」疑应为「{}」（当时不在候选范围）",
+                                &caps[1], &caps[2]
+                            )),
+                            vote_after: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 // ── 工具定义 ──
@@ -338,7 +677,7 @@ static JUDGE_TOOLS: LazyLock<Value> = LazyLock::new(|| {
                 "reason": { "type": "string", "description": "一句话依据" },
             }, "required": ["index", "action"] } },
             "observations": { "type": "array", "items": { "type": "string" },
-                "description": "候选之外观察到的其他 OCR 质量问题（只记录，不会被应用）" },
+                "description": "候选之外观察到的其他 OCR 质量问题（只记录，不会被应用）。若能给出修正，用「错写」应为「正写」的格式" },
         }, "required": ["verdicts"] },
     }}])
 });
@@ -359,8 +698,9 @@ const JUDGE_SYSTEM_PROMPT: &str = r#"你是 OCR 字符混淆修正器。文档�
 - 是 → action=replace，replaceWith 给出唯一正确字符（必须恰好 1 个字符）。
 - 否（本来就对）或拿不准 → action=keep。拿不准必须 keep——宁可漏修，不可错改。产品型号、代码、编号里的字符尤其要保守。
 标注〔表格单元格〕的候选来自表格，附有表标题/表头/所在行——结合行列语义判断；表格里的序号列、编号列、代码列几乎都是合法数字/字母，必须 keep。
+部分候选附有「频率投票」（全文多数派/少数派写法统计）或「前轮观察」辅助证据，可作为判断依据，但仍须结合上下文确认。
 只做字符级一换一修正，绝不润色、增删、改写。
-若在候选之外观察到其他 OCR 质量问题（乱码、明显错字），写进 observations（仅记录，系统不会应用）。
+若在候选之外观察到其他 OCR 质量问题（乱码、明显错字），写进 observations（仅记录，系统不会应用）；能给出修正的用「错写」应为「正写」格式。
 必须调用 judgeConfusions 工具一次性提交全部候选的裁决。"#;
 
 // ── 结果 ──
@@ -376,7 +716,7 @@ pub struct ConfusionOutcome {
 
 // ── 主流程 ──
 
-/// 对 items 的 text/list_items/table_caption 做混淆修正。
+/// 对 items 的 text/list_items/table_caption/table_body 做混淆修正。
 /// 取得 items 所有权：调用方在 panic 时（catch_unwind）保留原件，天然整层丢弃。
 pub async fn fix_confusions(
     mut items: Vec<RefItem>,
@@ -386,46 +726,23 @@ pub async fn fix_confusions(
     log: &Logger,
 ) -> (Vec<RefItem>, ConfusionOutcome) {
     let mut outcome = ConfusionOutcome::default();
+    let concurrency = concurrency.max(1);
 
-    // 1. 字段单元快照 + 候选扫描（文档序，输出确定性的根）
+    // 1. 字段单元快照（全量，先于候选筛选——频率统计要看全文）
     let mut units: Vec<Unit> = Vec::new();
-    let mut cands: Vec<Cand> = Vec::new();
     let mut table_ctx: HashMap<usize, TableCtx> = HashMap::new();
-    let add_unit =
-        |units: &mut Vec<Unit>, cands: &mut Vec<Cand>, unit: Unit, offsets: Vec<usize>| {
-            if offsets.is_empty() {
-                return;
-            }
-            let unit_idx = units.len();
-            cands.extend(offsets.into_iter().map(|offset| Cand {
-                unit: unit_idx,
-                offset,
-            }));
-            units.push(unit);
-        };
     for (item_idx, r) in items.iter().enumerate() {
-        let push_plain = |units: &mut Vec<Unit>, cands: &mut Vec<Cand>, field: Field, s: &str| {
-            let chars: Vec<char> = s.chars().collect();
-            let offsets: Vec<usize> = chars
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| table.is_candidate(**c))
-                .map(|(i, _)| i)
-                .collect();
-            add_unit(
-                units,
-                cands,
-                Unit {
-                    item_idx,
-                    field,
-                    chars,
-                    table: None,
-                },
-                offsets,
-            );
+        let mut push_plain = |field: Field, s: &str| {
+            units.push(Unit {
+                item_idx,
+                field,
+                chars: s.chars().collect(),
+                table: None,
+                entities: Vec::new(),
+            });
         };
         if let Some(t) = r.item.text() {
-            push_plain(&mut units, &mut cands, Field::Text, t);
+            push_plain(Field::Text, t);
         }
         for (key, make) in [
             ("list_items", Field::ListItem as fn(usize) -> Field),
@@ -433,127 +750,146 @@ pub async fn fix_confusions(
         ] {
             if let Some(parts) = r.item.str_array(key) {
                 for (i, p) in parts.iter().enumerate() {
-                    push_plain(&mut units, &mut cands, make(i), p);
+                    push_plain(make(i), p);
                 }
             }
         }
         if let Some(tb) = r.item.table_body() {
             let (nodes, rows) = parse_table_nodes(tb);
-            let mut any = false;
+            if nodes.is_empty() {
+                continue;
+            }
             for node in nodes {
                 let entities = entity_spans(&node.chars);
-                let offsets: Vec<usize> = node
-                    .chars
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, c)| table.is_candidate(**c) && !in_spans(*i, &entities))
-                    .map(|(i, _)| i)
-                    .collect();
-                if offsets.is_empty() {
-                    continue;
-                }
-                any = true;
-                add_unit(
-                    &mut units,
-                    &mut cands,
-                    Unit {
-                        item_idx,
-                        field: Field::TableBody,
-                        chars: node.chars,
-                        table: Some(node.pos),
-                    },
-                    offsets,
-                );
+                units.push(Unit {
+                    item_idx,
+                    field: Field::TableBody,
+                    chars: node.chars,
+                    table: Some(node.pos),
+                    entities,
+                });
             }
-            if any {
-                let caption = r
-                    .item
-                    .str_array("table_caption")
-                    .map(|c| c.join("；"))
-                    .unwrap_or_default();
-                table_ctx.insert(item_idx, TableCtx { caption, rows });
-            }
+            let caption = r
+                .item
+                .str_array("table_caption")
+                .map(|c| c.join("；"))
+                .unwrap_or_default();
+            table_ctx.insert(item_idx, TableCtx { caption, rows });
         }
+    }
+
+    // 2. 全文频率统计 + 拉丁 token 投票
+    let stats = FreqStats::build(&units);
+    let votes = latin_token_votes(&units, &stats);
+    let mut votes_by_unit: HashMap<usize, BTreeMap<usize, (char, String)>> = HashMap::new();
+    for ((ui, off), v) in votes {
+        votes_by_unit.entry(ui).or_default().insert(off, v);
+    }
+
+    // 3. 候选扫描（文档序，输出确定性的根）：
+    //    准入名单字符（频率加白的跳过、少数派写法附注记）∪ 拉丁投票定点候选
+    let mut cands: Vec<Cand> = Vec::new();
+    let mut whitelisted = 0u64;
+    for (ui, unit) in units.iter().enumerate() {
+        let unit_votes = votes_by_unit.remove(&ui).unwrap_or_default();
+        let mut offsets: BTreeMap<usize, Cand> = BTreeMap::new();
+        for (i, &c) in unit.chars.iter().enumerate() {
+            if !table.is_candidate(c) || in_spans(i, &unit.entities) {
+                continue;
+            }
+            let alts = table.alternatives(c);
+            if stats.whitelisted(&unit.chars, i, &alts) {
+                whitelisted += 1;
+                continue;
+            }
+            offsets.insert(
+                i,
+                Cand {
+                    unit: ui,
+                    offset: i,
+                    note: stats.minority_note(&unit.chars, i, &alts),
+                    vote_after: None,
+                },
+            );
+        }
+        for (off, (after, note)) in unit_votes {
+            let cand = offsets.entry(off).or_insert(Cand {
+                unit: ui,
+                offset: off,
+                note: None,
+                vote_after: None,
+            });
+            cand.note = Some(note);
+            cand.vote_after = Some(after);
+        }
+        cands.extend(offsets.into_values());
     }
     if cands.is_empty() {
         return (items, outcome);
     }
-
-    // 2. 打包成裁决调用（按文档序，每批 ≤ MAX_CANDIDATES_PER_CALL，批即 cands 的连续区间）
-    let batches: Vec<Range<usize>> = (0..cands.len())
-        .step_by(MAX_CANDIDATES_PER_CALL)
-        .map(|s| s..(s + MAX_CANDIDATES_PER_CALL).min(cands.len()))
-        .collect();
-    log(&format!(
-        "混淆层：{} 个候选字符，分 {} 次裁决",
-        cands.len(),
-        batches.len()
-    ));
-
-    // 3. 批量裁决（buffered 让 concurrency 个调用始终在飞；单调用失败 → 该批搁置）
-    let concurrency = concurrency.max(1);
-    let mut proposals: Vec<Proposal> = Vec::new();
-    let mut shelved_batches = 0u64;
-    // 先把 future 收集成 Vec（绕开 rustc 对惰性迭代器 + async 块的高阶生命周期误判）
-    let judge_futs: Vec<_> = batches
-        .iter()
-        .map(|batch| judge_batch(batch.clone(), &cands, &units, &table_ctx, chat.clone()))
-        .collect();
-    let judge_results: Vec<_> = futures::stream::iter(judge_futs)
-        .buffered(concurrency)
-        .collect()
-        .await;
-    for (batch, result) in batches.iter().zip(judge_results) {
-        match result {
-            Ok(reply) => {
-                outcome.usage.prompt += reply.usage.prompt_tokens;
-                outcome.usage.completion += reply.usage.completion_tokens;
-                outcome.observations.extend(reply.observations);
-                if reply.invalid > 0 {
-                    outcome.rejected += reply.invalid;
-                    log(&format!(
-                        "混淆层：{} 条结构非法的 replace 提案被解析期拒绝",
-                        reply.invalid
-                    ));
-                }
-                for (local, after, reason) in reply.replacements {
-                    let cand_idx = batch.start + local;
-                    if cand_idx >= batch.end {
-                        outcome.rejected += 1;
-                        log(&format!("混淆层：裁决引用了不存在的候选编号 {local}，拒绝"));
-                        continue;
-                    }
-                    proposals.push(Proposal {
-                        cand: cand_idx,
-                        after,
-                        reason,
-                    });
-                }
-            }
-            Err(e) => {
-                shelved_batches += 1;
-                log(&format!(
-                    "混淆层：裁决调用失败，搁置该批 {} 个候选: {e}",
-                    batch.len()
-                ));
-            }
-        }
-    }
-    if shelved_batches > 0 {
+    if whitelisted > 0 {
         log(&format!(
-            "混淆层：共搁置 {shelved_batches} 批候选（LLM 故障，漏修不误修）"
+            "混淆层：频率投票加白 {whitelisted} 个候选位置（全文一致的高频写法，跳过送审）"
         ));
     }
 
-    // 4. 结构闸门：去重（同一候选只认第一条；cand 索引与 (unit, offset) 一一对应）+ 与原字符不同
-    let mut seen_cands: HashSet<usize> = HashSet::new();
+    // 4. 第一轮裁决
+    let round1 = 0..cands.len();
+    log(&format!(
+        "混淆层：{} 个候选字符，分 {} 次裁决",
+        cands.len(),
+        round1.len().div_ceil(MAX_CANDIDATES_PER_CALL)
+    ));
+    let mut proposals: Vec<Proposal> = Vec::new();
+    let round1_obs = judge_range(
+        round1.clone(),
+        &cands,
+        &units,
+        &table_ctx,
+        &chat,
+        concurrency,
+        &mut outcome,
+        &mut proposals,
+        log,
+    )
+    .await;
+    outcome.observations.extend(round1_obs.iter().cloned());
+
+    // 4b. observations 闭环回灌（最多一轮）：解析「X 应为 Y」→ 定点候选 → 第二轮裁决。
+    // 第二轮的 observations 只记录不再回灌（防循环）。
+    let judged: HashSet<(usize, usize)> = cands.iter().map(|c| (c.unit, c.offset)).collect();
+    let feedback = feedback_candidates(&round1_obs, &units, &stats, &judged);
+    if !feedback.is_empty() {
+        log(&format!(
+            "混淆层：observations 回灌生成 {} 个定点候选，第二轮裁决",
+            feedback.len()
+        ));
+        let start = cands.len();
+        cands.extend(feedback);
+        let round2_obs = judge_range(
+            start..cands.len(),
+            &cands,
+            &units,
+            &table_ctx,
+            &chat,
+            concurrency,
+            &mut outcome,
+            &mut proposals,
+            log,
+        )
+        .await;
+        outcome.observations.extend(round2_obs);
+    }
+
+    // 5. 结构闸门：去重（同一位置只认第一条提案）+ 与原字符不同
+    let mut seen_pos: HashSet<(usize, usize)> = HashSet::new();
     proposals.retain(|p| {
         let cand = &cands[p.cand];
         let before = units[cand.unit].chars[cand.offset];
         if p.after == before {
             return false; // replace 成同字符 = 无操作，静默丢弃不计 rejected
         }
-        if !seen_cands.insert(p.cand) {
+        if !seen_pos.insert((cand.unit, cand.offset)) {
             outcome.rejected += 1;
             log(&format!(
                 "混淆层：{} 字符 {} 处重复提案，拒绝",
@@ -565,7 +901,7 @@ pub async fn fix_confusions(
         true
     });
 
-    // 5. 密度闸门：单元内提案数超过稀疏上限 → 整单元拒绝（先于二次裁决，省调用）
+    // 6. 密度闸门：单元内提案数超过稀疏上限 → 整单元拒绝（先于二次裁决，省调用）
     let mut per_unit: HashMap<usize, usize> = HashMap::new();
     for p in &proposals {
         *per_unit.entry(cands[p.cand].unit).or_insert(0) += 1;
@@ -590,7 +926,7 @@ pub async fn fix_confusions(
         true
     });
 
-    // 5b. 每表聚合密度闸门：单格各自合规但整表提案过多 = 乱码表特征，整表拒绝
+    // 6b. 每表聚合密度闸门：单格各自合规但整表提案过多 = 乱码表特征，整表拒绝
     //（乱码表的归宿是整表裁决/降级，不是逐字"修复"）
     let mut per_table_n: HashMap<usize, usize> = HashMap::new();
     for p in &proposals {
@@ -626,31 +962,44 @@ pub async fn fix_confusions(
         true
     });
 
-    // 6. 准入闸门：表内直接落地；表外走对抗式二次裁决
-    let (in_table, out_of_table): (Vec<Proposal>, Vec<Proposal>) =
-        proposals.into_iter().partition(|p| {
-            let cand = &cands[p.cand];
-            table.allowed(units[cand.unit].chars[cand.offset], p.after)
-        });
+    // 7. 准入闸门：表内直接落地；频率投票定点候选命中多数派写法也直接落地；
+    //    其余表外提案走对抗式二次裁决（附辅助证据）。
+    let mut accepted: Vec<(Proposal, &'static str)> = Vec::new();
+    let mut to_verify: Vec<Proposal> = Vec::new();
+    for p in proposals {
+        let cand = &cands[p.cand];
+        let before = units[cand.unit].chars[cand.offset];
+        if table.allowed(before, p.after) {
+            accepted.push((p, "table"));
+        } else if cand.vote_after == Some(p.after) {
+            accepted.push((p, "frequency_vote"));
+        } else {
+            to_verify.push(p);
+        }
+    }
 
-    let mut accepted: Vec<(Proposal, &'static str)> =
-        in_table.into_iter().map(|p| (p, "table")).collect();
-
-    let verify_futs: Vec<_> = out_of_table
+    let verify_futs: Vec<_> = to_verify
         .iter()
         .map(|p| {
             let cand = &cands[p.cand];
             let unit = &units[cand.unit];
             let before = unit.chars[cand.offset];
             let context = context_window(&unit.chars, cand.offset);
-            verify_out_of_table(chat.clone(), before, p.after, context, &p.reason)
+            verify_out_of_table(
+                chat.clone(),
+                before,
+                p.after,
+                context,
+                &p.reason,
+                cand.note.as_deref(),
+            )
         })
         .collect();
     let verify_results: Vec<_> = futures::stream::iter(verify_futs)
         .buffered(concurrency)
         .collect()
         .await;
-    for (p, result) in out_of_table.into_iter().zip(verify_results) {
+    for (p, result) in to_verify.into_iter().zip(verify_results) {
         let cand = &cands[p.cand];
         let before = units[cand.unit].chars[cand.offset];
         match result {
@@ -677,10 +1026,13 @@ pub async fn fix_confusions(
         }
     }
 
-    // 7. 落地：按文档序排序 → 改字符 → 写回字段。
+    // 8. 落地：按文档序排序 → 改字符 → 写回字段。
     // 普通字段逐单元重组；table_body 按 item 聚合成全串定点替换（base+局部偏移），
     // 标签骨架从未进过单元，逐字节原样保留是构造性保证。
-    accepted.sort_by_key(|(p, _)| p.cand); // cands 本身按 (unit, offset) 文档序构造
+    accepted.sort_by_key(|(p, _)| {
+        let cand = &cands[p.cand];
+        (cand.unit, cand.offset)
+    });
     let mut touched: HashMap<usize, Vec<char>> = HashMap::new();
     let mut table_swaps: HashMap<usize, Vec<(usize, char, char)>> = HashMap::new();
     for (p, source) in &accepted {
@@ -755,6 +1107,81 @@ pub async fn fix_confusions(
         ));
     }
     (items, outcome)
+}
+
+/// 对 cands[range] 做一轮批量裁决：提案推进 proposals（结构非法的在解析期拒），
+/// usage 记入 outcome，返回该轮收集到的 observations（是否回灌由调用方定）。
+#[allow(clippy::too_many_arguments)]
+async fn judge_range(
+    range: Range<usize>,
+    cands: &[Cand],
+    units: &[Unit],
+    table_ctx: &HashMap<usize, TableCtx>,
+    chat: &Arc<dyn ChatClient>,
+    concurrency: usize,
+    outcome: &mut ConfusionOutcome,
+    proposals: &mut Vec<Proposal>,
+    log: &Logger,
+) -> Vec<String> {
+    let batches: Vec<Range<usize>> = range
+        .clone()
+        .step_by(MAX_CANDIDATES_PER_CALL)
+        .map(|s| s..(s + MAX_CANDIDATES_PER_CALL).min(range.end))
+        .collect();
+    // 先把 future 收集成 Vec（绕开 rustc 对惰性迭代器 + async 块的高阶生命周期误判）
+    let judge_futs: Vec<_> = batches
+        .iter()
+        .map(|batch| judge_batch(batch.clone(), cands, units, table_ctx, chat.clone()))
+        .collect();
+    let judge_results: Vec<_> = futures::stream::iter(judge_futs)
+        .buffered(concurrency.max(1))
+        .collect()
+        .await;
+
+    let mut observations: Vec<String> = Vec::new();
+    let mut shelved_batches = 0u64;
+    for (batch, result) in batches.iter().zip(judge_results) {
+        match result {
+            Ok(reply) => {
+                outcome.usage.prompt += reply.usage.prompt_tokens;
+                outcome.usage.completion += reply.usage.completion_tokens;
+                observations.extend(reply.observations);
+                if reply.invalid > 0 {
+                    outcome.rejected += reply.invalid;
+                    log(&format!(
+                        "混淆层：{} 条结构非法的 replace 提案被解析期拒绝",
+                        reply.invalid
+                    ));
+                }
+                for (local, after, reason) in reply.replacements {
+                    let cand_idx = batch.start + local;
+                    if cand_idx >= batch.end {
+                        outcome.rejected += 1;
+                        log(&format!("混淆层：裁决引用了不存在的候选编号 {local}，拒绝"));
+                        continue;
+                    }
+                    proposals.push(Proposal {
+                        cand: cand_idx,
+                        after,
+                        reason,
+                    });
+                }
+            }
+            Err(e) => {
+                shelved_batches += 1;
+                log(&format!(
+                    "混淆层：裁决调用失败，搁置该批 {} 个候选: {e}",
+                    batch.len()
+                ));
+            }
+        }
+    }
+    if shelved_batches > 0 {
+        log(&format!(
+            "混淆层：共搁置 {shelved_batches} 批候选（LLM 故障，漏修不误修）"
+        ));
+    }
+    observations
 }
 
 fn set_array_elem(item: &mut crate::types::MineruItem, key: &str, i: usize, s: String) {
@@ -859,13 +1286,18 @@ async fn judge_batch(
             let cand = &cands[cand_idx];
             let unit = &units[cand.unit];
             let ch = unit.chars[cand.offset];
+            let note = cand
+                .note
+                .as_ref()
+                .map(|n| format!("（{n}）"))
+                .unwrap_or_default();
             match &unit.table {
                 None => format!(
-                    "候选{local}（字符「{ch}」）：{}",
+                    "候选{local}（字符「{ch}」）：{}{note}",
                     context_window(&unit.chars, cand.offset)
                 ),
                 Some(pos) => format!(
-                    "候选{local}（字符「{ch}」）：〔表格单元格〕{}",
+                    "候选{local}（字符「{ch}」）：〔表格单元格〕{}{note}",
                     table_context(&table_ctx[&unit.item_idx], pos, cand.offset)
                 ),
             }
@@ -941,13 +1373,19 @@ fn parse_judge_reply(r: &ChatResult) -> Option<JudgeReply> {
 }
 
 /// 表外提案的对抗式二次裁决：独立对话，prompt 反着问，默认怀疑。
+/// extra_evidence：候选携带的频率投票/前轮观察注记——非形近但全文实证充分的
+/// 替换（「全2预测」→「全年预测」）靠它过审，无证据时仍按字形从严。
 async fn verify_out_of_table(
     chat: Arc<dyn ChatClient>,
     before: char,
     after: char,
     context: String,
     proposer_reason: &str,
+    extra_evidence: Option<&str>,
 ) -> Result<(bool, String, Usage), LlmError> {
+    let evidence_line = extra_evidence
+        .map(|e| format!("辅助证据：{e}\n"))
+        .unwrap_or_default();
     let messages = vec![
         Message::System {
             content: "你是 OCR 修正提案的对抗式审查者。你的职责是否决可疑提案，不是配合提案者。"
@@ -956,9 +1394,10 @@ async fn verify_out_of_table(
         Message::User {
             content: format!(
                 "有人主张把下文中 «» 标出的「{before}」改成「{after}」，理由：{proposer_reason}。\n\
-                 该字符对不在已知 OCR 形近混淆表内。\n\n上下文：{context}\n\n\
-                 严格审查：仅当「{before}」与「{after}」字形高度相似、确属 OCR 误认、且替换不改变语义时才 approve；\
-                 任何怀疑（语义改动、字形不近、上下文不支持）一律 reject。调用 verifyConfusion 提交。"
+                 该字符对不在已知 OCR 形近混淆表内。\n\n上下文：{context}\n{evidence_line}\n\
+                 严格审查：仅当确属 OCR 误认（「{before}」与「{after}」字形高度相似，或辅助证据——\
+                 全文频率投票/前轮观察——充分支持）且替换不改变语义时才 approve；\
+                 任何怀疑（语义改动、证据不足、上下文不支持）一律 reject。调用 verifyConfusion 提交。"
             ),
         },
     ];
@@ -994,6 +1433,16 @@ mod tests {
         assert!(t.allowed('入', 'λ') && t.allowed('竟', '竞'));
         assert!(!t.allowed('0', 'D'));
         assert!(t.is_candidate('B') && !t.is_candidate('好'));
+        // c3 实证扩充
+        assert!(t.allowed('校', '较') && t.allowed('酒', '源') && t.allowed('军', '率'));
+    }
+
+    #[test]
+    fn alternatives_are_deterministic() {
+        let t = ConfusionTable::build(&["0D".into()]).unwrap();
+        assert_eq!(t.alternatives('0'), vec!['O', 'D']);
+        assert_eq!(t.alternatives('校'), vec!['较']);
+        assert!(t.alternatives('好').is_empty());
     }
 
     #[test]
@@ -1021,5 +1470,47 @@ mod tests {
     fn context_window_marks_candidate() {
         let chars: Vec<char> = "公司CE0办公室".chars().collect();
         assert_eq!(context_window(&chars, 4), "公司CE«0»办公室");
+    }
+
+    #[test]
+    fn latin_tokens_skip_numbers_and_shorts() {
+        let chars: Vec<char> = "OGSMT 与 2025 年的 CE0 与 MN001X".chars().collect();
+        let toks: Vec<String> = latin_tokens(&chars).into_iter().map(|(t, _)| t).collect();
+        // 2025 纯数字、CE0 过短、MN001X 数字超 1 个 → 全部排除
+        assert_eq!(toks, vec!["OGSMT"]);
+    }
+
+    #[test]
+    fn align_corrections_cases() {
+        let c = |s: &str| s.chars().collect::<Vec<char>>();
+        // 等长单字差
+        assert_eq!(
+            align_corrections(&c("数据来酒"), &c("数据来源")),
+            vec![(3, '源')]
+        );
+        // 正写更短：滑窗
+        assert_eq!(
+            align_corrections(&c("2025年全2预测偏差"), &c("全年"))
+                .iter()
+                .map(|(i, a)| (*i, *a))
+                .collect::<Vec<_>>(),
+            vec![(3, '全'), (6, '年')] // 「5年」「全2」两个歧义窗口都出候选，交 LLM 裁决
+        );
+        // 等长多字差 / 要加字 → 不认
+        assert!(align_corrections(&c("甲乙"), &c("丙丁")).is_empty());
+        assert!(align_corrections(&c("全年"), &c("全年预测")).is_empty());
+    }
+
+    #[test]
+    fn obs_correction_regex_matches_quote_styles() {
+        for s in [
+            "表格中「数据来酒」应为「数据来源」",
+            "“数据来酒”应该是“数据来源”之误",
+            "「数据来酒」→「数据来源」",
+        ] {
+            let caps = OBS_CORRECTION.captures(s).unwrap_or_else(|| panic!("{s}"));
+            assert_eq!(&caps[1], "数据来酒");
+            assert_eq!(&caps[2], "数据来源");
+        }
     }
 }

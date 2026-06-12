@@ -486,6 +486,43 @@ pub fn detect(items: &[RefItem]) -> Vec<WorkItem> {
             }
         }
 
+        // ── 疑似赘字/衍字（→ deleteChar）：功能词叠字（的的/地地/是是/了了）与孤立
+        // 偏旁部首。「目的+的」「但是+是」类合法语法必须由 LLM 结合语境裁决，判不了
+        // 就 dismiss 不改。多处命中合并为一个疑点（一轮删一处，loop 收敛）。──
+        if item.item_type() == "text" && !text.is_empty() {
+            let chars: Vec<char> = text.chars().collect();
+            let hits = crate::extrachar::scan(&chars);
+            if !hits.is_empty() {
+                let detail = hits
+                    .iter()
+                    .map(|h| {
+                        let lo = h.offset.saturating_sub(10);
+                        let hi = (h.offset + 11).min(chars.len());
+                        let ctx: String = chars[lo..hi].iter().collect();
+                        format!(
+                            "「{}」中 offset={} 的「{}」（{}）",
+                            ctx,
+                            h.offset,
+                            h.ch,
+                            match h.kind {
+                                crate::extrachar::ExtraKind::DupWord => "功能词叠字",
+                                crate::extrachar::ExtraKind::Radical => "孤立偏旁部首",
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("；");
+                out.push(suspect(
+                    SuspectKind::ExtraChar,
+                    id,
+                    format!(
+                        "疑似 OCR 赘字/衍字: {detail}。确认是衍字 → deleteChar(offset=证据中的值)；属正常语法（如「目的+的」「但是+是」「不甚了了」）或在讨论偏旁本身 → dismiss"
+                    ),
+                    true,
+                ));
+            }
+        }
+
         // ── 段尾粘连节标记（→ split）：跨页 merge 把「[相关文件]」类独立结构块
         // 吸进了上一段结尾。建议 offset 直接给出，split 可一步到位。──
         if item.item_type() == "text"

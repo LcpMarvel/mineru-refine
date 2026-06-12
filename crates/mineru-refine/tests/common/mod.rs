@@ -181,6 +181,13 @@ impl MockChat {
                 "dismiss".into(),
                 json!({ "id": id, "reason": "mock 默认不重排" }),
             ),
+            SuspectKind::ExtraChar => {
+                let offset = OFFSET_RE
+                    .captures(evidence)
+                    .and_then(|c| c[1].parse::<i64>().ok())
+                    .ok_or_else(|| LlmError(format!("mock 无法从证据解析 offset: {evidence}")))?;
+                ("deleteChar".into(), json!({ "id": id, "offset": offset }))
+            }
             SuspectKind::CaptionIssue => {
                 return Err(LlmError("mock 未定义 caption_issue 的处理".into()));
             }

@@ -566,6 +566,56 @@ fn op_strip(items: &[RefItem], id: &str, pattern: StripPattern) -> OpResult {
     })
 }
 
+// ── deleteChar(id, offset)：删 text 中 offset 处的单个 OCR 衍字。继承原 ID。──
+// 结构闸门在 extrachar::validate_delete：只许删功能词叠字（的/地/是/了 的紧邻重复，
+// 成语构造性保护）或孤立偏旁部首；纯删除，C_out ⊆ C_in 天然成立。
+fn op_delete_char(items: &[RefItem], id: &str, offset: i64) -> OpResult {
+    let i = must_index_of_id(items, id)?;
+    let it = &items[i].item;
+    if it.item_type() != "text" || it.text().is_none() {
+        return Err(format!(
+            "deleteChar 仅限 text 块（{id} 是 {}）",
+            it.item_type()
+        ));
+    }
+    let text = it.text().unwrap();
+    let chars: Vec<char> = text.chars().collect();
+    if offset < 0 || offset as usize >= chars.len() {
+        return Err(format!(
+            "deleteChar offset 越界：{offset}（text 长 {}）",
+            chars.len()
+        ));
+    }
+    let offset = offset as usize;
+    let reason = crate::extrachar::validate_delete(&chars, offset)?;
+    let removed = chars[offset];
+    let new_text: String = chars
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| *k != offset)
+        .map(|(_, c)| *c)
+        .collect();
+    if non_ws_len(&new_text) == 0 {
+        return Err(format!("deleteChar 会把 {id} 掏空，应改用 drop"));
+    }
+
+    let mut item = it.clone();
+    item.set("text", Value::String(new_text));
+    let mut out = items.to_vec();
+    out[i] = RefItem {
+        id: id.to_string(),
+        item,
+    };
+    Ok(OpOutcome {
+        items: out,
+        removed_spans: vec![RemovedSpan {
+            item_id: id.to_string(),
+            text: removed.to_string(),
+            reason: format!("deleteChar:{reason}"),
+        }],
+    })
+}
+
 // ── 调度 + 保真闸 ──
 
 pub struct ApplyContext<'a> {
@@ -605,6 +655,7 @@ pub fn apply_op_checked(items: &[RefItem], call: &OpCall, ctx: &ApplyContext) ->
         OpCall::Reorder { ids_in_order } => op_reorder(items, ids_in_order),
         OpCall::Drop { id } => op_drop(items, id, ctx.droppable_ids),
         OpCall::Strip { id, pattern } => op_strip(items, id, *pattern),
+        OpCall::DeleteChar { id, offset } => op_delete_char(items, id, *offset),
         OpCall::MergeTable { id_a, id_b } => op_merge_table(items, ctx.next_id, id_a, id_b),
         OpCall::MergeList {
             id_a,

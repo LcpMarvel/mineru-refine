@@ -161,11 +161,7 @@ fn on() -> RefineOptions {
 #[test]
 fn golden_confusions_fixed_end_to_end() {
     let input = confused_doc();
-    let result = run(
-        input,
-        confusion_chat(golden_decide(), reject_all()),
-        on(),
-    );
+    let result = run(input, confusion_chat(golden_decide(), reject_all()), on());
 
     assert!(!result.report.fail_open);
     let texts: Vec<&str> = result.items.iter().filter_map(|i| i.text()).collect();
@@ -282,11 +278,7 @@ fn out_of_table_proposal_lands_only_after_second_opinion() {
     assert_eq!(approved.report.confusion_fixes.len(), 1);
     assert_eq!(approved.report.confusion_fixes[0].source, "second_opinion");
 
-    let rejected = run(
-        doc(),
-        confusion_chat(decide, reject_all()),
-        on(),
-    );
+    let rejected = run(doc(), confusion_chat(decide, reject_all()), on());
     assert_eq!(rejected.items[0].text().unwrap(), "编号0文件已存档备查。");
     assert!(rejected.report.confusion_fixes.is_empty());
     assert_eq!(rejected.report.confusion_rejected, 1);
@@ -349,11 +341,7 @@ fn density_cap_rejects_whole_unit() {
         { "type": "text", "text": "0甲0乙0丙0丁0卯。", "page_idx": 0, "bbox": [50, 40, 550, 60] },
     ]));
     let decide: Decide = Arc::new(|ch, _| (ch == '0').then(|| ('O', "全换".into())));
-    let result = run(
-        doc.clone(),
-        confusion_chat(decide, reject_all()),
-        on(),
-    );
+    let result = run(doc.clone(), confusion_chat(decide, reject_all()), on());
     assert_eq!(result.items, doc, "密度超标必须整单元回绝");
     assert!(result.report.confusion_fixes.is_empty());
     assert_eq!(result.report.confusion_rejected, 5);
@@ -506,11 +494,7 @@ fn table_aggregate_density_rejects_whole_table() {
         },
     ]));
     let decide: Decide = Arc::new(|ch, _| (ch == '0').then(|| ('O', "全换".into())));
-    let result = run(
-        doc.clone(),
-        confusion_chat(decide, reject_all()),
-        on(),
-    );
+    let result = run(doc.clone(), confusion_chat(decide, reject_all()), on());
     // 单格 1 条提案都没超 max(2,3%)，但整表 6 条 > max(4, 2%·12) = 4 → 全拒
     assert_eq!(result.items, doc, "聚合密度超标必须整表回绝");
     assert!(result.report.confusion_fixes.is_empty());
@@ -540,11 +524,7 @@ fn table_candidates_get_structured_context() {
         }
         None
     });
-    let result = run(
-        doc,
-        confusion_chat(decide, reject_all()),
-        on(),
-    );
+    let result = run(doc, confusion_chat(decide, reject_all()), on());
     assert!(
         result.items[0]
             .table_body()
@@ -580,4 +560,212 @@ fn evidence_backed_pairs_are_in_builtin_whitelist() {
     );
     assert_eq!(result.items[0].text().unwrap(), "从业界标杆入手分析。");
     assert_eq!(result.report.confusion_fixes[0].source, "table");
+}
+
+// ════ Phase 3：形近字扩充 + 频率投票 + observations 闭环 ════
+
+// ── c3 扩充的中文形近对（校较）走表内直落，且少数派写法附频率投票注记 ──
+
+#[test]
+fn c3_pairs_in_table_and_minority_gets_vote_note() {
+    let doc = items_of(json!([
+        { "type": "text", "text": "比较方式甲", "page_idx": 0, "bbox": [50, 40, 550, 60] },
+        { "type": "text", "text": "比较方式乙", "page_idx": 0, "bbox": [50, 80, 550, 100] },
+        { "type": "text", "text": "比较方式丙", "page_idx": 0, "bbox": [50, 120, 550, 140] },
+        { "type": "text", "text": "比校方式丁", "page_idx": 0, "bbox": [50, 160, 550, 180] },
+    ]));
+    // 只在带「频率投票」注记时才修：证明少数派候选确实携带了注记
+    let decide: Decide = Arc::new(|ch, ctx| {
+        (ch == '校' && ctx.contains("频率投票") && ctx.contains("「比较」×3"))
+            .then(|| ('较', "少数派写法".into()))
+    });
+    let result = run(doc, confusion_chat(decide, reject_all()), on());
+    assert_eq!(result.items[3].text().unwrap(), "比较方式丁");
+    assert_eq!(result.report.confusion_fixes.len(), 1);
+    // 校↔较 在 c3 内置表内 → 免二次裁决直落（verify 永远 reject 证明没走那条路）
+    assert_eq!(result.report.confusion_fixes[0].source, "table");
+}
+
+// ── 频率加白（排误）：全文一致的高频写法跳过送审，零调用 ──
+
+#[test]
+fn consistent_frequent_word_is_whitelisted_no_calls() {
+    let items: Vec<serde_json::Value> = (0..5)
+        .map(|i| {
+            json!({ "type": "text", "text": "学校管理制度", "page_idx": 0,
+                    "bbox": [50, 40 + i * 40, 550, 60 + i * 40] })
+        })
+        .collect();
+    let doc = items_of(Value::Array(items));
+    let chat = confusion_chat(
+        Arc::new(|ch, _| (ch == '校').then(|| ('较', "不该被问到".into()))),
+        reject_all(),
+    );
+    let result = run(doc.clone(), chat.clone(), on());
+    assert_eq!(
+        chat.call_count(),
+        0,
+        "「学校」×5 且无「学较」变体 → 全部加白，不该有任何调用"
+    );
+    assert_eq!(result.items, doc);
+}
+
+// ── 拉丁 token 频率投票：少数派换位写法生成定点候选，命中多数派免二次裁决 ──
+
+#[test]
+fn latin_token_vote_fixes_transposition_as_frequency_vote() {
+    let doc = items_of(json!([
+        { "type": "text", "text": "平台 OGSMT 上线", "page_idx": 0, "bbox": [50, 40, 550, 60] },
+        { "type": "text", "text": "OGSMT 模块联调", "page_idx": 0, "bbox": [50, 80, 550, 100] },
+        { "type": "text", "text": "OGSMT 验收通过", "page_idx": 0, "bbox": [50, 120, 550, 140] },
+        { "type": "text", "text": "OGSMT 培训完成", "page_idx": 0, "bbox": [50, 160, 550, 180] },
+        { "type": "text", "text": "OGSTM 运维移交", "page_idx": 0, "bbox": [50, 200, 550, 220] },
+    ]));
+    let decide: Decide = Arc::new(|ch, ctx| {
+        if !ctx.contains("频率投票") {
+            return None; // O/G/S 的常规类内候选一律 keep
+        }
+        match ch {
+            'T' => Some(('M', "OGSMT 多数派".into())),
+            'M' => Some(('T', "OGSMT 多数派".into())),
+            _ => None,
+        }
+    });
+    // verify 永远 reject：投票命中多数派的修复必须免二次裁决
+    let result = run(doc, confusion_chat(decide, reject_all()), on());
+    assert_eq!(result.items[4].text().unwrap(), "OGSMT 运维移交");
+    let fixes = &result.report.confusion_fixes;
+    assert_eq!(fixes.len(), 2);
+    assert!(fixes.iter().all(|f| f.source == "frequency_vote"));
+    assert_eq!(
+        fixes
+            .iter()
+            .map(|f| (f.before.as_str(), f.after.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("T", "M"), ("M", "T")]
+    );
+}
+
+// ── observations 闭环：「X 应为 Y」回灌成定点候选，二轮裁决 + 二次审查后落地；
+//    第二轮的 observations 只记录不再回灌（防循环）──
+
+#[test]
+fn observation_feedback_generates_second_round_then_stops() {
+    let doc = items_of(json!([
+        { "type": "text", "text": "公司在竟争中保持优势。", "page_idx": 0, "bbox": [50, 40, 550, 60] },
+        { "type": "text", "text": "数据来潭统计表", "page_idx": 0, "bbox": [50, 80, 550, 100] },
+    ]));
+    let judge_calls = Arc::new(AtomicU64::new(0));
+    let jc = judge_calls.clone();
+    let call_id = Arc::new(AtomicU64::new(0));
+    let chat: Arc<dyn ChatClient> = Arc::new(FnChat::new(
+        move |messages: &[Message], tools: &Value| -> Result<ChatResult, LlmError> {
+            let n = call_id.fetch_add(1, Ordering::Relaxed) + 1;
+            let content = first_user_content(messages);
+            match tools.pointer("/0/function/name").and_then(Value::as_str) {
+                Some("judgeConfusions") => {
+                    let round = jc.fetch_add(1, Ordering::Relaxed) + 1;
+                    let verdicts: Vec<Value> = CAND_RE
+                        .captures_iter(content)
+                        .map(|c| {
+                            let index: u64 = c[1].parse().unwrap();
+                            if &c[2] == "潭" {
+                                assert!(
+                                    c[3].contains("前轮观察"),
+                                    "回灌候选应带前轮观察注记: {}",
+                                    &c[3]
+                                );
+                                json!({ "index": index, "action": "replace",
+                                        "replaceWith": "源", "reason": "来源误认" })
+                            } else {
+                                json!({ "index": index, "action": "keep" })
+                            }
+                        })
+                        .collect();
+                    // 两轮都报 observations：第二轮的必须只记录、不再触发第三轮
+                    let obs = if round == 1 {
+                        json!(["表格中「数据来潭」应为「数据来源」"])
+                    } else {
+                        json!(["「保持优」应为「保持忧」"])
+                    };
+                    Ok(tool_reply(
+                        n,
+                        "judgeConfusions",
+                        json!({ "verdicts": verdicts, "observations": obs }).to_string(),
+                    ))
+                }
+                Some("verifyConfusion") => Ok(tool_reply(
+                    n,
+                    "verifyConfusion",
+                    json!({ "verdict": "approve", "reason": "前轮观察证据充分" }).to_string(),
+                )),
+                other => Err(LlmError(format!("不期望的调用: {other:?}"))),
+            }
+        },
+    ));
+    let result = run(doc, chat, on());
+    assert_eq!(
+        judge_calls.load(Ordering::Relaxed),
+        2,
+        "恰好两轮裁决：第二轮 observations 不再回灌"
+    );
+    assert_eq!(result.items[1].text().unwrap(), "数据来源统计表");
+    let fixes = &result.report.confusion_fixes;
+    assert_eq!(fixes.len(), 1);
+    assert_eq!(
+        (fixes[0].before.as_str(), fixes[0].after.as_str()),
+        ("潭", "源")
+    );
+    assert_eq!(fixes[0].source, "second_opinion");
+    // 两轮 observations 都进报告
+    assert_eq!(result.report.confusion_observations.len(), 2);
+}
+
+// ── observations 回灌的排误：全文一致的高频术语（烟感反例）不回灌 ──
+
+#[test]
+fn feedback_skips_frequency_whitelisted_terms() {
+    let mut items: Vec<serde_json::Value> = (0..5)
+        .map(|i| {
+            json!({ "type": "text", "text": "烟感探测器安装", "page_idx": 0,
+                    "bbox": [50, 40 + i * 40, 550, 60 + i * 40] })
+        })
+        .collect();
+    items.push(json!({ "type": "text", "text": "公司在竟争中保持优势。",
+                       "page_idx": 0, "bbox": [50, 240, 550, 260] }));
+    let doc = items_of(Value::Array(items));
+    let judge_calls = Arc::new(AtomicU64::new(0));
+    let jc = judge_calls.clone();
+    let call_id = Arc::new(AtomicU64::new(0));
+    let chat: Arc<dyn ChatClient> = Arc::new(FnChat::new(
+        move |messages: &[Message], tools: &Value| -> Result<ChatResult, LlmError> {
+            let n = call_id.fetch_add(1, Ordering::Relaxed) + 1;
+            let content = first_user_content(messages);
+            match tools.pointer("/0/function/name").and_then(Value::as_str) {
+                Some("judgeConfusions") => {
+                    jc.fetch_add(1, Ordering::Relaxed);
+                    let verdicts: Vec<Value> = CAND_RE
+                        .captures_iter(content)
+                        .map(|c| json!({ "index": c[1].parse::<u64>().unwrap(), "action": "keep" }))
+                        .collect();
+                    Ok(tool_reply(
+                        n,
+                        "judgeConfusions",
+                        json!({ "verdicts": verdicts,
+                                "observations": ["「烟感」应为「灶感」"] })
+                        .to_string(),
+                    ))
+                }
+                other => Err(LlmError(format!("不期望的调用: {other:?}"))),
+            }
+        },
+    ));
+    let result = run(doc.clone(), chat, on());
+    assert_eq!(
+        judge_calls.load(Ordering::Relaxed),
+        1,
+        "「烟感」×5 全文一致 → 频率加白，观察不回灌、无第二轮"
+    );
+    assert_eq!(result.items, doc);
+    assert!(result.report.confusion_fixes.is_empty());
 }

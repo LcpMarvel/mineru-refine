@@ -719,3 +719,36 @@ async fn missed_heading_trailing_marker_and_mechanical_cleanup_end_to_end() {
         json!({ "promote": 1, "split": 1, "mechEmptyRow": 1 })
     );
 }
+
+// ── extra_char → deleteChar 端到端 ──
+
+#[tokio::test]
+async fn extra_char_fixed_end_to_end_via_delete_char() {
+    let input = items_of(json!([
+        { "type": "text", "text": "基本治理理念的的变化情况。", "page_idx": 0, "bbox": bbox(0) },
+    ]));
+    // MockChat 默认按证据里的 offset 回 deleteChar
+    let r = run(input, Arc::new(MockChat::new())).await;
+    assert!(!r.report.fail_open);
+    assert_eq!(r.items[0].text().unwrap(), "基本治理理念的变化情况。");
+    assert_eq!(op_counts_json(&r), json!({ "deleteChar": 1 }));
+    assert_eq!(r.report.removed_spans.len(), 1);
+    assert_eq!(r.report.removed_spans[0].reason, "deleteChar:dup_char");
+    assert_eq!(r.report.removed_spans[0].text, "的");
+}
+
+#[tokio::test]
+async fn extra_char_dismissed_leaves_text_untouched() {
+    let input = items_of(json!([
+        { "type": "text", "text": "确保目的的实现。", "page_idx": 0, "bbox": bbox(0) },
+    ]));
+    let overrides: HashMap<SuspectKind, KindHandler> =
+        HashMap::from([(SuspectKind::ExtraChar, dismiss_handler())]);
+    let r = run(input.clone(), Arc::new(MockChat::with(overrides))).await;
+    assert!(!r.report.fail_open);
+    assert_eq!(
+        serde_json::to_value(&r.items).unwrap(),
+        serde_json::to_value(&input).unwrap()
+    );
+    assert_eq!(r.report.dismissed, 1);
+}

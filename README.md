@@ -175,6 +175,15 @@ HTML 标签骨架(`colspan=1` 的 `1`)在构造上就不可能被替换,实体(`
 行列结构化上下文裁决(表标题/表头/所在行),并多一道每表聚合密度闸门:单格各自合规
 但整表提案过多 = 乱码表特征,整表拒绝——乱码表的归宿是整表裁决,不是逐字"修复"。
 
+**全文频率投票**:候选字与邻字构成的高频词全文一致出现(≥5 次)且无任何类内变体写法
+→ 大概率真术语,加白跳过送审(压误报、省调用);拉丁 token 的少数派写法
+(`OGSTM`×2 vs `OGSMT`×20,单字差或相邻换位)生成定点候选,LLM 确认且命中多数派写法的
+免二次裁决直落(`source=frequency_vote`——差异本身就是全文实证)。
+
+**observations 闭环**:LLM 裁决时顺带报告的「X 应为 Y」表外观察,解析出单字替换后
+生成定点候选做第二轮裁决(三道闸门照旧),回收已花掉的 token。最多一轮回灌,
+第二轮的 observations 只记录不再回灌(防循环);频率加白的术语(「烟感」×5)不回灌。
+
 `fixOcrConfusion` 与 `extraConfusionPairs` 均进缓存 key,开关不同的调用绝不互相污染缓存。
 
 ## 工作原理
@@ -213,10 +222,14 @@ HTML 标签骨架(`colspan=1` 的 `1`)在构造上就不可能被替换,实体(`
 | `empty_table` 空壳表 | 零内容表(无行/caption/图)——MinerU 跨页合并后留下的占位 | `drop` |
 | `split_table` 跨页拆表 | 跨页的两个有体表格,中间仅页面家具。支持三页以上的链式拆表(每轮合一对,逐段咬合) | `mergeTable`(**仅视觉裁决**,见下) |
 | `split_list` 跨页拆列表 | 跨页相邻的两个列表 | `mergeList` |
+| `missed_heading` 漏标标题 | 同级编号兄弟是标题而本块是正文,且编号相邻 | `promote` |
+| `trailing_marker` 段尾粘连节标记 | 段尾粘了「[相关文件]」类独立结构块(跨页 merge 吸入) | `split` |
+| `separated_caption` caption 错序 | caption 样短文本与表格之间隔着一个标题块 | `reorder` |
+| `extra_char` 赘字/衍字 | 功能词叠字(的的/地地/是是/了了,合法叠词除外)、孤立偏旁部首(「3)亻」) | `deleteChar` |
 
 **只标记、无修复操作**(LLM 只能判误报,计入 report 供观测):孤儿/空 caption(`caption_issue`)。
 
-### 修复操作集(9 个削减/重组 + dismiss)
+### 修复操作集(10 个削减/重组 + dismiss)
 
 全部是纯函数 `(items, args) -> items`,自带保真校验,违反即回滚并计入 `report.violations`。
 
@@ -229,6 +242,7 @@ HTML 标签骨架(`colspan=1` 的 `1`)在构造上就不可能被替换,实体(`
 | `reorder(idsInOrder)` | 修跨页错序(仅限连续区间内的排列) | 各块不变 |
 | `drop(id)` | 删页码/页眉/页脚/水印/空壳表(须命中白名单类型) | —(删除) |
 | `strip(id, pattern)` | 去残留符号。pattern 白名单:`md_link` / `latex_dollar` / `latex_block` / `latex_command` / `escaped_dollar` / `html_tag` | 不变 |
+| `deleteChar(id, offset)` | 删单个 OCR 衍字。白名单严格:与紧邻字符重复的功能词叠字(的/地/是/了)或孤立偏旁部首;的的确确/地地道道/是是非非受构造性保护 | 不变 |
 | `mergeTable(idA, idB)` | 跨页拆表合并:B 的 `<tr>` 行**原字节**追加到 A 末行后,caption/footnote 拼接;B 首行与 A 表头逐字节相同时(每页重印表头)去重并留痕 | bbox 并集;page_idx 取首块 |
 | `mergeList(idA, idB, joinSeam?)` | 跨页拆列表合并:`list_items` 拼接;`joinSeam` 把 A 尾项与 B 首项缝成一项(断句跨页) | bbox 并集;page_idx 取首块 |
 | `dismiss(id, reason)` | 裁定误报,不改文本;重新探测时不再标记它 | — |

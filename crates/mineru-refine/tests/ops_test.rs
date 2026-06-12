@@ -1041,3 +1041,77 @@ fn padded_repair_attempt_fails_row_level_gate() {
     }));
     assert!(check_table_bodies(&[&a, &b], &[&padded]).is_err());
 }
+
+// ── deleteChar ──
+
+#[test]
+fn delete_char_removes_dup_word_and_radical_keeps_id() {
+    let s = setup(&items_of(json!([
+        { "type": "text", "text": "基本治理理念的的变化情况。", "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "3）亻残留", "page_idx": 0, "bbox": bbox(40) },
+    ])));
+    let a = must_apply(
+        &s.ref_items,
+        OpCall::DeleteChar {
+            id: "it_0001".into(),
+            offset: 7,
+        },
+        &s.ctx(),
+    );
+    assert_eq!(a.items[0].item.text().unwrap(), "基本治理理念的变化情况。");
+    assert_eq!(a.items[0].id, "it_0001"); // 继承原 ID
+    assert!(a.new_ids.is_empty());
+    assert_eq!(
+        spans_json(&a.removed_spans),
+        json!([span("it_0001", "的", "deleteChar:dup_char")])
+    );
+
+    let b = must_apply(
+        &a.items,
+        OpCall::DeleteChar {
+            id: "it_0002".into(),
+            offset: 2,
+        },
+        &s.ctx(),
+    );
+    assert_eq!(b.items[1].item.text().unwrap(), "3）残留");
+    assert_eq!(
+        spans_json(&b.removed_spans),
+        json!([span("it_0002", "亻", "deleteChar:radical")])
+    );
+}
+
+#[test]
+fn delete_char_rejects_out_of_whitelist_and_idioms() {
+    let s = setup(&items_of(json!([
+        { "type": "text", "text": "的的确确发生过", "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "普通正文内容", "page_idx": 0, "bbox": bbox(40) },
+    ])));
+    // 成语构造性保护
+    assert!(is_rejected(
+        &s.ref_items,
+        OpCall::DeleteChar {
+            id: "it_0001".into(),
+            offset: 1,
+        },
+        &s.ctx(),
+    ));
+    // 非白名单字符
+    assert!(is_rejected(
+        &s.ref_items,
+        OpCall::DeleteChar {
+            id: "it_0002".into(),
+            offset: 0,
+        },
+        &s.ctx(),
+    ));
+    // 越界
+    assert!(is_rejected(
+        &s.ref_items,
+        OpCall::DeleteChar {
+            id: "it_0001".into(),
+            offset: 99,
+        },
+        &s.ctx(),
+    ));
+}

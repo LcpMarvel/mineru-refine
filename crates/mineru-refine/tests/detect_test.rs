@@ -390,3 +390,40 @@ fn caption_directly_before_table_not_flagged() {
     ])));
     assert!(!m.contains_key("it_0001"));
 }
+
+// ── extra_char：赘字/衍字疑点 ──
+
+#[test]
+fn extra_char_flags_dup_function_words_and_isolated_radicals() {
+    let m = kinds_of(&items_of(json!([
+        { "type": "text", "text": "基本治理理念的的变化情况。", "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "确保目的的实现。", "page_idx": 0, "bbox": bbox(40) },
+        { "type": "text", "text": "3）亻", "page_idx": 0, "bbox": bbox(80) },
+    ])));
+    assert!(m["it_0001"].contains(&SuspectKind::ExtraChar));
+    assert!(m["it_0002"].contains(&SuspectKind::ExtraChar)); // 合法语法嫌疑也报，由 LLM 裁决
+    assert!(m["it_0003"].contains(&SuspectKind::ExtraChar));
+}
+
+#[test]
+fn extra_char_evidence_carries_offset_for_delete_char() {
+    let ws = detect_of(&items_of(json!([
+        { "type": "text", "text": "基本治理理念的的变化情况。", "page_idx": 0, "bbox": bbox(0) },
+    ])));
+    let w = ws
+        .iter()
+        .find(|w| w.kind == SuspectKind::ExtraChar)
+        .expect("应有 extra_char 疑点");
+    assert!(w.has_op);
+    assert!(w.evidence.contains("offset=7"), "{}", w.evidence);
+}
+
+#[test]
+fn extra_char_not_flagged_on_legit_reduplication() {
+    let m = kinds_of(&items_of(json!([
+        { "type": "text", "text": "这件事的的确确发生过。", "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "他是地地道道的本地人。", "page_idx": 0, "bbox": bbox(40) },
+        { "type": "text", "text": "是是非非自有公论。", "page_idx": 0, "bbox": bbox(80) },
+    ])));
+    assert!(m.is_empty(), "合法叠词不许报疑点: {m:?}");
+}

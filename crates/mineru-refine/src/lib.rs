@@ -9,6 +9,7 @@
 pub mod agent_loop;
 pub mod confusion;
 pub mod detect;
+pub mod extrachar;
 pub mod id;
 pub mod invariant;
 pub mod llm;

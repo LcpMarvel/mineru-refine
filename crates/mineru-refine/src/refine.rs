@@ -6,7 +6,9 @@ use crate::agent_loop::{
     DEFAULT_CONCURRENCY, DEFAULT_MAX_ROUNDS, Logger, LoopOptions, default_logger, run_loop,
     skipped_without_vision,
 };
-use crate::confusion::{CONFUSION_PROMPT_VERSION, ConfusionOutcome, ConfusionTable, fix_confusions};
+use crate::confusion::{
+    CONFUSION_PROMPT_VERSION, ConfusionOutcome, ConfusionTable, fix_confusions,
+};
 use crate::detect::detect;
 use crate::id::{assign_ids, strip_ids};
 use crate::invariant::check_fidelity;
@@ -24,9 +26,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 // 0.5：split_table 视觉裁决；0.6：拆表检测放宽到链式 + split_table 仅视觉裁决；
 // 0.7：Rust 重写（逻辑对齐 0.6，实现换底）；
-// 0.8：机械清洗 pass + 三个新探测器（missed_heading/trailing_marker/separated_caption）
-pub const REFINE_LOGIC_VERSION: &str = "0.8.0";
-pub const PROMPT_VERSION: &str = "p5"; // p5：新疑点 op_hint + missed_heading 裁决规则
+// 0.8：机械清洗 pass + 三个新探测器（missed_heading/trailing_marker/separated_caption）；
+// 0.9：赘字/衍字删除（extra_char 探测器 + deleteChar op，全走 LLM 裁决）
+pub const REFINE_LOGIC_VERSION: &str = "0.9.0";
+pub const PROMPT_VERSION: &str = "p6"; // p6：extra_char 疑点 op_hint + deleteChar 工具
 /// 默认文本裁决模型;运行时可被 `DEEPSEEK_MODEL` 覆盖(见 `cache_key_for`)。
 pub const MODEL_ID: &str = crate::llm::DEEPSEEK_DEFAULT_MODEL;
 
@@ -310,9 +313,15 @@ async fn apply_confusion_layer(
     };
 
     // 进层前留快照：panic 时整层丢弃，原件返还
-    let attempt = AssertUnwindSafe(fix_confusions(items.clone(), chat, concurrency, &table, log))
-        .catch_unwind()
-        .await;
+    let attempt = AssertUnwindSafe(fix_confusions(
+        items.clone(),
+        chat,
+        concurrency,
+        &table,
+        log,
+    ))
+    .catch_unwind()
+    .await;
     match attempt {
         Ok((fixed, outcome)) => (fixed, outcome),
         Err(_) => {

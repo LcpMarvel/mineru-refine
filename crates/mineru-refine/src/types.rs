@@ -113,6 +113,8 @@ pub enum SuspectKind {
     TrailingMarker,
     /// caption 与其表格之间隔了一个标题块（跨页/排版错序）→ reorder / dismiss
     SeparatedCaption,
+    /// 疑似 OCR 赘字/衍字（功能词叠字/孤立偏旁，机械层拿不准的）→ deleteChar / dismiss
+    ExtraChar,
     // 只标记、无 op（标记后不做处理）
     CaptionIssue,
 }
@@ -131,6 +133,7 @@ impl SuspectKind {
             SuspectKind::MissedHeading => "missed_heading",
             SuspectKind::TrailingMarker => "trailing_marker",
             SuspectKind::SeparatedCaption => "separated_caption",
+            SuspectKind::ExtraChar => "extra_char",
             SuspectKind::CaptionIssue => "caption_issue",
         }
     }
@@ -187,6 +190,11 @@ pub enum OpCall {
         id: String,
         pattern: StripPattern,
     },
+    /// 删除 text 中 offset 处的单个衍字（仅限 extrachar 白名单：功能词叠字/孤立偏旁）
+    DeleteChar {
+        id: String,
+        offset: i64,
+    },
     MergeTable {
         id_a: String,
         id_b: String,
@@ -208,6 +216,7 @@ impl OpCall {
             OpCall::Reorder { .. } => "reorder",
             OpCall::Drop { .. } => "drop",
             OpCall::Strip { .. } => "strip",
+            OpCall::DeleteChar { .. } => "deleteChar",
             OpCall::MergeTable { .. } => "mergeTable",
             OpCall::MergeList { .. } => "mergeList",
         }

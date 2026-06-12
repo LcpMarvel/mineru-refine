@@ -146,6 +146,14 @@ static TOOLS: LazyLock<Value> = LazyLock::new(|| {
                 "pattern": { "type": "string", "enum": ["md_link", "latex_dollar", "latex_block", "latex_command", "escaped_dollar", "html_tag"] },
             }, "required": ["id", "pattern"] },
         }},
+        { "type": "function", "function": {
+            "name": "deleteChar",
+            "description": "删除 text 块中 offset 处的单个 OCR 衍字。白名单严格：只能删与紧邻字符重复的功能词叠字（的/地/是/了）或孤立的偏旁部首部件（亻氵扌…），其余字符一律拒绝；的的确确/地地道道/是是非非 受构造性保护删不动。",
+            "parameters": { "type": "object", "properties": {
+                "id": id_param,
+                "offset": { "type": "integer", "description": "待删字符的字符位置（疑点证据中给出）" },
+            }, "required": ["id", "offset"] },
+        }},
         // 注：mergeTable 不在文本工具集里——split_table 仅视觉裁决（try_vision_verdict），
         // 文本 LLM 不该在任何疑点对话里合并表格（首末行摘要不足以核对行归属）。
         { "type": "function", "function": {
@@ -165,7 +173,7 @@ pub fn tools() -> &'static Value {
     &TOOLS
 }
 
-const OP_NAMES: [&str; 8] = [
+const OP_NAMES: [&str; 9] = [
     "merge",
     "split",
     "demote",
@@ -173,6 +181,7 @@ const OP_NAMES: [&str; 8] = [
     "reorder",
     "drop",
     "strip",
+    "deleteChar",
     "mergeList",
 ];
 const OBSERVE_NAMES: [&str; 4] = ["outline", "getItems", "whyFlagged", "peekPage"];
@@ -191,7 +200,7 @@ const SYSTEM_PROMPT: &str = r#"你是 MinerU PDF 解析结果的结构修复器�
    - 列表项（-、•、①、(1) 等开头的行）之间绝不 merge——行尾无标点是列表的常态，不是断句。
    - 但 page_artifact 证据若给出「已分类页眉/页脚同文佐证」，说明同文块在别处已被正确分类为页面家具，该块就是漏标的同款 → 应 drop，不要因「像标题」而 dismiss。
    - 同一文本的多处 page_artifact 疑点应裁决一致：要删都删，不要删一处留其余。
-4. 修复只许削减/重组（merge/split/demote/promote/reorder/drop/strip/mergeList），系统会机器校验"不新增任何字符、表格行不被篡改"，违规会被自动回滚。
+4. 修复只许削减/重组（merge/split/demote/promote/reorder/drop/strip/deleteChar/mergeList），系统会机器校验"不新增任何字符、表格行不被篡改"，违规会被自动回滚。
 5. 每个疑点最终以【一个】变更 op 或 dismiss 收尾。"#;
 
 // ── 观察工具实现（确定性，只读）──
@@ -414,6 +423,10 @@ fn to_op_call(name: &str, args: &Value) -> Result<OpCall, String> {
         }
         "drop" => Ok(OpCall::Drop {
             id: arg_str(args, "id"),
+        }),
+        "deleteChar" => Ok(OpCall::DeleteChar {
+            id: arg_str(args, "id"),
+            offset: int_of("offset")?,
         }),
         "strip" => {
             let pattern: StripPattern =
@@ -806,6 +819,9 @@ fn op_hint(kind: SuspectKind) -> &'static str {
         }
         SuspectKind::SeparatedCaption => {
             "用 getItems/peekPage 判断表格归属：表格属于 caption 所在小节 → reorder 把表格挪到标题之前；caption 与表格都属新小节 → reorder 把 caption 挪到标题之后；拿不准 → dismiss"
+        }
+        SuspectKind::ExtraChar => {
+            "读上下文判断该字是否 OCR 衍字：删掉后语句更通顺 → deleteChar（offset 用证据中的值）；属正常语法（「目的+的」「但是+是」「不甚了了」）或正文在讨论偏旁本身 → dismiss"
         }
         _ => "无对应 op，只能 dismiss（仅标记类）",
     }
