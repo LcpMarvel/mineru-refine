@@ -214,7 +214,26 @@ impl OpCall {
     }
 }
 
-// ── provenance（纯削减模式不加字，恒为空，结构保留备用）──
+// ── 混淆修正（opt-in，fix_ocr_confusion=true 才会出现）──
+
+/// 混淆层落地的一条字符替换。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfusionFix {
+    pub item_id: String,
+    /// "text" / "list_items[2]" / "table_caption[0]"
+    pub field: String,
+    /// 字符（非字节）偏移
+    pub char_offset: usize,
+    pub before: String,
+    pub after: String,
+    /// "table"（混淆表内直接落地）| "second_opinion"（表外、二次裁决通过）
+    pub source: String,
+    /// LLM 给的裁决依据
+    pub note: String,
+}
+
+// ── provenance（默认纯削减不加字、恒为空；混淆层开启时记录其每条替换）──
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -258,6 +277,18 @@ pub struct RefineReport {
     pub violations: u64,
     pub token_usage: TokenUsage,
     pub fail_open: bool,
+    // 混淆层（fix_ocr_confusion）产物。关 flag 时恒缺省，序列化输出与旧版逐字节兼容。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confusion_fixes: Vec<ConfusionFix>,
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub confusion_rejected: u64,
+    /// LLM 在裁决中顺带观察到的表外 OCR 质量问题（只记录，从未被应用）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confusion_observations: Vec<String>,
+}
+
+fn u64_is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -6,6 +6,7 @@ use crate::agent_loop::{
     DEFAULT_CONCURRENCY, DEFAULT_MAX_ROUNDS, Logger, LoopOptions, default_logger, run_loop,
     skipped_without_vision,
 };
+use crate::confusion::{CONFUSION_PROMPT_VERSION, ConfusionOutcome, ConfusionTable, fix_confusions};
 use crate::detect::detect;
 use crate::id::{assign_ids, strip_ids};
 use crate::invariant::check_fidelity;
@@ -14,7 +15,7 @@ use crate::llm::{
     SplitTableVerdict, VisionClient,
 };
 use crate::mechanical::mechanical_clean;
-use crate::types::{MineruItem, RefineReport, RefineResult, WorkItem};
+use crate::types::{MineruItem, ProvenanceEntry, RefItem, RefineReport, RefineResult, WorkItem};
 use futures::FutureExt;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -46,6 +47,13 @@ pub struct RefineOptions {
     pub chat: Option<Arc<dyn ChatClient>>,
     /// 内部/测试用：注入视觉裁决（默认 Qwen-VL 裸 API）。
     pub vision: Option<Arc<dyn VisionClient>>,
+    /// OCR 字符混淆修正层（opt-in）。开启后输出不再满足 C_out ⊆ C_in，
+    /// 改为双契约：核心层只删不增 + 混淆层在准入名单内做稀疏一换一替换
+    ///（每条进 report.confusionFixes 与 provenance，可审计可撤销）。
+    pub fix_ocr_confusion: bool,
+    /// 混淆准入名单的用户补充对：每项恰好 2 个不同字符（如 "0D" 表示 0↔D），
+    /// 非法配置立即失败（fail-open + 大声 log），不静默吞。
+    pub extra_confusion_pairs: Vec<String>,
     pub log: Option<Logger>,
 }
 
@@ -68,6 +76,22 @@ pub fn cache_key_for(sha256: &str) -> String {
     )
 }
 
+/// 含混淆层配置的缓存 key：flag/混淆 prompt 版本/补充对都改变输出，必须进 key——
+/// 否则开关不同的两次调用会互相污染缓存。关 flag 时与 cache_key_for 完全一致。
+/// 补充对先排序：语义相同但顺序不同的配置必须命中同一份缓存。
+pub fn cache_key_for_opts(sha256: &str, opts: &RefineOptions) -> String {
+    let base = cache_key_for(sha256);
+    if !opts.fix_ocr_confusion {
+        return base;
+    }
+    let mut pairs = opts.extra_confusion_pairs.clone();
+    pairs.sort();
+    format!(
+        "{base}:confusion-{CONFUSION_PROMPT_VERSION}:{}",
+        pairs.join(",")
+    )
+}
+
 /// 测试/运维用：清空进程内缓存。
 pub fn clear_refine_cache() {
     CACHE.lock().unwrap().clear();
@@ -87,7 +111,7 @@ impl VisionClient for UnavailableVision {
 pub async fn refine(items: Vec<MineruItem>, opts: RefineOptions) -> RefineResult {
     let log: Logger = opts.log.clone().unwrap_or_else(default_logger);
 
-    let key = opts.sha256.as_ref().map(|s| cache_key_for(s));
+    let key = opts.sha256.as_ref().map(|s| cache_key_for_opts(s, &opts));
     if let Some(k) = &key
         && let Some(hit) = CACHE.lock().unwrap().get(k)
     {
@@ -139,6 +163,16 @@ async fn refine_inner(
     opts: &RefineOptions,
     log: &Logger,
 ) -> Result<RefineResult, String> {
+    // 混淆层配置先验证（早抛）：配置错误不该烧掉任何 token 才暴露
+    let confusion_table = if opts.fix_ocr_confusion {
+        Some(
+            ConfusionTable::build(&opts.extra_confusion_pairs)
+                .map_err(|e| format!("extraConfusionPairs 配置非法: {e}"))?,
+        )
+    } else {
+        None
+    };
+
     let (mut ref_items, next_id) = assign_ids(snapshot);
 
     // 机械清洗 pass（确定性、自校验、不打 LLM）。先于基线快照执行：
@@ -184,7 +218,7 @@ async fn refine_inner(
                 .unwrap_or_else(|| adaptive_max_iterations(input_suspects)),
             max_rounds_per_suspect: DEFAULT_MAX_ROUNDS,
             concurrency: opts.concurrency.unwrap_or(DEFAULT_CONCURRENCY),
-            chat,
+            chat: chat.clone(),
             load_image,
             vision,
             log: log.clone(),
@@ -207,6 +241,36 @@ async fn refine_inner(
         ));
     }
 
+    // ── 混淆修正层（opt-in）：出口闸门之后运行，核心承诺已经定格。
+    let (items, confusion) = apply_confusion_layer(
+        confusion_table,
+        loop_result.items,
+        chat,
+        opts.concurrency.unwrap_or(DEFAULT_CONCURRENCY),
+        log,
+    )
+    .await;
+
+    let mut token_usage = loop_result.token_usage;
+    token_usage.prompt += confusion.usage.prompt;
+    token_usage.completion += confusion.usage.completion;
+
+    // 混淆修复逐条登记 provenance（层只产出 fixes，溯源条目格式由编排层统一）
+    let provenance: Vec<ProvenanceEntry> = confusion
+        .fixes
+        .iter()
+        .map(|f| ProvenanceEntry {
+            item_id: f.item_id.clone(),
+            field: f.field.clone(),
+            char_start: f.char_offset,
+            char_end: f.char_offset + 1,
+            origin: "ocr_confusion".into(),
+            op: "fixConfusion".into(),
+            confidence: 1.0,
+            note: Some(format!("「{}」→「{}」（{}）", f.before, f.after, f.note)),
+        })
+        .collect();
+
     // 机械清洗的统计并入报告：opCounts 用 mech* 前缀区分，removedSpans 置于最前
     let mut op_counts = loop_result.op_counts;
     for (k, v) in mech.counts {
@@ -216,16 +280,44 @@ async fn refine_inner(
     removed_spans.extend(loop_result.removed_spans);
 
     Ok(RefineResult {
-        items: strip_ids(&loop_result.items), // 出口剥除内部 ID（schema 透明）
-        provenance: vec![],                   // 纯削减模式（不加字）→ 恒为空，结构预留
+        items: strip_ids(&items), // 出口剥除内部 ID（schema 透明）
+        provenance,
         report: RefineReport {
             iterations: loop_result.iterations,
             op_counts,
             dismissed: loop_result.dismissed,
             removed_spans,
             violations: loop_result.violations,
-            token_usage: loop_result.token_usage,
+            token_usage,
             fail_open: false,
+            confusion_fixes: confusion.fixes,
+            confusion_rejected: confusion.rejected,
+            confusion_observations: confusion.observations,
         },
     })
+}
+
+/// 混淆修正层（opt-in）。flag 关 → 原样直通；层内 panic → 丢弃整层、保留核心产物。
+async fn apply_confusion_layer(
+    table: Option<ConfusionTable>,
+    items: Vec<RefItem>,
+    chat: Arc<dyn ChatClient>,
+    concurrency: usize,
+    log: &Logger,
+) -> (Vec<RefItem>, ConfusionOutcome) {
+    let Some(table) = table else {
+        return (items, ConfusionOutcome::default());
+    };
+
+    // 进层前留快照：panic 时整层丢弃，原件返还
+    let attempt = AssertUnwindSafe(fix_confusions(items.clone(), chat, concurrency, &table, log))
+        .catch_unwind()
+        .await;
+    match attempt {
+        Ok((fixed, outcome)) => (fixed, outcome),
+        Err(_) => {
+            log("混淆层异常 —— 丢弃本层全部结果，保留核心产物");
+            (items, ConfusionOutcome::default())
+        }
+    }
 }

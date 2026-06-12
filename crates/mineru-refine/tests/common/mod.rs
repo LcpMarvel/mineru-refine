@@ -322,22 +322,27 @@ impl ChatClient for Scripted {
     }
 }
 
-/// 闭包式 chat mock（每轮同一决策函数）。
+/// 闭包式 chat mock（每轮同一决策函数；闭包能看到 tools——混淆层测试用它区分
+/// judge/verify 调用）。自带调用计数（call_count）。
 pub struct FnChat<F>(pub F, pub AtomicU64);
 
 impl<F> FnChat<F> {
     pub fn new(f: F) -> Self {
         Self(f, AtomicU64::new(0))
     }
+
+    pub fn call_count(&self) -> u64 {
+        self.1.load(Ordering::Relaxed)
+    }
 }
 
 #[async_trait]
 impl<F> ChatClient for FnChat<F>
 where
-    F: Fn(&[Message]) -> Result<ChatResult, LlmError> + Send + Sync,
+    F: Fn(&[Message], &Value) -> Result<ChatResult, LlmError> + Send + Sync,
 {
-    async fn chat(&self, messages: &[Message], _: &Value) -> Result<ChatResult, LlmError> {
+    async fn chat(&self, messages: &[Message], tools: &Value) -> Result<ChatResult, LlmError> {
         self.1.fetch_add(1, Ordering::Relaxed);
-        (self.0)(messages)
+        (self.0)(messages, tools)
     }
 }

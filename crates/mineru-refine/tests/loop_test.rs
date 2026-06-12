@@ -119,7 +119,7 @@ async fn oscillation_guard_blocks_split_of_merge_product() {
     // 策略：cross_page_break 疑点 → merge（产新块 it_0008）；
     // 其它疑点一律先试 split it_0008（应被防震荡拒）、收到拒绝再 dismiss。
     let rej = rejections.clone();
-    let chat = FnChat::new(move |messages: &[Message]| {
+    let chat = FnChat::new(move |messages: &[Message], _: &Value| {
         let content = common::first_user_content(messages);
         let (kind, id, _) = parse_suspect(content)?;
         if kind == mineru_refine::types::SuspectKind::CrossPageBreak {
@@ -171,7 +171,7 @@ async fn max_rounds_exhausted_forces_dismissal() {
 #[tokio::test]
 async fn broken_json_arguments_repaired_by_safe_json_repair() {
     let (ref_items, next_id) = assign_ids(&golden_input());
-    let chat = FnChat::new(move |messages: &[Message]| {
+    let chat = FnChat::new(move |messages: &[Message], _: &Value| {
         let (kind, id, _) = parse_suspect(common::first_user_content(messages))?;
         if kind == mineru_refine::types::SuspectKind::PseudoHeading {
             // 尾逗号坏 JSON

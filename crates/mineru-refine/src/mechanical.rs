@@ -26,7 +26,7 @@ static TR_ROW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<tr[\s\S]*?<
 static CELL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?is)(<t[dh][^>]*>)([\s\S]*?)(</t[dh]>)").unwrap());
 static ROWSPAN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?i)rowspan\s*=\s*"?([0-9]+)"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"(?i)rowspan\s*=\s*['"]?([0-9]+)['"]?"#).unwrap());
 static ESCAPED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\([$*])").unwrap());
 // 句末标点（含分号）：上一行 cell 以它收尾说明记录完整，不做续行合并
 static CELL_SENTENCE_END: LazyLock<Regex> =

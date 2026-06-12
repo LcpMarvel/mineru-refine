@@ -37,14 +37,19 @@ result = mineru_refine.refine(
     max_iterations=None,                # 可选:修复循环硬上限,默认随疑点数自适应
     concurrency=8,                      # 可选:并行裁决的疑点数,1 = 严格串行
     image_dir="/abs/mineru/out",        # 可选:MinerU 产物目录,提供则启用跨页拆表的视觉裁决
+    fix_ocr_confusion=False,            # 可选:opt-in 的 OCR 字符混淆修正层(CE0→CEO 等)
+    extra_confusion_pairs=None,         # 可选:混淆准入名单补充对,如 ["0D"]
 )
 
 result["items"]    # 清洗后的 content_list(同 schema,未知字段原样透传)
 result["report"]   # 审计报告:iterations / opCounts / dismissed / removedSpans
                    #          / violations / tokenUsage / failOpen
+                   #          (开 fix_ocr_confusion 后另有 confusionFixes 等,见主 README)
 ```
 
 删除的每段内容都留痕于 `report["removedSpans"]`(itemId / 原文 / 原因),逐条可审计。
+`fix_ocr_confusion=True` 开启混淆修正层(直接替换,LLM 提案 + 机械闸门),
+开启后输出契约从"只删不增"变为双契约——详见主 README 的「混淆修正层」一节。
 
 独立工具函数(都不调 LLM):
 

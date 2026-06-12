@@ -1,6 +1,8 @@
 // CLI transport（备选，首选是 HTTP）：stdin 收 JSON、stdout 回 JSON，subprocess 调用。
-// stdin 形如 { "items": [...], "sha256"?: "...", "maxIterations"?: n, "imageDir"?: "/abs/path" }
+// stdin 形如 { "items": [...], "sha256"?: "...", "maxIterations"?: n, "imageDir"?: "/abs/path",
+//              "fixOcrConfusion"?: bool, "extraConfusionPairs"?: ["0D", ...] }
 // 或直接是 items 数组。imageDir 指向 MinerU 产物目录（含 images/），提供则启用视觉裁决。
+// fixOcrConfusion 开启 OCR 字符混淆修正层（opt-in，见 lib 文档）。
 //
 // 跑：  cat content_list.json | mineru-refine
 
@@ -30,6 +32,17 @@ async fn main() {
     let (items_value, opts) = match parsed {
         Value::Array(_) => (parsed, RefineOptions::default()),
         Value::Object(ref obj) => {
+            // 严格解析：含非字符串元素是配置错误，早抛不静默吞（与 HTTP server 的 serde 行为一致）
+            let extra_confusion_pairs = match obj.get("extraConfusionPairs") {
+                None => vec![],
+                Some(v) => match serde_json::from_value::<Vec<String>>(v.clone()) {
+                    Ok(pairs) => pairs,
+                    Err(e) => {
+                        eprintln!("[mineru-refine] extraConfusionPairs 必须是字符串数组: {e}");
+                        exit(2);
+                    }
+                },
+            };
             let opts = RefineOptions {
                 sha256: obj
                     .get("sha256")
@@ -37,6 +50,11 @@ async fn main() {
                     .map(str::to_string),
                 max_iterations: obj.get("maxIterations").and_then(Value::as_u64),
                 image_dir: obj.get("imageDir").and_then(Value::as_str).map(Into::into),
+                fix_ocr_confusion: obj
+                    .get("fixOcrConfusion")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                extra_confusion_pairs,
                 ..RefineOptions::default()
             };
             (obj.get("items").cloned().unwrap_or(Value::Null), opts)

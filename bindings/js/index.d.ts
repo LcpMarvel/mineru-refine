@@ -6,6 +6,8 @@ export declare function clearRefineCache(): void
 /** 探测器独立调用：返回疑点列表（kind/itemId/evidence/hasOp），不打 LLM。 */
 export declare function detectSuspects(items: any): any
 
+export const CONFUSION_PROMPT_VERSION: string
+
 export const MODEL_ID: string
 
 export const PROMPT_VERSION: string
@@ -27,6 +29,13 @@ export interface RefineOpts {
   concurrency?: number
   /** MinerU 产物目录绝对路径；提供则 split_table 启用 Qwen-VL 视觉裁决 */
   imageDir?: string
+  /**
+   * OCR 字符混淆修正层（opt-in，默认关）。开启后输出契约变为：
+   * 核心层只删不增 + 混淆层在准入名单内做稀疏一换一替换（全量进 report.confusionFixes）
+   */
+  fixOcrConfusion?: boolean
+  /** 混淆准入名单补充对：每项恰好 2 个不同字符（如 "0D" 表示 0↔D 互换可直接落地） */
+  extraConfusionPairs?: Array<string>
 }
 
 /** items → full.md 文本（确定性重渲染，与 MinerU pipeline 拼接规则对齐）。 */

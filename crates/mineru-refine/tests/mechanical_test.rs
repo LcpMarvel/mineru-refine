@@ -97,20 +97,24 @@ fn template_table_with_label_rows_not_merged() {
 #[test]
 fn rowspan_table_only_trims_trailing_empty_rows_and_skips_row_merge() {
     // 第 2 行的"空行"其实被 rowspan=2 覆盖 → 必须保留；尾部真空行可删
-    let body = "<table>\
-        <tr><td rowspan=\"2\">A</td><td>x</td></tr>\
-        <tr><td></td></tr>\
-        <tr><td>B</td><td>未完</td></tr>\
-        <tr><td></td><td>续文</td></tr>\
-        <tr><td></td><td></td></tr></table>";
-    let (items, o) = clean(items_of(json!([
-        { "type": "table", "table_body": body, "page_idx": 0, "bbox": bbox(0) },
-    ])));
-    let new_body = items[0].item.table_body().unwrap();
-    assert_eq!(count(&o, "mechEmptyRow"), 1); // 只删了最后的真空行
-    assert_eq!(count(&o, "mechRowMerge"), 0); // 含 rowspan>1 的表不做续行合并
-    assert!(new_body.contains("<tr><td></td></tr>")); // rowspan 覆盖行保留
-    assert!(new_body.contains("续文"));
+    for attr in ["rowspan=2", "rowspan=\"2\"", "rowspan='2'"] {
+        let body = format!(
+            "<table>\
+            <tr><td {attr}>A</td><td>x</td></tr>\
+            <tr><td></td></tr>\
+            <tr><td>B</td><td>未完</td></tr>\
+            <tr><td></td><td>续文</td></tr>\
+            <tr><td></td><td></td></tr></table>"
+        );
+        let (items, o) = clean(items_of(json!([
+            { "type": "table", "table_body": body, "page_idx": 0, "bbox": bbox(0) },
+        ])));
+        let new_body = items[0].item.table_body().unwrap();
+        assert_eq!(count(&o, "mechEmptyRow"), 1, "{attr}"); // 只删了最后的真空行
+        assert_eq!(count(&o, "mechRowMerge"), 0, "{attr}"); // 含 rowspan>1 的表不做续行合并
+        assert!(new_body.contains("<tr><td></td></tr>"), "{attr}"); // rowspan 覆盖行保留
+        assert!(new_body.contains("续文"), "{attr}");
+    }
 }
 
 #[test]

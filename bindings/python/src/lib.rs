@@ -26,7 +26,8 @@ fn parse_items(items: &Bound<'_, PyAny>) -> PyResult<Vec<MineruItem>> {
 /// 返回 dict：{ "items": [...], "provenance": [], "report": {...} }，
 /// 字段与 TS/HTTP 版完全一致（camelCase report）。
 #[pyfunction]
-#[pyo3(signature = (items, *, sha256=None, max_iterations=None, concurrency=None, image_dir=None))]
+#[pyo3(signature = (items, *, sha256=None, max_iterations=None, concurrency=None, image_dir=None, fix_ocr_confusion=false, extra_confusion_pairs=None))]
+#[allow(clippy::too_many_arguments)] // PyO3 keyword-only 参数面，逐项展开是接口本体
 fn refine(
     py: Python<'_>,
     items: Bound<'_, PyAny>,
@@ -34,6 +35,8 @@ fn refine(
     max_iterations: Option<u64>,
     concurrency: Option<usize>,
     image_dir: Option<String>,
+    fix_ocr_confusion: bool,
+    extra_confusion_pairs: Option<Vec<String>>,
 ) -> PyResult<Py<PyAny>> {
     let items = parse_items(&items)?;
     let opts = RefineOptions {
@@ -41,6 +44,8 @@ fn refine(
         max_iterations,
         concurrency,
         image_dir: image_dir.map(Into::into),
+        fix_ocr_confusion,
+        extra_confusion_pairs: extra_confusion_pairs.unwrap_or_default(),
         ..RefineOptions::default()
     };
     let result = py.detach(|| RUNTIME.block_on(mineru_refine_core::refine(items, opts)));
@@ -77,6 +82,10 @@ fn mineru_refine(m: &Bound<'_, PyModule>) -> PyResult<()> {
         mineru_refine_core::REFINE_LOGIC_VERSION,
     )?;
     m.add("PROMPT_VERSION", mineru_refine_core::PROMPT_VERSION)?;
+    m.add(
+        "CONFUSION_PROMPT_VERSION",
+        mineru_refine_core::CONFUSION_PROMPT_VERSION,
+    )?;
     m.add("MODEL_ID", mineru_refine_core::MODEL_ID)?;
     Ok(())
 }

@@ -21,6 +21,10 @@ struct RefineRequest {
     max_iterations: Option<u64>,
     /// MinerU 产物目录绝对路径（须与本服务共享文件系统）；提供则 split_table 启用 Qwen-VL 视觉裁决。
     image_dir: Option<String>,
+    /// OCR 字符混淆修正层（opt-in，默认关）。
+    fix_ocr_confusion: Option<bool>,
+    /// 混淆准入名单补充对：每项恰好 2 个不同字符（如 "0D"）。
+    extra_confusion_pairs: Option<Vec<String>>,
 }
 
 async fn handle_refine(
@@ -38,6 +42,8 @@ async fn handle_refine(
             sha256: req.sha256,
             max_iterations: req.max_iterations,
             image_dir: req.image_dir.map(Into::into),
+            fix_ocr_confusion: req.fix_ocr_confusion.unwrap_or(false),
+            extra_confusion_pairs: req.extra_confusion_pairs.unwrap_or_default(),
             ..RefineOptions::default()
         },
     )

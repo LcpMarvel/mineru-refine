@@ -23,6 +23,11 @@ pub struct RefineOpts {
     pub concurrency: Option<u32>,
     /// MinerU 产物目录绝对路径；提供则 split_table 启用 Qwen-VL 视觉裁决
     pub image_dir: Option<String>,
+    /// OCR 字符混淆修正层（opt-in，默认关）。开启后输出契约变为：
+    /// 核心层只删不增 + 混淆层在准入名单内做稀疏一换一替换（全量进 report.confusionFixes）
+    pub fix_ocr_confusion: Option<bool>,
+    /// 混淆准入名单补充对：每项恰好 2 个不同字符（如 "0D" 表示 0↔D 互换可直接落地）
+    pub extra_confusion_pairs: Option<Vec<String>>,
 }
 
 /// MinerU content_list 清洗。fail-open：任何异常原样返回输入（report.failOpen=true）。
@@ -38,6 +43,8 @@ pub async fn refine(items: Value, opts: Option<RefineOpts>) -> Result<Value> {
             max_iterations: opts.max_iterations.map(u64::from),
             concurrency: opts.concurrency.map(|c| c as usize),
             image_dir: opts.image_dir.map(Into::into),
+            fix_ocr_confusion: opts.fix_ocr_confusion.unwrap_or(false),
+            extra_confusion_pairs: opts.extra_confusion_pairs.unwrap_or_default(),
             ..RefineOptions::default()
         },
     )
@@ -72,3 +79,6 @@ pub const MODEL_ID: &str = mineru_refine_core::MODEL_ID;
 
 #[napi]
 pub const PROMPT_VERSION: &str = mineru_refine_core::PROMPT_VERSION;
+
+#[napi]
+pub const CONFUSION_PROMPT_VERSION: &str = mineru_refine_core::CONFUSION_PROMPT_VERSION;
