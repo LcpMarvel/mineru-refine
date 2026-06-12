@@ -10,9 +10,8 @@ content_list。**只做削减与重组,绝不新增一个字**:输出的每个�
 panic。探测器、修复操作集、闸门的完整设计文档见
 [仓库 README](https://github.com/LcpMarvel/mineru-refine#readme)。
 
-```toml
-[dependencies]
-mineru-refine = "0.7"
+```bash
+cargo add mineru-refine
 ```
 
 ## 用法
@@ -26,6 +25,7 @@ let result = refine(items, RefineOptions {
     concurrency: Some(8),                     // 可选:并行裁决的疑点数,1 = 严格串行
     image_dir: Some("/abs/mineru/out".into()),// 可选:MinerU 产物目录 → 启用跨页拆表的视觉裁决
     fix_ocr_confusion: false,                 // 可选:opt-in 的 OCR 字符混淆修正层
+    extra_confusion_pairs: vec![],            // 可选:混淆准入名单补充对,如 ["0D"]
     rewrite_garbled_tables: false,            // 可选:opt-in 的重度乱码表视觉重转写层(需要 image_dir)
     ..Default::default()
 }).await;

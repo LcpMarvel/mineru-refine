@@ -14,7 +14,8 @@ MinerU 把 PDF 解析成 `content_list.json`——一个 item 对象数组,每�
 - **残留符号**——markdown 链接、LaTeX 命令、`\$`/`\*` 转义等解析残骸
 - **巨型块**——多个小节被糊成一个超长 item
 - **段尾粘连**——跨页合并把「[相关文件]」这类独立结构块吸进上一段结尾
-- **表格噪声**——全空 `<tr>`、单元格内 OCR 空格（含被空格打断的 URL）
+- **表格噪声**——全空 `<tr>`、单元格内 OCR 空格（含被空格打断的 URL）、伪 LaTeX 包装
+  （`$\text{...}$` 套着普通文字，已知符号命令换成 Unicode；`\frac` 等真公式不动）
 
 其中无歧义的表格噪声由**机械清洗 pass**（确定性代码、自带校验、不打 LLM）直接处理，
 其余疑点交 LLM 裁决。
@@ -312,6 +313,12 @@ HTML 标签骨架在构造上不可触碰(替换只发生在单元格内层区�
   默认上限随初始疑点数自适应——修复会解锁新疑点(实测总工作量约为初始数的 1.6 倍),
   固定常数对大文档必然截断。
 - **防震荡**:合并产物禁止立刻拆分,拆分产物对禁止立刻合并回去。
+- **矛盾决策守卫**:同一条回复同时调 dismiss 和变更操作 → 整体驳回,把矛盾点回灌给
+  LLM 强制重裁(实测 LLM 会把「应 drop」的分析写进 dismiss 理由又并行调 drop)。
+  每个变更操作都带一句话依据进审计日志。
+- **联合裁决**:强关联疑点归并为一次裁决——同级编号兄弟组的 `missed_heading` 一起判
+  (防止逐个裁决忽升忽不升),同文 `page_artifact` 一起判(同一页眉文本要删全删、
+  要留全留)。
 - 出口合格判定全部是机器检查:队列空 ∧ 保真 ∧ 疑点数 ≤ 输入 ∧ 几何可定位;
   任一不满足 → fail-open。
 
@@ -376,7 +383,7 @@ cat content_list.json | mineru-refine > refined.json
 ## 开发
 
 ```bash
-just test         # cargo test:全程 mock LLM,不打网络(96 个测试)
+just test         # cargo test:全程 mock LLM,不打网络(160+ 个测试)
 just check        # clippy -D warnings + fmt --check
 just smoke-vl     # 冒烟:真实 Qwen-VL 判表(三对真实表格图,需 key)
 just js-build     # JS 绑定本地构建(napi)
@@ -410,8 +417,12 @@ crates/mineru-refine/            # Rust core
   src/types.rs                   #   MineruItem(保序 JSON 对象)/ WorkItem / OpCall / RefineReport
   src/id.rs                      #   内部稳定 ID(出口剥除,绝不进输出 schema)
   src/detect.rs                  #   确定性异常探测器 → 疑点队列
-  src/ops.rs                     #   9 个削减/重组操作 + 保真闸 + 回滚
+  src/mechanical.rs              #   机械清洗 pass(表格噪声,确定性、不打 LLM)
+  src/ops.rs                     #   10 个削减/重组操作 + 保真闸 + 回滚
+  src/extrachar.rs               #   赘字/衍字白名单(deleteChar 的准入)
   src/invariant.rs               #   保真 / table_body / 几何校验
+  src/confusion.rs               #   混淆修正层(opt-in,fixOcrConfusion)
+  src/garbled.rs                 #   乱码表重转写层(opt-in,rewriteGarbledTables)
   src/agent_loop.rs              #   确定性外层循环 + LLM tool-use + 守卫
   src/llm.rs                     #   裸 reqwest:DeepSeek + Qwen-VL(trait 注入,测试 mock)
   src/markdown.rs                #   清洗后 items → full.md 确定性重渲染
