@@ -167,6 +167,13 @@ async fn max_rounds_exhausted_forces_dismissal() {
     .unwrap();
     assert_eq!(r.dismissed, 4); // 4 个 hasOp 疑点全部轮数耗尽被搁置
     assert!(r.op_counts.is_empty());
+    // 明细逐条展开，与计数一致，且类别正确、带探测器证据
+    assert_eq!(r.dismissed_suspects.len(), 4);
+    assert!(
+        r.dismissed_suspects
+            .iter()
+            .all(|d| d.reason == "max_rounds_exhausted" && !d.evidence.is_empty())
+    );
 }
 
 #[tokio::test]

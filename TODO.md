@@ -17,6 +17,14 @@
 > ⑦ 乱码表降级兜底（`degradeGarbledTables`，opt-in）；
 > ⑧ caption_heading 探测器 + extractCaption op（被吞进表格题注的小节标题）。
 >
+> 已完成（2026-06-13，VL 确定性）：
+> ⑨ Qwen-VL 视觉裁决加 `top_k:1` 贪婪解码——根因是 DashScope 的 temperature 有效区间
+>    是【开区间 (0,2)】，传 0 落区间外被静默忽略、回落默认采样（temp0.8/top_p0.8），这才是
+>    §4 记录的「mergeTable 同输入跑出 100/102 items」漂移真因。`top_k:1` 把 softmax 退化成
+>    确定性 argmax（温度从此不起作用）。两处 VL 调用（judge_split_table/transcribe_table）
+>    都带上。回归验证（/refine-regression 真 LLM）：003/047 旧码→新码逐字节无差异（二者
+>    各跑 mergeTable×2/×1），JZY mergeTable×7 两次一致——VL 侧零漂移。详见「4.」。
+>
 > 已完成（2026-06-12，bugfix）：
 > ⑤ 图注/图脚注静默丢失修复——`render_markdown`（markdown.rs）与 caption 探测器
 >    （detect.rs）查的字段名是 `img_caption`/`img_footnote`，但 MinerU 真实字段是
@@ -94,9 +102,16 @@ JZY-001 精修后仍有约 16 处疑似跨页断句，抽查分两类：
 - **mergeTable 合表 ≠ 修内容**：ZBZ-003 序号 1-10 输入信息表跨页合并成功，但续表本身
   OCR 烂——`3）亻`（拆字）、`2 3)`（并格错位）、`有效 性`（空格断字）原样保留。合表只接
   结构，单元格内乱码归 `rewriteGarbledTables`（opt-in）/「2.」管，默认配置不治。
-- **跨运行非确定性**：mergeTable 走 Qwen-VL 视觉裁决，同一输入两次跑出 100 / 102 items
-  不同结果（本轮把序号 10 续表 + 一条页眉清掉了，更优）。VL 裁决本质非确定，暂接受；
-  若要稳定可考虑对 mergeTable 判定加缓存或降温。
+- ~~**跨运行非确定性**：mergeTable 走 Qwen-VL 视觉裁决，同一输入两次跑出 100 / 102 items
+  不同结果~~ ✅（2026-06-13，见上⑨）：根因不是「VL 本质非确定」，而是 `temperature:0` 在
+  DashScope **开区间 (0,2)** 外被静默忽略 → 回落默认采样。加 `top_k:1` 贪婪解码后钉死。
+  回归实测：003（mergeTable×2，正是当年 100/102 漂移的那份）旧码→新码逐字节无差异。
+  **走降温/贪婪解决，未加缓存。**
+- **文本侧（DeepSeek）抖动仍在**（与上条独立）：DeepSeek 走 tool-call 路径，虽 temperature
+  已 0，但偶发 `llm_no_tool_call` / 轮次耗尽会让某疑点这轮落、下轮不落。JZY 真 LLM 两跑
+  实测 4 处差异（2 改进：多 drop 一页眉、demote 一伪标题；2 回归：衍字「的的」未删、
+  「附件3/编制人」caption 残留回潮）。`top_k` 治不到（病灶是模型不调工具，非采样温度）。
+  待议——若要稳，方向是 tool_choice=required 兜底 / 搁置项二次重试，不属本次范围。
 
 ## 5. 第二轮复查（2026-06-12，通读三份 refined full.md 全文）
 
@@ -162,19 +177,50 @@ table_caption 数组、「4.7公司十大核心指标」塞进了十大指标表
 
 ### 5.4 其余残留（待办，未排期）
 
-- **跨页续表碎片**（003 末尾：附件表第 10 项的 4 列碎片表 vs 3 列主表，含 `3）亻`）：
-  探测器有标（split_table 不要求列数相等），但 VL 裁决非确定（见「4. 观察」），
-  且列数不一致 + 烂行的合并正确性存疑。待跨运行稳定性方案一起看。
-- **同表双 OCR 副本**（JZY it_0586 干净表头版 + it_0587 乱码版连续两表）：
-  无现成信号（页码相同不触发 split_table），需「相邻表内容相似度」探测器。
+- ~~**跨页续表碎片**~~ ✅（2026-06-13，调查澄清——无需改代码）：原顾虑「VL 判 merge 后 ops 层
+  并列错位会不会更糟」已证伪。**合并本就在跑且已落地**：迭代循环先 drop 掉空壳表（it100/p7）和
+  泄漏成 text 的跑马灯页眉（it104/p8「真诺测量仪表…版本 K-」），随后主表（it96/p6，3 列）与碎片
+  （it105/p8，4 列）结构相邻 → split_table 触发 → VL 判 merge → 主表 10 行长到 14 行落地
+  （refined report `mergeTable:2`，`violations:0`）。**错位只在尾部 4 行**（序号9 续行 + 序号10，
+  因续表页被 OCR 把"输入信息"列重切成"子编号+内容"两列，行内列数 4/4/2/2），**前 9 行干净 3 列零损**。
+  对照「不合并」的替代（干净主表 + 末尾孤立乱码碎片表），合并反而把序号10 留在了它的表里、内容
+  更完整——**不会更糟，反而更好**。
+  - **机械无法安全修齐**：试过「后块列数 > 前块就拒合」等闸，全被已固化的合法用例反例否决——
+    `ops_test::ragged_merge_2col_plus_3col_no_padding_invented`（A 尾空列被 MinerU 略去看着像 2 列、
+    B 带全 3 列，B 列数 > A 但合并正确）+ `rowspan_carryover_with_unequal_columns_merges`（rowspan
+    跨页携带让 A 内部参差且合法）。列数信号区分不了「OCR 重切列(该拒)」与「尾空列略去/rowspan携带
+    (该合)」。唯一能真正修齐的是重型 VL 跨行跨页重折叠，且要打破 mergeTable 逐字节保真闸，性价比极低。
+  - 项目哲学明确「绝不发明空单元格去对齐」（`ops_test::padded_repair_attempt_fails_row_level_gate`），
+    保留即正确。已加回归 `ops_test::cross_page_fragment_resplit_columns_merges_byte_faithful`
+    用 003 真实碎片 body 锁定「干净行零损 + 参差行原样 + 不发明空格 + 过行级保真闸」当前行为。
+  - 碎片内乱码（`3）亻`/`2 3)`/`有效 性`）是另一回事，归 opt-in 的 `rewriteGarbledTables`/
+    `degradeGarbledTables`，不属本项。
+- ~~**同表双 OCR 副本**~~ ❌（2026-06-13，调查后明确排除，见「不做」清单）：渲染 origin.pdf
+  p45 后真相与原诊断相反——**不是 OCR 把同一表拍两遍，而是源文档作者主动画了两份**
+  （上：带深蓝标题栏「竞争分析表-通过学习和打击抢夺机会」的品牌样式展示版 it_0586；
+  下：待填写的大号纯网格版 it_0587，OCR 表头带噪声且把后文「2、竞争分析表的 SWOT 输出」
+  抓成 footnote）。两份都是同一张空模板。删一份属"替作者改稿"，碰保真红线。
 - **公式碎裂进多格**（JZY 判断矩阵表尾 `一-致性检验：/CI/λmax-/=8.45-8=0.0/645`）：
   跨格重组超出现有 op 能力（cell 级只有整格重转写），搁置。
 - **colspan 文本拆裂**（047「批准|表」横拆、「公司核心/指标」竖拆）：
   机械判定「两格拼起来是词而各自不是」可做但收益小，观察。
-- **dismissed 明细不进 report**：36 次 dismiss（JZY）只有计数没有(疑点,理由)明细，
-  优化收敛成本先要这个——可观测性补齐，低成本高价值。
-- **页眉残留漏删一处**（JZY full.md:549「附件3：…」+「编制人：张威」）：同文 3 处
-  已 drop、此处漏。0.11 已有同文组联合裁决，待重跑验证是否已根治。
+- ~~**dismissed 明细不进 report**~~ ✅：已补 `report.dismissedSuspects[]`，逐条展开
+  `dismissed` 计数——每条带 `kind`/`itemId`/`reason`（llm_dismiss / max_rounds_exhausted /
+  vision_unavailable / llm_no_tool_call / llm_error）/`detail`（LLM 一句话理由或错误信息）/
+  `evidence`（探测器原始证据）。关 flag 无关恒输出，无搁置时缺省、序列化与旧版逐字节兼容。
+- ~~**页眉家具被吞进 table_caption**~~ ✅（JZY full.md:549「附件3：…」+「编制人：张威」）：
+  ~~同文 3 处已 drop、此处漏，待同文组联合裁决根治~~ —— 2026-06-13 重跑验证，**原诊断错误**。
+  真相：泄漏成 text 的 4 处「附件3」已全 drop（it_0329/0363/0370/0376）；残留这处是
+  MinerU 把页眉「附件3：…」+页脚「编制人：张威」误塞进了 page25「细分市场」跨页表片段的
+  `table_caption`（输入 seq326 caption 非空），`mergeTable` 跨页合并时按「B 的 caption 字符
+  不许丢」（ops.rs:208）忠实拼接保留，渲染器输出 caption → 残留。两个探测器都看不到它：
+  `page_artifact` 只扫 item 文本、不扫 caption 数组；`caption_heading` 只认编号小节标题形状、
+  不认「附件3/编制人」这类家具。
+  **修复（2026-06-13）**：新增 `caption_artifact` 探测器——复用 page_artifact 的家具同文佐证
+  （≥2 处 header/footer 同文）/全文高频重复信号扫 `table_caption` 数组，命中交 LLM 裁决
+  → 新增 `dropCaption(id, captionIndex)` op（纯削减、留痕、白名单 `droppable_caption_ids` 双保险）
+  或 dismiss。真 LLM 重跑：`dropCaption×2` 落地、549/551 残留清零、正文引用（131 行）保留、
+  细分市场表 caption=[]、violations=0、failOpen=false、table_body 逐字节不变。
 
 ## 不做（明确排除）
 
@@ -188,3 +234,8 @@ table_caption 数组、「4.7公司十大核心指标」塞进了十大指标表
   两步且切分点只能 LLM 判，同级 2）~5）已是标题、此处渲染为段落语义无损，不值得
 - **源文档自身的内容错误**（JZY「波特五力」正文把五力写成「买方/卖方议价」重复、
   章节编号 3→5 跳号）：保真原则下不替作者改稿
+- **同表双副本去重**（JZY p45「竞争分析表」it_0586 样式展示版 + it_0587 待填写网格版）：
+  曾误判为「同表双 OCR 副本」立项，渲染 origin.pdf 后确认是**源文档作者主动画了两份同一空模板**
+  （品牌标题展示版 + 大号填写网格版），非 OCR 重复检测。删一份 = 替作者改稿，同上条红线。
+  两份都是空模板、单文档单次、价值有限，且任何「相邻近重复表」探测器都有误删合法相似表的
+  数据丢失风险。下游若嫌冗余，自行过滤即可

@@ -629,6 +629,48 @@ pub fn detect(items: &[RefItem]) -> Vec<WorkItem> {
             }
         }
 
+        // ── 被吞进 table_caption 的页眉/页脚家具（→ dropCaption）：caption 条目的非空白文本
+        // 与已正确分类的 header/footer 同文（≥2 处佐证），或全文高频重复（≥3 页）。MinerU 把
+        // 跑马灯页眉/页脚塞进了跨页表片段的 caption，mergeTable 又忠实保留 → 渲染成残留。
+        // 真实数据：JZY-001「附件3：…」页眉 + 「编制人：张威」页脚被吞进「细分市场」表 caption。
+        // page_artifact 探测器只扫 item 文本、不扫 caption 数组，caption_heading 只认编号标题，
+        // 二者都漏。每表只标首个命中条目：删掉后下一轮迭代再标剩余的，loop 自然收敛。──
+        if item.item_type() == "table"
+            && let Some(captions) = item.str_array("table_caption")
+        {
+            for (ci, cap) in captions.iter().enumerate() {
+                let key = non_ws(cap);
+                if key.is_empty() {
+                    continue;
+                }
+                let corrob = corroborated.contains(&key.as_str());
+                let repeated = repeated_texts.contains(cap.trim());
+                if !corrob && !repeated {
+                    continue;
+                }
+                let evidence = if corrob {
+                    format!(
+                        "table_caption[{ci}]「{}」与已分类页眉/页脚同文（{}×{}处家具佐证），\
+                         疑似被吞进 caption 的页面家具。确认是家具 → dropCaption(captionIndex={ci})；\
+                         确认是真表格题注 → dismiss",
+                        cap.trim(),
+                        key,
+                        furniture_counts.get(&key).copied().unwrap_or(0),
+                    )
+                } else {
+                    format!(
+                        "table_caption[{ci}]「{}」是高频重复短文本（出现于 {} 个不同页），\
+                         疑似被吞进 caption 的页眉/页脚/水印。确认是家具 → dropCaption(captionIndex={ci})；\
+                         确认是真表格题注 → dismiss",
+                        cap.trim(),
+                        text_pages.get(cap.trim()).map(|p| p.len()).unwrap_or(0),
+                    )
+                };
+                out.push(suspect(SuspectKind::CaptionArtifact, id, evidence, true));
+                break;
+            }
+        }
+
         // ── caption 与表格被标题隔开（→ reorder）：caption 样短文本后紧跟一个标题
         //（或漏标标题候选），标题后紧跟有体表格 → 三块顺序疑似错排。──
         if item.item_type() == "text" && item.text_level().is_none() && caption_like(text) {
@@ -803,6 +845,15 @@ pub fn droppable_ids(worklist: &[WorkItem]) -> HashSet<String> {
     worklist
         .iter()
         .filter(|w| matches!(w.kind, SuspectKind::PageArtifact | SuspectKind::EmptyTable))
+        .map(|w| w.item_id.clone())
+        .collect()
+}
+
+/// 当前被标为 caption_artifact 的表格 id 集（dropCaption 白名单的第二道保险）。
+pub fn droppable_caption_ids(worklist: &[WorkItem]) -> HashSet<String> {
+    worklist
+        .iter()
+        .filter(|w| matches!(w.kind, SuspectKind::CaptionArtifact))
         .map(|w| w.item_id.clone())
         .collect()
 }

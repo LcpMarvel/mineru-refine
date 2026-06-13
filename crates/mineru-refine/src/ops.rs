@@ -706,12 +706,71 @@ fn op_extract_caption(
     })
 }
 
+// ── dropCaption(id, captionIndex)：删掉 table_caption 里的某一条（被吞进 caption 的页眉/
+// 页脚家具）。纯削减：表格本体与其余 caption 原序保留；删掉的字符留痕于 removedSpans。
+// droppable_caption_ids 提供时 id 必须命中（双保险，禁止误删真题注）。──
+fn op_drop_caption(
+    items: &[RefItem],
+    id: &str,
+    caption_index: i64,
+    droppable_caption_ids: Option<&HashSet<String>>,
+) -> OpResult {
+    if let Some(allow) = droppable_caption_ids
+        && !allow.contains(id)
+    {
+        return Err(format!(
+            "dropCaption 被拒：{id} 未被探测器标为 caption_artifact（drop 白名单第二道保险）"
+        ));
+    }
+    let i = must_index_of_id(items, id)?;
+    let it = &items[i].item;
+    if it.item_type() != "table" {
+        return Err(format!(
+            "dropCaption 仅限 table 块（{id} 是 {}）",
+            it.item_type()
+        ));
+    }
+    let captions = it.str_array("table_caption").unwrap_or_default();
+    if caption_index < 0 || caption_index as usize >= captions.len() {
+        return Err(format!(
+            "dropCaption captionIndex 越界：{caption_index}（{id} 共 {} 条 caption）",
+            captions.len()
+        ));
+    }
+    let entry = captions[caption_index as usize].to_string();
+
+    let mut table = it.clone();
+    let remaining: Vec<Value> = captions
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| *k != caption_index as usize)
+        .map(|(_, s)| Value::String(s.to_string()))
+        .collect();
+    table.set("table_caption", Value::Array(remaining));
+
+    let mut out: Vec<RefItem> = items.to_vec();
+    out[i] = RefItem {
+        id: id.to_string(),
+        item: table,
+    };
+    Ok(OpOutcome {
+        items: out,
+        removed_spans: vec![RemovedSpan {
+            item_id: id.to_string(),
+            text: entry,
+            reason: "dropCaption:page_artifact".into(),
+        }],
+    })
+}
+
 // ── 调度 + 保真闸 ──
 
 pub struct ApplyContext<'a> {
     pub next_id: &'a IdGen,
     /// 探测器当前标记为 page_artifact/empty_table 的 id 集；提供时 drop 必须命中（双保险）。
     pub droppable_ids: Option<&'a HashSet<String>>,
+    /// 探测器当前标记为 caption_artifact 的 id 集；提供时 dropCaption 必须命中（双保险）。
+    pub droppable_caption_ids: Option<&'a HashSet<String>>,
     /// 输入文档的页集合（几何校验基准）。
     pub valid_pages: &'a HashSet<i64>,
 }
@@ -758,6 +817,9 @@ pub fn apply_op_checked(items: &[RefItem], call: &OpCall, ctx: &ApplyContext) ->
             position,
             level,
         } => op_extract_caption(items, ctx.next_id, id, *caption_index, *position, *level),
+        OpCall::DropCaption { id, caption_index } => {
+            op_drop_caption(items, id, *caption_index, ctx.droppable_caption_ids)
+        }
     };
     let outcome = match outcome {
         Ok(o) => o,

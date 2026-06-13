@@ -352,6 +352,7 @@ async fn refine_inner(
             iterations: loop_result.iterations,
             op_counts,
             dismissed: loop_result.dismissed,
+            dismissed_suspects: loop_result.dismissed_suspects,
             removed_spans,
             violations: loop_result.violations,
             token_usage,

@@ -3,7 +3,7 @@
 mod common;
 
 use common::{bbox, golden_input, items_of, mi};
-use mineru_refine::detect::{detect, droppable_ids};
+use mineru_refine::detect::{detect, droppable_caption_ids, droppable_ids};
 use mineru_refine::id::assign_ids;
 use mineru_refine::types::{MineruItem, SuspectKind, WorkItem};
 use serde_json::json;
@@ -91,6 +91,44 @@ fn leaked_page_number_in_text_enters_droppable_ids() {
     )]);
     assert_eq!(wl[0].kind, SuspectKind::PageArtifact);
     assert!(droppable_ids(&wl).contains("it_0001"));
+}
+
+#[test]
+fn furniture_swallowed_into_table_caption_is_caption_artifact() {
+    // MinerU 把跑马灯页眉「附件3：…」+页脚「编制人：张威」塞进了「细分市场」表的 caption；
+    // 同文已在别处被正确分类为 header/footer（≥2 处佐证）→ 应标 CaptionArtifact（带 op）。
+    let wl = detect_of(&items_of(json!([
+        { "type": "header", "text": "附件3：战略管理之“看市场和客户”", "page_idx": 24, "bbox": bbox(10) },
+        { "type": "footer", "text": "编制人：张威", "page_idx": 24, "bbox": bbox(800) },
+        { "type": "header", "text": "附件3：战略管理之“看市场和客户”", "page_idx": 25, "bbox": bbox(10) },
+        { "type": "footer", "text": "编制人：张威", "page_idx": 25, "bbox": bbox(800) },
+        { "type": "table", "table_body": T1,
+          "table_caption": ["附件3：战略管理之“看市场和客户”", "编制人：张威"],
+          "page_idx": 26, "bbox": bbox(100) },
+    ])));
+    let ca: Vec<_> = wl
+        .iter()
+        .filter(|w| w.kind == SuspectKind::CaptionArtifact)
+        .collect();
+    // 每表只标首个命中条目（captionIndex=0），删后下一轮再标剩余的
+    assert_eq!(ca.len(), 1);
+    assert_eq!(ca[0].item_id, "it_0005");
+    assert!(ca[0].has_op);
+    assert!(ca[0].evidence.contains("captionIndex=0"));
+    assert!(ca[0].evidence.contains("家具佐证"));
+    assert!(droppable_caption_ids(&wl).contains("it_0005"));
+}
+
+#[test]
+fn real_table_caption_is_not_caption_artifact() {
+    // 真表格题注（无家具佐证、不高频重复）不该被误标。
+    let wl = detect_of(&items_of(json!([
+        { "type": "table", "table_body": T1, "table_caption": ["表1 年度战略安排"], "page_idx": 0, "bbox": bbox(0) },
+    ])));
+    assert!(
+        !wl.iter().any(|w| w.kind == SuspectKind::CaptionArtifact),
+        "真题注被误标为 caption_artifact"
+    );
 }
 
 // ── 跨页拆表/拆列表/空壳表（hasOp）与空 caption（仅标记）──

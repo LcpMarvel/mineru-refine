@@ -20,6 +20,8 @@ MinerU 把 PDF 解析成 `content_list.json`——一个 item 对象数组,每�
   全文频率投票直接改写少数派
 - **被吞进表格题注的小节标题**——MinerU 把「4.6 核心组织绩效的应用」塞进相邻表格的
   `table_caption`，渲染后貌似漏升级标题，实为结构错位
+- **被吞进表格题注的页眉/页脚家具**——MinerU 把跑马灯页眉「附件3：…」、页脚「编制人：张威」
+  塞进跨页表片段的 `table_caption`，`mergeTable` 又忠实保留，渲染成残留（靠同文家具佐证识别后删掉）
 
 其中无歧义的表格噪声与频率投票由**机械清洗 pass**（确定性代码、自带校验、不打 LLM）
 直接处理，其余疑点交 LLM 裁决。
@@ -132,6 +134,7 @@ HTTP 模式下该目录须与 server 共享文件系统。
 | `report.iterations` | 修复循环实际轮数 |
 | `report.opCounts` | 各修复操作的执行次数 |
 | `report.dismissed` | 被裁定为误报(或被搁置)的疑点数 |
+| `report.dismissedSuspects` | `dismissed` 计数的逐条明细:每条带 `kind`(探测器类别) / `itemId` / `reason`(搁置类别:`llm_dismiss` LLM 主动判误报 / `max_rounds_exhausted` 轮数耗尽 / `vision_unavailable` split_table 无图可裁 / `llm_no_tool_call` / `llm_error` 调用重试耗尽) / `detail`(LLM 一句话理由或错误信息,可空) / `evidence`(探测器原始证据)。用于离线复盘「为什么没修」并据此调探测器/prompt;无搁置时缺省 |
 | `report.removedSpans` | 删除留痕:每段被删内容的 itemId / 原文 / 原因,逐条可审计 |
 | `report.violations` | 保真闸回滚次数(修复产物违反保真被自动撤销) |
 | `report.tokenUsage` | LLM token 消耗 |
@@ -283,11 +286,12 @@ HTML 标签骨架在构造上不可触碰(替换只发生在单元格内层区�
 | `trailing_marker` 段尾粘连节标记 | 段尾粘了「[相关文件]」类独立结构块(跨页 merge 吸入) | `split` |
 | `separated_caption` caption 错序 | caption 样短文本与表格之间隔着一个标题块 | `reorder` |
 | `caption_heading` 被吞标题 | `table_caption` 条目是带编号的标题样短文本,且存在相邻的同级编号标题兄弟(MinerU 把小节标题塞进了表格题注) | `extractCaption` |
+| `caption_artifact` 被吞家具 | `table_caption` 条目与已分类的 `header`/`footer` 同文(≥2 处佐证)或全文高频重复——MinerU 把跑马灯页眉/页脚塞进了表格题注,`mergeTable` 又忠实保留,渲染成残留 | `dropCaption` |
 | `extra_char` 赘字/衍字 | 功能词叠字(的的/地地/是是/了了,合法叠词除外)、孤立偏旁部首(「3)亻」) | `deleteChar` |
 
 **只标记、无修复操作**(LLM 只能判误报,计入 report 供观测):孤儿/空 caption(`caption_issue`)。
 
-### 修复操作集(11 个削减/重组 + dismiss)
+### 修复操作集(12 个削减/重组 + dismiss)
 
 全部是纯函数 `(items, args) -> items`,自带保真校验,违反即回滚并计入 `report.violations`。
 
@@ -304,6 +308,7 @@ HTML 标签骨架在构造上不可触碰(替换只发生在单元格内层区�
 | `mergeTable(idA, idB)` | 跨页拆表合并:B 的 `<tr>` 行**原字节**追加到 A 末行后,caption/footnote 拼接;B 首行与 A 表头逐字节相同时(每页重印表头)去重并留痕 | bbox 并集;page_idx 取首块 |
 | `mergeList(idA, idB, joinSeam?)` | 跨页拆列表合并:`list_items` 拼接;`joinSeam` 把 A 尾项与 B 首项缝成一项(断句跨页) | bbox 并集;page_idx 取首块 |
 | `extractCaption(id, captionIndex, position, level?)` | 把被吞进 `table_caption` 的小节标题抽出为独立 text 块(字符纯移动),插在表格前/后;`level` 给则直接设 `text_level` | 新块继承表格 bbox/page_idx |
+| `dropCaption(id, captionIndex)` | 删掉 `table_caption` 里被吞进的页眉/页脚家具条目(纯削减,表格本体与其余 caption 不动,留痕 `removedSpans`);须命中 `caption_artifact` 白名单 | 不变 |
 | `dismiss(id, reason)` | 裁定误报,不改文本;重新探测时不再标记它 | — |
 
 `mergeTable` **不做列对齐判断,也不做列对齐修复**:"是否同一张表"由模型看内容裁决
@@ -441,7 +446,7 @@ crates/mineru-refine/            # Rust core
   src/id.rs                      #   内部稳定 ID(出口剥除,绝不进输出 schema)
   src/detect.rs                  #   确定性异常探测器 → 疑点队列
   src/mechanical.rs              #   机械清洗 pass(表格噪声 + 频率投票,确定性、不打 LLM)
-  src/ops.rs                     #   11 个削减/重组操作 + 保真闸 + 回滚
+  src/ops.rs                     #   12 个削减/重组操作 + 保真闸 + 回滚
   src/extrachar.rs               #   赘字/衍字白名单(deleteChar 的准入)
   src/invariant.rs               #   保真 / table_body / 几何校验
   src/confusion.rs               #   混淆修正层(opt-in,fixOcrConfusion)

@@ -555,6 +555,12 @@ async fn vision_dismiss_counts_into_dismissed() {
         2
     );
     assert_eq!(r.report.dismissed, 1);
+    // 视觉裁决的自由文本依据落进明细，可离线复盘「为什么没合」
+    assert_eq!(r.report.dismissed_suspects.len(), 1);
+    let d = &r.report.dismissed_suspects[0];
+    assert_eq!(d.kind, "split_table");
+    assert_eq!(d.reason, "llm_dismiss");
+    assert_eq!(d.detail, "两张不同的表");
 }
 
 #[tokio::test]

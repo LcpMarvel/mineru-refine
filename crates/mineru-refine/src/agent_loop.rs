@@ -2,14 +2,16 @@
 // LLM 回一个 op 或 dismiss → 执行（保真闸+回滚）→ 重探测。loop-until-dry + 守卫。
 // LLM 不当司机：每个疑点一个独立小对话，工具集固定，tool_choice:required。
 
-use crate::detect::{NumStyle, detect, droppable_ids, parse_numbering};
+use crate::detect::{NumStyle, detect, droppable_caption_ids, droppable_ids, parse_numbering};
 use crate::id::{IdGen, index_of_id, must_index_of_id};
 use crate::invariant::{input_pages, table_rows};
 use crate::llm::{
     ChatClient, LlmError, LoadImage, Message, ToolCall, VisionClient, parse_json_safe,
 };
 use crate::ops::{ApplyContext, ApplyResult, RejectKind, apply_op_checked};
-use crate::types::{OpCall, RefItem, RemovedSpan, StripPattern, SuspectKind, TokenUsage, WorkItem};
+use crate::types::{
+    DismissedSuspect, OpCall, RefItem, RemovedSpan, StripPattern, SuspectKind, TokenUsage, WorkItem,
+};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -27,6 +29,7 @@ pub struct LoopResult {
     pub iterations: u64,
     pub op_counts: BTreeMap<String, u64>,
     pub dismissed: u64,
+    pub dismissed_suspects: Vec<DismissedSuspect>,
     pub removed_spans: Vec<RemovedSpan>,
     pub violations: u64,
     pub token_usage: TokenUsage,
@@ -192,6 +195,15 @@ static TOOLS: LazyLock<Value> = LazyLock::new(|| {
                 "reason": reason_param.clone(),
             }, "required": ["id", "captionIndex", "position"] },
         }},
+        { "type": "function", "function": {
+            "name": "dropCaption",
+            "description": "删掉 table_caption 数组里的某一条——专用于被 MinerU 吞进 caption 的页眉/页脚家具（如跑马灯页眉、「编制人：X」页脚）。纯削减，表格本体与其余 caption 不动。仅当该条目确为页面家具（疑点证据给出「同文已分类为 header/footer 佐证」或「全文高频重复」）时用；若是真表格题注 → dismiss。",
+            "parameters": { "type": "object", "properties": {
+                "id": id_param,
+                "captionIndex": { "type": "integer", "description": "待删条目在 table_caption 数组中的下标（疑点证据中给出）" },
+                "reason": reason_param.clone(),
+            }, "required": ["id", "captionIndex"] },
+        }},
     ])
 });
 
@@ -200,7 +212,7 @@ pub fn tools() -> &'static Value {
     &TOOLS
 }
 
-const OP_NAMES: [&str; 10] = [
+const OP_NAMES: [&str; 11] = [
     "merge",
     "split",
     "demote",
@@ -211,6 +223,7 @@ const OP_NAMES: [&str; 10] = [
     "deleteChar",
     "mergeList",
     "extractCaption",
+    "dropCaption",
 ];
 const OBSERVE_NAMES: [&str; 4] = ["outline", "getItems", "whyFlagged", "peekPage"];
 
@@ -495,6 +508,10 @@ fn to_op_call(name: &str, args: &Value) -> Result<OpCall, String> {
                 level: args.get("level").and_then(Value::as_i64),
             })
         }
+        "dropCaption" => Ok(OpCall::DropCaption {
+            id: arg_str(args, "id"),
+            caption_index: int_of("captionIndex")?,
+        }),
         _ => Err(format!("未知 op: {name}")),
     }
 }
@@ -708,6 +725,7 @@ fn apply_op_call(
         return Err(format!("被拒（{banned}）。请 dismiss 或换别的 op。"));
     }
     let droppable = droppable_ids(worklist);
+    let droppable_captions = droppable_caption_ids(worklist);
     let mut items = state.lock().unwrap();
     if let OpCall::Promote { id, level } = &op_call
         && let Some(exp) = expected_heading_level(&items, id)
@@ -728,6 +746,7 @@ fn apply_op_call(
             next_id: &ctx.next_id,
             valid_pages: &ctx.valid_pages,
             droppable_ids: Some(&droppable),
+            droppable_caption_ids: Some(&droppable_captions),
         },
     ) {
         ApplyResult::Ok {
@@ -804,6 +823,8 @@ enum SuspectOutcome {
     },
     Dismissed {
         reason: &'static str,
+        /// 自由文本依据（LLM 的一句话理由 / 视觉裁决依据）；无则空串。
+        detail: String,
         violations: u64,
     },
 }
@@ -826,6 +847,7 @@ pub async fn run_loop(
     // invalid_args，作为工具结果反馈给 LLM，由它改判或 dismiss。
     let state: Arc<Mutex<Vec<RefItem>>> = Arc::new(Mutex::new(initial));
     let mut dismissed_keys: HashSet<String> = HashSet::new(); // 误报裁决集（防永不终止）
+    let mut dismissed_suspects: Vec<DismissedSuspect> = Vec::new(); // 上集的逐条明细（顺序即裁决序）
     let ctx = Arc::new(SuspectCtx {
         next_id,
         valid_pages,
@@ -929,7 +951,15 @@ pub async fn run_loop(
                         "疑点 {} LLM 调用失败，搁置: {e}",
                         suspect_key(&target)
                     ));
-                    dismissed_keys.insert(suspect_key(&target));
+                    if dismissed_keys.insert(suspect_key(&target)) {
+                        dismissed_suspects.push(DismissedSuspect {
+                            kind: target.kind.as_str().into(),
+                            item_id: target.item_id.clone(),
+                            reason: "llm_error".into(),
+                            detail: e.0.clone(),
+                            evidence: target.evidence.clone(),
+                        });
+                    }
                     llm_errors.push(e);
                 }
                 Ok(outcome) => {
@@ -944,10 +974,19 @@ pub async fn run_loop(
                         }
                         SuspectOutcome::Dismissed {
                             reason,
+                            detail,
                             violations: v,
                         } => {
                             // dismiss（LLM 主动 / 轮数耗尽 / op 被闸门回滚后放弃）→ 计入裁决集，重探测不再标记
-                            dismissed_keys.insert(suspect_key(&target));
+                            if dismissed_keys.insert(suspect_key(&target)) {
+                                dismissed_suspects.push(DismissedSuspect {
+                                    kind: target.kind.as_str().into(),
+                                    item_id: target.item_id.clone(),
+                                    reason: reason.into(),
+                                    detail,
+                                    evidence: target.evidence.clone(),
+                                });
+                            }
                             violations += v;
                             if reason != "llm_dismiss" {
                                 log(&format!("疑点 {} 强制搁置: {reason}", suspect_key(&target)));
@@ -975,6 +1014,7 @@ pub async fn run_loop(
         iterations,
         op_counts,
         dismissed: dismissed_keys.len() as u64,
+        dismissed_suspects,
         removed_spans,
         violations,
         token_usage: TokenUsage {
@@ -1044,6 +1084,7 @@ async fn try_vision_verdict(
         ));
         return Some(SuspectOutcome::Dismissed {
             reason: "llm_dismiss",
+            detail: v.reason.clone(),
             violations: 0,
         });
     }
@@ -1061,6 +1102,7 @@ async fn try_vision_verdict(
             next_id: &ctx.next_id,
             valid_pages: &ctx.valid_pages,
             droppable_ids: Some(&droppable),
+            droppable_caption_ids: None,
         },
     );
     match result {
@@ -1130,6 +1172,7 @@ async fn handle_suspect(
         let vision_outcome = try_vision_verdict(target, state, worklist, ctx).await;
         return Ok(vision_outcome.unwrap_or(SuspectOutcome::Dismissed {
             reason: "vision_unavailable",
+            detail: String::new(),
             violations: 0,
         }));
     }
@@ -1204,6 +1247,7 @@ async fn handle_suspect(
         let Some(calls) = r.message.tool_calls.filter(|c| !c.is_empty()) else {
             return Ok(SuspectOutcome::Dismissed {
                 reason: "llm_no_tool_call",
+                detail: String::new(),
                 violations: violation_count,
             });
         };
@@ -1300,6 +1344,7 @@ async fn handle_suspect(
                 ));
                 return Ok(SuspectOutcome::Dismissed {
                     reason: "llm_dismiss",
+                    detail: reason.to_string(),
                     violations: violation_count,
                 });
             }
@@ -1342,6 +1387,7 @@ async fn handle_suspect(
 
     Ok(SuspectOutcome::Dismissed {
         reason: "max_rounds_exhausted",
+        detail: String::new(),
         violations: violation_count,
     })
 }
@@ -1529,6 +1575,7 @@ async fn handle_group(
                     pending.remove(k),
                     SuspectOutcome::Dismissed {
                         reason: "llm_dismiss",
+                        detail: reason.to_string(),
                         violations: std::mem::take(&mut violation_count),
                     },
                 ));
@@ -1603,6 +1650,7 @@ async fn handle_group(
             w,
             SuspectOutcome::Dismissed {
                 reason: "max_rounds_exhausted",
+                detail: String::new(),
                 violations: std::mem::take(&mut violation_count),
             },
         ));

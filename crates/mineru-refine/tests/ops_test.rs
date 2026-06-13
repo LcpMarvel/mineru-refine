@@ -21,6 +21,7 @@ impl Setup {
         ApplyContext {
             next_id: &self.next_id,
             droppable_ids: None,
+            droppable_caption_ids: None,
             valid_pages: &self.valid_pages,
         }
     }
@@ -292,6 +293,7 @@ fn drop_must_hit_droppable_ids_when_provided() {
     let ctx = ApplyContext {
         next_id: &s.next_id,
         droppable_ids: Some(&empty),
+        droppable_caption_ids: None,
         valid_pages: &s.valid_pages,
     };
     assert!(is_rejected(
@@ -449,6 +451,7 @@ fn geometry_gate_rolls_back_any_op() {
     let ctx = ApplyContext {
         next_id: &s.next_id,
         droppable_ids: None,
+        droppable_caption_ids: None,
         valid_pages: &other_pages,
     };
     match apply_op_checked(
@@ -563,6 +566,103 @@ fn form_reference_in_angle_brackets_not_stripped() {
         OpCall::Strip {
             id: "it_0001".into(),
             pattern: StripPattern::HtmlTag
+        },
+        &s.ctx()
+    ));
+}
+
+// ── dropCaption（删掉被吞进 caption 的页眉/页脚家具）──
+
+#[test]
+fn drop_caption_removes_entry_keeps_body_and_trails() {
+    let s = setup(&items_of(json!([
+        { "type": "table",
+          "table_body": "<table><tbody>\n<tr><td>甲</td></tr>\n</tbody></table>",
+          "table_caption": ["附件3：战略管理之“看市场和客户”", "编制人：张威"],
+          "page_idx": 0, "bbox": bbox(100) },
+    ])));
+    let body_before = s.ref_items[0].item.table_body().unwrap().to_string();
+    let r = must_apply(
+        &s.ref_items,
+        OpCall::DropCaption {
+            id: "it_0001".into(),
+            caption_index: 0,
+        },
+        &s.ctx(),
+    );
+    assert_eq!(r.items[0].id, "it_0001"); // 表格继承原 ID
+    let t = &r.items[0].item;
+    assert_eq!(t.0["table_caption"], json!(["编制人：张威"])); // 其余 caption 原序保留
+    assert_eq!(t.table_body().unwrap(), body_before); // 表格本体逐字节不动
+    assert_eq!(
+        spans_json(&r.removed_spans),
+        json!([span(
+            "it_0001",
+            "附件3：战略管理之“看市场和客户”",
+            "dropCaption:page_artifact"
+        )])
+    );
+}
+
+#[test]
+fn drop_caption_must_hit_droppable_caption_ids_when_provided() {
+    let s = setup(&items_of(json!([
+        { "type": "table", "table_body": "<table><tbody><tr><td>x</td></tr></tbody></table>",
+          "table_caption": ["编制人：张威"], "page_idx": 0, "bbox": bbox(0) },
+    ])));
+    let empty: HashSet<String> = HashSet::new();
+    let denied = ApplyContext {
+        next_id: &s.next_id,
+        droppable_ids: None,
+        droppable_caption_ids: Some(&empty),
+        valid_pages: &s.valid_pages,
+    };
+    assert!(is_rejected(
+        &s.ref_items,
+        OpCall::DropCaption {
+            id: "it_0001".into(),
+            caption_index: 0,
+        },
+        &denied
+    ));
+    let allowed: HashSet<String> = HashSet::from(["it_0001".to_string()]);
+    let allowed_ctx = ApplyContext {
+        next_id: &s.next_id,
+        droppable_ids: None,
+        droppable_caption_ids: Some(&allowed),
+        valid_pages: &s.valid_pages,
+    };
+    let r = must_apply(
+        &s.ref_items,
+        OpCall::DropCaption {
+            id: "it_0001".into(),
+            caption_index: 0,
+        },
+        &allowed_ctx,
+    );
+    assert_eq!(r.items[0].item.0["table_caption"], json!([]));
+}
+
+#[test]
+fn drop_caption_rejects_out_of_range_and_non_table() {
+    let s = setup(&items_of(json!([
+        { "type": "table", "table_body": "<table><tbody><tr><td>x</td></tr></tbody></table>",
+          "table_caption": ["编制人：张威"], "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "正文", "page_idx": 0, "bbox": bbox(50) },
+    ])));
+    assert!(is_rejected(
+        &s.ref_items,
+        OpCall::DropCaption {
+            id: "it_0001".into(),
+            caption_index: 5,
+        },
+        &s.ctx()
+    ));
+    assert!(is_rejected(
+        &s.ref_items,
+        OpCall::DropCaption {
+            id: "it_0002".into(),
+            caption_index: 0,
         },
         &s.ctx()
     ));
@@ -891,6 +991,7 @@ fn drop_husk_must_hit_droppable_ids_when_provided() {
     let denied_ctx = ApplyContext {
         next_id: &s.next_id,
         droppable_ids: Some(&empty),
+        droppable_caption_ids: None,
         valid_pages: &s.valid_pages,
     };
     assert!(is_rejected(
@@ -904,6 +1005,7 @@ fn drop_husk_must_hit_droppable_ids_when_provided() {
     let allowed_ctx = ApplyContext {
         next_id: &s.next_id,
         droppable_ids: Some(&allowed),
+        droppable_caption_ids: None,
         valid_pages: &s.valid_pages,
     };
     assert!(!is_rejected(
@@ -1012,6 +1114,47 @@ fn rowspan_carryover_with_unequal_columns_merges() {
     );
     assert_eq!(merged.0["table_caption"], json!(["报告评分表"]));
     // 行级保真：合并体能通过出口闸门
+    assert!(check_table_bodies(&[&a, &b], &[merged]).is_ok());
+}
+
+/// 回归锁定（TODO 5.4 第1项）：跨页续表碎片在续表页被 OCR 重切了列——主表 A 是干净
+/// 3 列（序号|输入信息|责任人），碎片 B 把"输入信息"列拆成多列且行内列数参差（4/4/2/2，
+/// 含 rowspan 序号行）。VL 正确判 merge 后，op 只接结构、按字节追加：A 的干净行零损、
+/// B 的参差行原样保留、绝不发明空格去对齐、过出口行级保真闸。
+/// 尾部"列错位"是源 OCR 自身拆列的忠实反映，机械无法安全修齐（修了会发明单元格 / 回归
+/// rowspan 携带的合法参差），故不修——保留即正确。详见 TODO「调查澄清」。
+#[test]
+fn cross_page_fragment_resplit_columns_merges_byte_faithful() {
+    // 真实形态取自 MN-ZBZ-003 附件评审输入表（序号9 续行 + 序号10）
+    let a = mi(json!({
+        "type": "table",
+        "table_body": "<table><tbody><tr><td>序号</td><td>输入信息</td><td>责任人</td></tr><tr><td>9</td><td>各信息系统安全运行情况;</td><td>IT经理</td></tr></tbody></table>",
+        "table_caption": ["管理评审输入信息及责任人规定"],
+        "page_idx": 6,
+        "bbox": [50, 100, 550, 800],
+    }));
+    // 碎片 B：B 的逐字节真实 body（4/4/2/2 列参差）
+    let b = mi(json!({
+        "type": "table",
+        "table_body": "<table><tr><td></td><td>3）亻</td><td>信息安全事故与故障的处理情况;</td><td></td></tr><tr><td rowspan=\"3\">10</td><td>1)</td><td>质量目标完成情况；</td><td rowspan=\"3\">各部门经理</td></tr><tr><td>2 3)</td><td>资源的需求;</td></tr><tr><td></td><td>应对风险和机遇所采取措施的有效 性；</td></tr></table>",
+        "table_caption": [],
+        "page_idx": 8,
+        "bbox": [50, 80, 550, 300],
+    }));
+    let r = merge2(a.clone(), b.clone());
+    let merged = &r.items[0].item;
+    let body = merged.table_body().unwrap();
+    // B 首行 4 列 ≠ A 首行 3 列 → 不触发重印表头去重，B 全部行追加
+    assert_eq!(
+        body,
+        "<table><tbody><tr><td>序号</td><td>输入信息</td><td>责任人</td></tr><tr><td>9</td><td>各信息系统安全运行情况;</td><td>IT经理</td></tr>\
+<tr><td></td><td>3）亻</td><td>信息安全事故与故障的处理情况;</td><td></td></tr>\
+<tr><td rowspan=\"3\">10</td><td>1)</td><td>质量目标完成情况；</td><td rowspan=\"3\">各部门经理</td></tr>\
+<tr><td>2 3)</td><td>资源的需求;</td></tr>\
+<tr><td></td><td>应对风险和机遇所采取措施的有效 性；</td></tr></tbody></table>"
+    );
+    assert!(r.removed_spans.is_empty()); // 列数不等 → 不去重、不削减
+    // 行级保真闸通过：合并体的每一行字节都来自 A∪B，无发明单元格
     assert!(check_table_bodies(&[&a, &b], &[merged]).is_ok());
 }
 

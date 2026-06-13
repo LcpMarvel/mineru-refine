@@ -298,6 +298,11 @@ impl ChatClient for DeepSeekClient {
 // ── Qwen-VL 裸 API 客户端 ──
 // DashScope OpenAI 兼容端点，仅做【判定类】视觉裁决——输出是决策（merge/dismiss），
 // 不是内容字符，不碰纯削减保真红线。
+//
+// 确定性约定：DashScope 的 temperature 有效区间是【开区间 (0,2)】，传 0 落在区间外会被
+// 静默忽略、回落默认采样（temp 0.8 / top_p 0.8）——这正是 mergeTable 跨运行 100/102 漂移
+// 的根因。真正的贪婪开关是 top_k=1（只取最高分 token，softmax 退化成确定性 argmax，温度
+// 从此不起作用）。两处 VL 调用都带 top_k=1，把视觉裁决钉成可复现。
 
 const QWEN_DEFAULT_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const QWEN_DEFAULT_MODEL: &str = "qwen-vl-max";
@@ -420,6 +425,7 @@ impl VisionClient for QwenVlClient {
         let body = serde_json::json!({
             "model": self.model,
             "temperature": 0,
+            "top_k": 1, // 贪婪解码：钉死视觉裁决，消除跨运行漂移（见本节确定性约定）
             "messages": [{
                 "role": "user",
                 "content": [
@@ -451,6 +457,7 @@ impl VisionClient for QwenVlClient {
         let body = serde_json::json!({
             "model": self.model,
             "temperature": 0,
+            "top_k": 1, // 贪婪解码：重转写逐单元格可复现（见本节确定性约定）
             "max_tokens": 4096,
             "messages": [{
                 "role": "user",

@@ -114,6 +114,9 @@ pub enum SuspectKind {
     /// 小节标题被 MinerU 吞进 table_caption（渲染成 caption 行，貌似漏 promote）
     /// → extractCaption / dismiss
     CaptionHeading,
+    /// 页眉/页脚家具被 MinerU 吞进 table_caption（同文已在别处被正确分类为 header/footer，
+    /// 或全文高频重复）。渲染器会输出 caption → 残留 → dropCaption / dismiss
+    CaptionArtifact,
     /// caption 与其表格之间隔了一个标题块（跨页/排版错序）→ reorder / dismiss
     SeparatedCaption,
     /// 疑似 OCR 赘字/衍字（功能词叠字/孤立偏旁，机械层拿不准的）→ deleteChar / dismiss
@@ -136,6 +139,7 @@ impl SuspectKind {
             SuspectKind::MissedHeading => "missed_heading",
             SuspectKind::TrailingMarker => "trailing_marker",
             SuspectKind::CaptionHeading => "caption_heading",
+            SuspectKind::CaptionArtifact => "caption_artifact",
             SuspectKind::SeparatedCaption => "separated_caption",
             SuspectKind::ExtraChar => "extra_char",
             SuspectKind::CaptionIssue => "caption_issue",
@@ -224,6 +228,12 @@ pub enum OpCall {
         position: ExtractPosition,
         level: Option<i64>,
     },
+    /// 删掉 table_caption 数组里的某一条（被吞进 caption 的页眉/页脚家具）。
+    /// 纯削减：表格本体与其余 caption 原序保留，留痕于 removedSpans。
+    DropCaption {
+        id: String,
+        caption_index: i64,
+    },
 }
 
 impl OpCall {
@@ -240,6 +250,7 @@ impl OpCall {
             OpCall::MergeTable { .. } => "mergeTable",
             OpCall::MergeList { .. } => "mergeList",
             OpCall::ExtractCaption { .. } => "extractCaption",
+            OpCall::DropCaption { .. } => "dropCaption",
         }
     }
 }
@@ -306,6 +317,27 @@ pub struct RemovedSpan {
     pub reason: String,
 }
 
+/// 一条被搁置/驳回（未落任何 op）的疑点明细。`dismissed` 计数的逐条展开，
+/// 用于离线复盘「为什么没修」并据此调探测器/prompt。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DismissedSuspect {
+    /// 探测器类别，如 "missed_heading"
+    pub kind: String,
+    pub item_id: String,
+    /// 搁置类别：llm_dismiss（LLM 主动判误报）/ max_rounds_exhausted（轮数耗尽）/
+    /// vision_unavailable（split_table 无图可裁）/ llm_no_tool_call（LLM 未给工具调用）/
+    /// llm_error（LLM 调用重试耗尽）
+    pub reason: String,
+    /// 自由文本依据：llm_dismiss 时是 LLM 给的一句话理由，llm_error 时是错误信息；
+    /// 其余类别可能为空。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    /// 探测器原始证据串（探测时记录的疑点依据），便于不回看输入即可复盘。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub evidence: String,
+}
+
 // ── 报告 ──
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -321,6 +353,10 @@ pub struct RefineReport {
     /// BTreeMap：序列化键序确定（幂等输出逐字节可比）。
     pub op_counts: BTreeMap<String, u64>,
     pub dismissed: u64,
+    /// `dismissed` 计数的逐条明细（kind/item/类别/理由/证据）。关 flag 无关，恒输出；
+    /// 无搁置时缺省，序列化与旧版逐字节兼容。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dismissed_suspects: Vec<DismissedSuspect>,
     pub removed_spans: Vec<RemovedSpan>,
     /// 保真闸回滚次数
     pub violations: u64,

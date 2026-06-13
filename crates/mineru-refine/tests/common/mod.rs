@@ -234,6 +234,18 @@ impl MockChat {
                     json!({ "id": id, "captionIndex": ci, "position": "after", "level": level }),
                 )
             }
+            SuspectKind::CaptionArtifact => {
+                let ci = CAPTION_INDEX_RE
+                    .captures(evidence)
+                    .and_then(|c| c[1].parse::<i64>().ok())
+                    .ok_or_else(|| {
+                        LlmError(format!("mock 无法从证据解析 captionIndex: {evidence}"))
+                    })?;
+                (
+                    "dropCaption".into(),
+                    json!({ "id": id, "captionIndex": ci }),
+                )
+            }
             SuspectKind::CaptionIssue => {
                 return Err(LlmError("mock 未定义 caption_issue 的处理".into()));
             }
