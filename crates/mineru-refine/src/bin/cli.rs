@@ -1,10 +1,11 @@
 // CLI transport（备选，首选是 HTTP）：stdin 收 JSON、stdout 回 JSON，subprocess 调用。
 // stdin 形如 { "items": [...], "sha256"?: "...", "maxIterations"?: n, "imageDir"?: "/abs/path",
 //              "fixOcrConfusion"?: bool, "extraConfusionPairs"?: ["0D", ...],
-//              "rewriteGarbledTables"?: bool }
+//              "rewriteGarbledTables"?: bool, "degradeGarbledTables"?: bool }
 // 或直接是 items 数组。imageDir 指向 MinerU 产物目录（含 images/），提供则启用视觉裁决。
 // fixOcrConfusion 开启 OCR 字符混淆修正层；rewriteGarbledTables 开启重度乱码表的
-// 视觉重转写层（需要 imageDir）——均 opt-in，见 lib 文档。
+// 视觉重转写层（需要 imageDir）；degradeGarbledTables 开启乱码表降级兜底
+//（重转写救不回 → 整项降级为 image，纯机械）——均 opt-in，见 lib 文档。
 //
 // 跑：  cat content_list.json | mineru-refine
 
@@ -59,6 +60,10 @@ async fn main() {
                 extra_confusion_pairs,
                 rewrite_garbled_tables: obj
                     .get("rewriteGarbledTables")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                degrade_garbled_tables: obj
+                    .get("degradeGarbledTables")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 ..RefineOptions::default()

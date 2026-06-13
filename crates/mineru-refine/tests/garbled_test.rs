@@ -356,3 +356,122 @@ fn calibration_on_real_documents() {
     }
     assert_eq!(garbled_found, 1, "标定语料里应恰有一张已知乱码表");
 }
+
+// ── 乱码表降级兜底（degrade_garbled_tables）──
+
+mod degrade {
+    use super::*;
+    use mineru_refine::agent_loop::Logger;
+    use mineru_refine::garbled::degrade_garbled_tables;
+    use mineru_refine::id::assign_ids;
+
+    fn run(
+        items: Vec<mineru_refine::MineruItem>,
+    ) -> (
+        Vec<mineru_refine::types::RefItem>,
+        mineru_refine::garbled::DegradeOutcome,
+    ) {
+        let (mut ref_items, _) = assign_ids(&items);
+        let log: Logger = Arc::new(|_| {});
+        let out = degrade_garbled_tables(&mut ref_items, &log);
+        (ref_items, out)
+    }
+
+    #[test]
+    fn garbled_table_with_image_degrades_to_image_clean_table_untouched() {
+        let (items, o) = run(doc_with_garbled_table());
+        assert_eq!(o.degraded, 1);
+        // 乱码表 → image：body 删除、caption 改挂 image_caption、img_path 保留
+        let it = &items[0].item;
+        assert_eq!(it.item_type(), "image");
+        assert!(it.table_body().is_none());
+        assert!(it.0.get("table_caption").is_none());
+        assert_eq!(
+            it.str_array("image_caption").unwrap(),
+            vec!["表1 绩效指标定义"]
+        );
+        assert_eq!(it.img_path().unwrap(), "images/garbled.jpg");
+        // removedSpans 留痕：含覆盖率
+        assert_eq!(o.removed_spans.len(), 1);
+        assert_eq!(o.removed_spans[0].text, "[table]");
+        assert!(
+            o.removed_spans[0]
+                .reason
+                .starts_with("garbled:degrade_to_image(coverage=0.")
+        );
+        // 干净表原样
+        assert_eq!(items[1].item.item_type(), "table");
+        assert!(items[1].item.table_body().is_some());
+    }
+
+    #[test]
+    fn garbled_table_without_img_path_is_kept() {
+        let mut docs = doc_with_garbled_table();
+        docs[0].remove("img_path");
+        let (items, o) = run(docs);
+        assert_eq!(o.degraded, 0);
+        assert_eq!(items[0].item.item_type(), "table");
+        assert!(items[0].item.table_body().is_some());
+    }
+
+    #[tokio::test]
+    async fn rescued_table_is_not_degraded_when_both_layers_on() {
+        // 重转写层先救（金样本，覆盖率过阈值）→ 降级层自然跳过
+        let vision = Arc::new(FnTableVision::new(|_: &[u8], _: &str| {
+            Ok(transcription(golden_cells()))
+        }));
+        let r = refine(
+            doc_with_garbled_table(),
+            RefineOptions {
+                chat: Some(Arc::new(ExplodingChat::new())),
+                vision: Some(vision),
+                load_image: Some(loader_with_images()),
+                rewrite_garbled_tables: true,
+                degrade_garbled_tables: true,
+                ..RefineOptions::default()
+            },
+        )
+        .await;
+        assert!(!r.report.fail_open);
+        assert!(!r.report.table_rewrites.is_empty());
+        assert_eq!(r.report.table_degraded, 0);
+        assert_eq!(r.items[0].item_type(), "table");
+    }
+
+    #[tokio::test]
+    async fn unrescued_table_degrades_when_rewrite_layer_off() {
+        // 只开降级层：不需要视觉客户端，纯机械
+        let r = refine(
+            doc_with_garbled_table(),
+            RefineOptions {
+                chat: Some(Arc::new(ExplodingChat::new())),
+                degrade_garbled_tables: true,
+                ..RefineOptions::default()
+            },
+        )
+        .await;
+        assert!(!r.report.fail_open);
+        assert_eq!(r.report.table_degraded, 1);
+        assert_eq!(r.items[0].item_type(), "image");
+        assert!(
+            r.report
+                .removed_spans
+                .iter()
+                .any(|s| s.reason.starts_with("garbled:degrade_to_image"))
+        );
+    }
+
+    #[test]
+    fn degrade_flag_enters_cache_key() {
+        let base = RefineOptions::default();
+        let on = RefineOptions {
+            degrade_garbled_tables: true,
+            ..RefineOptions::default()
+        };
+        assert_ne!(
+            cache_key_for_opts("abc", &base),
+            cache_key_for_opts("abc", &on)
+        );
+        assert!(cache_key_for_opts("abc", &on).contains(":degrade-d1"));
+    }
+}

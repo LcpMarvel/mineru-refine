@@ -1,10 +1,12 @@
-// 9 个削减/重组 op（纯削减全集，不加字）。纯函数：(items, args) -> 新 items，绝不突变入参。
+// 11 个削减/重组 op（纯削减全集，不加字）。纯函数：(items, args) -> 新 items，绝不突变入参。
 // apply_op_checked 是唯一对外执行入口：执行 + 保真闸 + 几何派生，违反即回滚（丢弃副本）。
 // 参数一律稳定 ID。op 自身参数非法（ID 不存在 / 不相邻 / 不在白名单）直接报错。
 
 use crate::id::{IdGen, must_index_of_id};
 use crate::invariant::{check_fidelity, is_js_whitespace, non_ws_len, table_rows};
-use crate::types::{MineruItem, OpCall, RefItem, RemovedSpan, StripPattern, is_page_furniture};
+use crate::types::{
+    ExtractPosition, MineruItem, OpCall, RefItem, RemovedSpan, StripPattern, is_page_furniture,
+};
 use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -616,6 +618,94 @@ fn op_delete_char(items: &[RefItem], id: &str, offset: i64) -> OpResult {
     })
 }
 
+// ── extractCaption(id, captionIndex, position, level?)：把被 MinerU 吞进 table_caption
+// 的小节标题抽出为独立 text 块，插在表格前/后。字符纯移动（C 多重集不变），
+// table_body 不动；新块继承表格 bbox/page_idx（近似，仍能回指源区域）。表格继承原 ID。──
+fn op_extract_caption(
+    items: &[RefItem],
+    next_id: &IdGen,
+    id: &str,
+    caption_index: i64,
+    position: ExtractPosition,
+    level: Option<i64>,
+) -> OpResult {
+    let i = must_index_of_id(items, id)?;
+    let it = &items[i].item;
+    if it.item_type() != "table" {
+        return Err(format!(
+            "extractCaption 仅限 table 块（{id} 是 {}）",
+            it.item_type()
+        ));
+    }
+    let captions = it.str_array("table_caption").unwrap_or_default();
+    if caption_index < 0 || caption_index as usize >= captions.len() {
+        return Err(format!(
+            "extractCaption captionIndex 越界：{caption_index}（{id} 共 {} 条 caption）",
+            captions.len()
+        ));
+    }
+    let entry = captions[caption_index as usize].to_string();
+    if non_ws_len(&entry) == 0 {
+        return Err(format!(
+            "extractCaption：{id} 的 caption[{caption_index}] 没有内容字符"
+        ));
+    }
+    if let Some(l) = level
+        && !(1..=6).contains(&l)
+    {
+        return Err(format!("extractCaption level 非法：{l}"));
+    }
+
+    // 新 text 块：type/text/(text_level)/bbox/page_idx，几何继承表格
+    let mut extracted = MineruItem(serde_json::Map::new());
+    extracted.set("type", json!("text"));
+    extracted.set("text", Value::String(entry));
+    if let Some(l) = level {
+        extracted.set("text_level", json!(l));
+    }
+    for key in ["bbox", "page_idx"] {
+        if let Some(v) = it.0.get(key) {
+            extracted.set(key, v.clone());
+        }
+    }
+
+    // 表格去掉该条目（其余 caption 原序保留），继承原 ID
+    let mut table = it.clone();
+    let remaining: Vec<Value> = captions
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| *k != caption_index as usize)
+        .map(|(_, s)| Value::String(s.to_string()))
+        .collect();
+    table.set("table_caption", Value::Array(remaining));
+
+    let mut out: Vec<RefItem> = Vec::with_capacity(items.len() + 1);
+    out.extend_from_slice(&items[..i]);
+    let table_item = RefItem {
+        id: id.to_string(),
+        item: table,
+    };
+    let new_item = RefItem {
+        id: next_id.next(),
+        item: extracted,
+    };
+    match position {
+        ExtractPosition::Before => {
+            out.push(new_item);
+            out.push(table_item);
+        }
+        ExtractPosition::After => {
+            out.push(table_item);
+            out.push(new_item);
+        }
+    }
+    out.extend_from_slice(&items[i + 1..]);
+    Ok(OpOutcome {
+        items: out,
+        removed_spans: vec![],
+    })
+}
+
 // ── 调度 + 保真闸 ──
 
 pub struct ApplyContext<'a> {
@@ -662,6 +752,12 @@ pub fn apply_op_checked(items: &[RefItem], call: &OpCall, ctx: &ApplyContext) ->
             id_b,
             join_seam,
         } => op_merge_list(items, ctx.next_id, id_a, id_b, join_seam.unwrap_or(false)),
+        OpCall::ExtractCaption {
+            id,
+            caption_index,
+            position,
+            level,
+        } => op_extract_caption(items, ctx.next_id, id, *caption_index, *position, *level),
     };
     let outcome = match outcome {
         Ok(o) => o,

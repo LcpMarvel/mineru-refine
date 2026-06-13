@@ -35,6 +35,7 @@ const { items, report } = await refine(contentList, {
   fixOcrConfusion: false,      // 可选:opt-in 的 OCR 字符混淆修正层(CE0→CEO 等)
   extraConfusionPairs: [],     // 可选:混淆准入名单补充对,如 ["0D"]
   rewriteGarbledTables: false, // 可选:opt-in 的重度乱码表视觉重转写层(需要 imageDir)
+  degradeGarbledTables: false, // 可选:opt-in 的乱码表降级兜底(救不回的表降级为图片)
 });
 
 items;    // 清洗后的 content_list(同 schema,未知字段原样透传)
@@ -49,6 +50,9 @@ report;   // 审计报告:iterations / opCounts / dismissed / removedSpans
 `rewriteGarbledTables: true` 开启重度乱码表的视觉重转写层(机械检测整表认废的表,
 Qwen-VL 对照截图逐单元格重转写,全量进 report.tableRewrites)——详见主 README 的
 「乱码表重转写层」一节。
+`degradeGarbledTables: true` 开启乱码表降级兜底(纯机械,跑在重转写层之后:仍判废且
+有 img_path 的表整项降级为 image,report.tableDegraded 计数)——详见主 README 的
+「降级兜底」一节。
 
 独立工具函数(都不调 LLM):
 

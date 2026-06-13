@@ -252,3 +252,67 @@ fn clean_input_is_untouched_with_empty_counts() {
         serde_json::to_value(&input).unwrap()
     );
 }
+
+// ── 拉丁 token 全文频率投票（mech:token_vote）──
+
+#[test]
+fn token_vote_fixes_minority_confusable_token_in_text_and_cells() {
+    // SWOT×6（多数派 ≥4 且 ≥3× 少数派）vs SW0T×2，差异 0↔O 在混淆类内 → 机械落地
+    let (items, o) = clean(items_of(json!([
+        { "type": "text", "text": "SWOT分析与SWOT矩阵：先做SWOT要素筛选，再做SWOT策略组合。", "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "基于SWOT输出与SWOT排序，利用SW0T战略分析工具构建矩阵。", "page_idx": 0, "bbox": bbox(40) },
+        { "type": "table", "table_body": "<table><tr><td>复核各模块SW0T要素出处</td><td>2024</td></tr></table>",
+          "page_idx": 0, "bbox": bbox(80) },
+    ])));
+    assert_eq!(count(&o, "mechTokenVote"), 2);
+    assert_eq!(
+        items[1].item.text().unwrap(),
+        "基于SWOT输出与SWOT排序，利用SWOT战略分析工具构建矩阵。"
+    );
+    assert!(
+        items[2]
+            .item
+            .table_body()
+            .unwrap()
+            .contains("复核各模块SWOT要素出处")
+    );
+    let vote_spans: Vec<_> = o
+        .removed_spans
+        .iter()
+        .filter(|s| s.reason == "mech:token_vote→SWOT")
+        .collect();
+    assert_eq!(vote_spans.len(), 2);
+    assert!(vote_spans.iter().all(|s| s.text == "SW0T"));
+}
+
+#[test]
+fn token_vote_requires_majority_and_confusable_single_diff() {
+    let majority_3 = items_of(json!([
+        // 多数派只有 3 次（<4）→ 不动
+        { "type": "text", "text": "SWOT甲 SWOT乙 SWOT丙 与 SW0T。", "page_idx": 0, "bbox": bbox(0) },
+    ]));
+    let (items, o) = clean(majority_3);
+    assert_eq!(count(&o, "mechTokenVote"), 0);
+    assert!(items[0].item.text().unwrap().contains("SW0T"));
+
+    // 换位差异（OGSTM↔OGSMT，两处差异）与非形近差异（SWAT，O↔A 不在类内）都不收
+    let (items, o) = clean(items_of(json!([
+        { "type": "text", "text": "OGSMT表 OGSMT会 OGSMT周 OGSMT月 OGSMT季 OGSMT年 与 OGSTM。", "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "SWOT国 SWOT行 SWOT业 SWOT内 SWOT外 SWOT中 与 SWAT。", "page_idx": 0, "bbox": bbox(40) },
+    ])));
+    assert_eq!(count(&o, "mechTokenVote"), 0);
+    assert!(items[0].item.text().unwrap().contains("OGSTM"));
+    assert!(items[1].item.text().unwrap().contains("SWAT"));
+}
+
+#[test]
+fn token_vote_never_touches_numbers_or_short_tokens() {
+    // 年份（纯数字）与 ≤3 字 token（CE0）不在投票口径内——证据不足，归混淆层
+    let (items, o) = clean(items_of(json!([
+        { "type": "text", "text": "2026年 2026版 2026春 2026夏 2026秋 2026冬 与 2025。", "page_idx": 0, "bbox": bbox(0) },
+        { "type": "text", "text": "CEO甲 CEO乙 CEO丙 CEO丁 CEO戊 CEO己 与 CE0。", "page_idx": 0, "bbox": bbox(40) },
+    ])));
+    assert_eq!(count(&o, "mechTokenVote"), 0);
+    assert!(items[0].item.text().unwrap().contains("2025"));
+    assert!(items[1].item.text().unwrap().contains("CE0"));
+}

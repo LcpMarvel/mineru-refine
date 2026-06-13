@@ -111,6 +111,9 @@ pub enum SuspectKind {
     MissedHeading,
     /// 段尾粘连了「[相关文件]」类节标记 → split / dismiss
     TrailingMarker,
+    /// 小节标题被 MinerU 吞进 table_caption（渲染成 caption 行，貌似漏 promote）
+    /// → extractCaption / dismiss
+    CaptionHeading,
     /// caption 与其表格之间隔了一个标题块（跨页/排版错序）→ reorder / dismiss
     SeparatedCaption,
     /// 疑似 OCR 赘字/衍字（功能词叠字/孤立偏旁，机械层拿不准的）→ deleteChar / dismiss
@@ -132,6 +135,7 @@ impl SuspectKind {
             SuspectKind::EmptyTable => "empty_table",
             SuspectKind::MissedHeading => "missed_heading",
             SuspectKind::TrailingMarker => "trailing_marker",
+            SuspectKind::CaptionHeading => "caption_heading",
             SuspectKind::SeparatedCaption => "separated_caption",
             SuspectKind::ExtraChar => "extra_char",
             SuspectKind::CaptionIssue => "caption_issue",
@@ -150,6 +154,14 @@ pub struct WorkItem {
 }
 
 // ── op 调用。参数一律稳定 ID，不用 index ──
+
+/// extractCaption 抽出块相对表格的落位。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractPosition {
+    Before,
+    After,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -204,6 +216,14 @@ pub enum OpCall {
         id_b: String,
         join_seam: Option<bool>,
     },
+    /// 把被 MinerU 吞进 table_caption 的小节标题抽出为独立 text 块，
+    /// 插在表格前/后（level 给则直接设 text_level）。字符纯移动，不增不删。
+    ExtractCaption {
+        id: String,
+        caption_index: i64,
+        position: ExtractPosition,
+        level: Option<i64>,
+    },
 }
 
 impl OpCall {
@@ -219,6 +239,7 @@ impl OpCall {
             OpCall::DeleteChar { .. } => "deleteChar",
             OpCall::MergeTable { .. } => "mergeTable",
             OpCall::MergeList { .. } => "mergeList",
+            OpCall::ExtractCaption { .. } => "extractCaption",
         }
     }
 }
@@ -319,6 +340,10 @@ pub struct RefineReport {
     pub table_rewrites: Vec<TableCellRewrite>,
     #[serde(default, skip_serializing_if = "u64_is_zero")]
     pub table_rewrite_rejected: u64,
+    /// 降级层（degrade_garbled_tables）降级为图片的表数。关 flag 时恒缺省。
+    /// 每张降级表在 removedSpans 各有一条留痕（reason=garbled:degrade_to_image）。
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub table_degraded: u64,
 }
 
 fn u64_is_zero(n: &u64) -> bool {

@@ -12,13 +12,19 @@
 //      命中任何未知命令（\frac/\sum/\begin…）即视为真公式，整段不动。
 //      独立文本 item 的 LaTeX 残留仍走探测器 → LLM strip op；cell 受
 //      「table_body 逐字节不变」保真闸约束，op 体系动不了，只能在本 pass（基线快照前）清。
+//   7. 拉丁 token 全文频率投票（`SW0T`×6 vs `SWOT`×24 → SW0T 全部改 SWOT）：
+//      少数派 token 与高频多数派（≥4 次且 ≥3× 少数派）恰差一处单字替换、且
+//      (before, after) 同属内置 OCR 混淆等价类（0O/1lI/5S/8B/2Z/6G/9gq）→ 直接落地。
+//      token 口径与混淆层一致（≥4 字、至多 1 个数字——年份/编号天然多变体，投票是灾难）；
+//      证据是全文自明的（同一文档同一词的两种写法 + 形近差异），无需 LLM。
+//      短 token / 无全文多数派的混淆（CE0、0A）证据不足，仍归 opt-in 混淆层 LLM 裁决。
 //
 // 保真：本 pass 自带逐项校验，与 op 体系的保真闸互不依赖——
 //   - 字符串字段：删除的字符只能是空白或转义反斜杠，绝不新增字符
 //   - 表格：shell（行外字节）逐字节不变，全体 cell 内容字符多重集不增、删除的只能是空白/反斜杠。
-//     伪 LaTeX 剥除是唯一允许"删内容字符/换符号"的项：每个 $...$ 替换对先过 span 级
-//     字符预算校验（产物字符 ⊆ 原 span 字符 + span 内命令映射出的符号），再把替换对
-//     代入旧值得到期望值，期望值与新值之间仍走严格校验
+//     允许"换字符"的只有两项，且都走「替换对独立校验 + 代入旧值得期望值再严格比对」：
+//     伪 LaTeX 剥除（span 级字符预算：产物字符 ⊆ 原 span 字符 + 命令映射符号）、
+//     频率投票（同长、恰一处差异、差异对同属混淆等价类）
 // 任一校验不过 → 放弃该项变更、保留原值并记 mechReverted（防实现 bug，正常永不触发）。
 // 在 refine_inner 中先于基线快照执行，出口闸门以"机械清洗后的 items"为基准。
 
@@ -161,6 +167,144 @@ fn tighten_cell_ws(s: &str) -> (String, u64) {
         }
     }
     (out, hits)
+}
+
+// ── 拉丁 token 全文频率投票 ──
+
+/// OCR 混淆等价类里的 ASCII 字母数字字符 → 类号（投票替换对的准入判定）。
+/// 复用混淆层的内置等价类，只取 ASCII 字母数字（token 里只可能出现它们）。
+static CONFUSION_CLASS_OF: LazyLock<HashMap<char, usize>> = LazyLock::new(|| {
+    let mut m = HashMap::new();
+    for (ci, class) in crate::confusion::BUILTIN_CONFUSION_CLASSES
+        .iter()
+        .enumerate()
+    {
+        for c in class.chars().filter(char::is_ascii_alphanumeric) {
+            m.insert(c, ci);
+        }
+    }
+    m
+});
+
+/// 同一混淆等价类内的两个不同 ASCII 字母数字字符。
+fn confusable_pair(a: char, b: char) -> bool {
+    a != b
+        && matches!(
+            (CONFUSION_CLASS_OF.get(&a), CONFUSION_CLASS_OF.get(&b)),
+            (Some(x), Some(y)) if x == y
+        )
+}
+
+/// 投票口径的拉丁 token（连续 [A-Za-z0-9] 段、≥4 字、至多 1 个数字）及其字符偏移。
+/// 与混淆层 latin_tokens 同口径：纯数字/短编号（年份、序号）天然多变体，不参与投票。
+fn vote_tokens(chars: &[char]) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i].is_ascii_alphanumeric() {
+            let start = i;
+            while i < chars.len() && chars[i].is_ascii_alphanumeric() {
+                i += 1;
+            }
+            let len = i - start;
+            let alpha = chars[start..i]
+                .iter()
+                .filter(|c| c.is_ascii_alphabetic())
+                .count();
+            if len >= 4 && alpha >= len - 1 {
+                // HTML 实体防护（cell 内层可能有 &amp; 等）：紧跟 &/# 的 run 不算 token
+                let entity = start > 0 && matches!(chars[start - 1], '&' | '#');
+                if !entity {
+                    out.push((chars[start..i].iter().collect(), start));
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 少数派 token → 多数派写法。判据：恰一处单字替换、(before, after) 同属混淆等价类、
+/// 多数派 ≥4 次且 ≥3× 少数派。换位（OGSTM↔OGSMT）等非形近差异不收——那是混淆层 LLM 的事。
+pub(crate) struct TokenVotes(HashMap<String, String>);
+
+impl TokenVotes {
+    fn correction(&self, tok: &str) -> Option<&str> {
+        self.0.get(tok).map(String::as_str)
+    }
+}
+
+/// 全文 token 频率统计 → 投票表。texts 是全部字符串字段 + 全部 cell 内层文本。
+fn build_token_votes<'a>(texts: impl Iterator<Item = &'a str>) -> TokenVotes {
+    let mut freq: HashMap<String, u64> = HashMap::new();
+    for t in texts {
+        let chars: Vec<char> = t.chars().collect();
+        for (tok, _) in vote_tokens(&chars) {
+            *freq.entry(tok).or_insert(0) += 1;
+        }
+    }
+    // 排序保证确定性（HashMap 迭代序不稳定，best 平局时会抖动）
+    let mut sorted: Vec<(&str, u64)> = freq.iter().map(|(t, n)| (t.as_str(), *n)).collect();
+    sorted.sort_unstable();
+
+    let mut map: HashMap<String, String> = HashMap::new();
+    for &(t, ct) in &sorted {
+        let tc: Vec<char> = t.chars().collect();
+        let mut best: Option<(&str, u64)> = None;
+        for &(u, cu) in &sorted {
+            if u == t || cu < 4 || cu < 3 * ct {
+                continue;
+            }
+            let uc: Vec<char> = u.chars().collect();
+            if uc.len() != tc.len() {
+                continue;
+            }
+            let diffs: Vec<usize> = (0..tc.len()).filter(|&i| tc[i] != uc[i]).collect();
+            if let [i] = diffs.as_slice()
+                && confusable_pair(tc[*i], uc[*i])
+                && best.map(|(_, bc)| cu > bc).unwrap_or(true)
+            {
+                best = Some((u, cu));
+            }
+        }
+        if let Some((u, _)) = best {
+            map.insert(t.to_string(), u.to_string());
+        }
+    }
+    TokenVotes(map)
+}
+
+/// 应用投票：整 token 替换为多数派写法。返回 (新串, [(原 token, 多数派 token)])。
+fn apply_token_votes(s: &str, votes: &TokenVotes) -> (String, Vec<(String, String)>) {
+    if votes.0.is_empty() || !s.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return (s.to_string(), Vec::new());
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut hits: Vec<(String, String)> = Vec::new();
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0usize;
+    for (tok, start) in vote_tokens(&chars) {
+        if let Some(fixed) = votes.correction(&tok) {
+            out.extend(&chars[last..start]);
+            out.push_str(fixed);
+            last = start + tok.chars().count();
+            hits.push((tok, fixed.to_string()));
+        }
+    }
+    out.extend(&chars[last..]);
+    (out, hits)
+}
+
+/// 投票替换对的独立结构校验（防实现 bug）：同长、恰一处差异、差异对同属混淆等价类。
+fn vote_pair_ok(before: &str, after: &str) -> bool {
+    let b: Vec<char> = before.chars().collect();
+    let a: Vec<char> = after.chars().collect();
+    if b.len() != a.len() {
+        return false;
+    }
+    let diffs: Vec<usize> = (0..b.len()).filter(|&i| b[i] != a[i]).collect();
+    matches!(diffs.as_slice(), [i] if confusable_pair(b[*i], a[*i]))
 }
 
 // ── cell 内伪 LaTeX 剥除 ──
@@ -404,10 +548,12 @@ struct TableStats {
     unescapes: Vec<String>,
     /// 伪 LaTeX 剥除的 (原 span, 替换文)，原 span 即撤销凭据
     latex: Vec<(String, String)>,
+    /// 频率投票替换的 (原 token, 多数派 token)，原 token 即撤销凭据
+    votes: Vec<(String, String)>,
 }
 
 /// 表格清理：续行合并 → 空行删除 → cell 内容清理。返回 None = 无变更。
-fn clean_table_body(body: &str) -> Option<(String, TableStats)> {
+fn clean_table_body(body: &str, votes: &TokenVotes) -> Option<(String, TableStats)> {
     // 切分为 gap/row 交替段（gap 全保留 → shell 逐字节不变）
     let mut gaps: Vec<&str> = Vec::new();
     let mut rows: Vec<ParsedRow> = Vec::new();
@@ -429,6 +575,7 @@ fn clean_table_body(body: &str) -> Option<(String, TableStats)> {
         url_ws: 0,
         unescapes: Vec::new(),
         latex: Vec::new(),
+        votes: Vec::new(),
     };
     let table_has_rowspan = has_rowspan_gt1(body);
     let mut removed = vec![false; rows.len()];
@@ -505,7 +652,7 @@ fn clean_table_body(body: &str) -> Option<(String, TableStats)> {
         }
     }
 
-    // 3) cell 内容清理：伪 LaTeX 剥除 → 转义残留 → URL 空格 → 空白收紧
+    // 3) cell 内容清理：伪 LaTeX 剥除 → 转义残留 → URL 空格 → 空白收紧 → 频率投票
     //    （LaTeX 必须先于 unescape：`\$100\$` 经 unescape 会变出成对 $，再剥就误伤真美元）
     for (r, row) in rows.iter_mut().enumerate() {
         if removed[r] {
@@ -520,6 +667,8 @@ fn clean_table_body(body: &str) -> Option<(String, TableStats)> {
             stats.url_ws += url_fixes;
             let (s, ws_hits) = tighten_cell_ws(&s);
             stats.cell_ws += ws_hits;
+            let (s, vote_hits) = apply_token_votes(&s, votes);
+            stats.votes.extend(vote_hits);
             cell.1 = s;
         }
     }
@@ -530,6 +679,7 @@ fn clean_table_body(body: &str) -> Option<(String, TableStats)> {
         && stats.url_ws == 0
         && stats.unescapes.is_empty()
         && stats.latex.is_empty()
+        && stats.votes.is_empty()
     {
         return None;
     }
@@ -573,8 +723,13 @@ fn latex_pair_ok(span: &str, repl: &str) -> bool {
 }
 
 /// 表格变更校验：shell 逐字节不变 + 全体 cell 内容字符多重集合法（不新增、只删空白/反斜杠）。
-/// 伪 LaTeX 替换对先逐对过预算校验，再代入旧值得到期望值参与严格比对。
-fn verify_table(old: &str, new: &str, latex: &[(String, String)]) -> bool {
+/// 伪 LaTeX / 频率投票替换对先逐对过独立结构校验，再代入旧值得到期望值参与严格比对。
+fn verify_table(
+    old: &str,
+    new: &str,
+    latex: &[(String, String)],
+    votes: &[(String, String)],
+) -> bool {
     if table_shell(old) != table_shell(new) {
         return false;
     }
@@ -592,6 +747,12 @@ fn verify_table(old: &str, new: &str, latex: &[(String, String)]) -> bool {
         // diff_ok 按多重集比对，替换命中哪一处同串 span 不影响结果
         expected = expected.replacen(span.as_str(), repl, 1);
     }
+    for (before, after) in votes {
+        if !vote_pair_ok(before, after) {
+            return false;
+        }
+        expected = expected.replacen(before.as_str(), after, 1);
+    }
     diff_ok(&expected, &inners(new))
 }
 
@@ -606,6 +767,25 @@ pub fn mechanical_clean(items: &mut [RefItem], log: &Logger) -> MechOutcome {
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     let mut removed_spans: Vec<RemovedSpan> = Vec::new();
 
+    // 全文 token 频率统计（先于任何变更，对全部字符串字段 + cell 内层构建）
+    let votes = {
+        let mut texts: Vec<String> = Vec::new();
+        for r in items.iter() {
+            if let Some(t) = r.item.text() {
+                texts.push(t.to_string());
+            }
+            for field in ["list_items", "table_caption", "table_footnote"] {
+                if let Some(parts) = r.item.str_array(field) {
+                    texts.extend(parts.iter().map(|s| s.to_string()));
+                }
+            }
+            if let Some(body) = r.item.table_body() {
+                texts.extend(CELL.captures_iter(body).map(|c| c[2].to_string()));
+            }
+        }
+        build_token_votes(texts.iter().map(String::as_str))
+    };
+
     for r in items.iter_mut() {
         let id = r.id.clone();
 
@@ -616,21 +796,42 @@ pub fn mechanical_clean(items: &mut [RefItem], log: &Logger) -> MechOutcome {
          -> Option<String> {
             let (t, escapes) = unescape(s);
             let (t, url_fixes) = fix_url_ws(&t);
-            if escapes.is_empty() && url_fixes == 0 {
+            let (t, vote_hits) = apply_token_votes(&t, &votes);
+            if escapes.is_empty() && url_fixes == 0 && vote_hits.is_empty() {
                 return None;
             }
-            if !diff_ok(s, &t) {
+            // 期望值：投票替换逐对代入原串（先过独立结构校验），其余变更只许删空白/反斜杠
+            let mut expected = s.to_string();
+            for (before, after) in &vote_hits {
+                if !vote_pair_ok(before, after) {
+                    log(&format!(
+                        "机械清洗校验不过（{id} 投票替换对非法），保留原值"
+                    ));
+                    bump(counts, "mechReverted", 1);
+                    return None;
+                }
+                expected = expected.replacen(before.as_str(), after, 1);
+            }
+            if !diff_ok(&expected, &t) {
                 log(&format!("机械清洗校验不过（{id} 字符串字段），保留原值"));
                 bump(counts, "mechReverted", 1);
                 return None;
             }
             bump(counts, "mechUnescape", escapes.len() as u64);
             bump(counts, "mechUrlWs", url_fixes);
+            bump(counts, "mechTokenVote", vote_hits.len() as u64);
             for e in escapes {
                 spans.push(RemovedSpan {
                     item_id: id.clone(),
                     text: e,
                     reason: "mech:unescape".into(),
+                });
+            }
+            for (before, after) in vote_hits {
+                spans.push(RemovedSpan {
+                    item_id: id.clone(),
+                    text: before,
+                    reason: format!("mech:token_vote→{after}"),
                 });
             }
             Some(t)
@@ -666,9 +867,9 @@ pub fn mechanical_clean(items: &mut [RefItem], log: &Logger) -> MechOutcome {
 
         // 表格
         if let Some(body) = r.item.table_body().map(str::to_string)
-            && let Some((new_body, stats)) = clean_table_body(&body)
+            && let Some((new_body, stats)) = clean_table_body(&body, &votes)
         {
-            if !verify_table(&body, &new_body, &stats.latex) {
+            if !verify_table(&body, &new_body, &stats.latex, &stats.votes) {
                 log(&format!("机械清洗校验不过（{id} table_body），保留原值"));
                 bump(&mut counts, "mechReverted", 1);
                 continue;
@@ -679,6 +880,7 @@ pub fn mechanical_clean(items: &mut [RefItem], log: &Logger) -> MechOutcome {
             bump(&mut counts, "mechUrlWs", stats.url_ws);
             bump(&mut counts, "mechUnescape", stats.unescapes.len() as u64);
             bump(&mut counts, "mechCellLatex", stats.latex.len() as u64);
+            bump(&mut counts, "mechTokenVote", stats.votes.len() as u64);
             for e in stats.unescapes {
                 removed_spans.push(RemovedSpan {
                     item_id: id.clone(),
@@ -691,6 +893,13 @@ pub fn mechanical_clean(items: &mut [RefItem], log: &Logger) -> MechOutcome {
                     item_id: id.clone(),
                     text: span,
                     reason: format!("mech:cell_latex→{repl}"),
+                });
+            }
+            for (before, after) in stats.votes {
+                removed_spans.push(RemovedSpan {
+                    item_id: id.clone(),
+                    text: before,
+                    reason: format!("mech:token_vote→{after}"),
                 });
             }
             r.item.set("table_body", Value::String(new_body));

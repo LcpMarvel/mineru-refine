@@ -497,3 +497,78 @@ fn extra_char_not_flagged_on_legit_reduplication() {
     ])));
     assert!(m.is_empty(), "合法叠词不许报疑点: {m:?}");
 }
+
+// ── caption_heading：被吞进 table_caption 的小节标题 ──
+
+#[test]
+fn numbered_caption_with_adjacent_heading_sibling_is_flagged() {
+    // 047 实测形态：4.5 是标题，「4.6核心组织绩效的应用」被吞进评分表 caption
+    let m = kinds_of(&items_of(json!([
+        { "type": "text", "text": "4.5核心组织绩效的考核方法", "text_level": 2, "page_idx": 0, "bbox": bbox(0) },
+        {
+            "type": "table",
+            "table_body": "<table><tr><td>考核项目</td><td>权重</td></tr></table>",
+            "table_caption": ["报告评分表", "4.6核心组织绩效的应用"],
+            "page_idx": 0,
+            "bbox": bbox(40),
+        },
+    ])));
+    let flags = &m["it_0002"];
+    assert!(flags.contains(&SuspectKind::CaptionHeading), "{flags:?}");
+    // 证据应给出条目下标与兄弟 level（mock/LLM 都按它出参数）
+    let w = detect_of(&items_of(json!([
+        { "type": "text", "text": "4.5核心组织绩效的考核方法", "text_level": 2, "page_idx": 0, "bbox": bbox(0) },
+        {
+            "type": "table",
+            "table_body": "<table><tr><td>考核项目</td><td>权重</td></tr></table>",
+            "table_caption": ["报告评分表", "4.6核心组织绩效的应用"],
+            "page_idx": 0,
+            "bbox": bbox(40),
+        },
+    ])));
+    let ev = &w
+        .iter()
+        .find(|x| x.kind == SuspectKind::CaptionHeading)
+        .unwrap()
+        .evidence;
+    assert!(ev.contains("captionIndex=1"), "{ev}");
+    assert!(ev.contains("level=2"), "{ev}");
+}
+
+#[test]
+fn caption_heading_negatives_stay_silent() {
+    // 真题注（表N 前缀编号不解析为节编号）、无编号 caption、有编号但无相邻标题兄弟、
+    // 含句末标点的条目——都不标
+    let m = kinds_of(&items_of(json!([
+        { "type": "text", "text": "3.1差距分析流程", "text_level": 2, "page_idx": 0, "bbox": bbox(0) },
+        {
+            "type": "table",
+            "table_body": "<table><tr><td>甲</td></tr></table>",
+            "table_caption": ["表3.1 差距分析模板"],
+            "page_idx": 0, "bbox": bbox(40),
+        },
+        {
+            "type": "table",
+            "table_body": "<table><tr><td>乙</td></tr></table>",
+            "table_caption": ["更改情况"],
+            "page_idx": 0, "bbox": bbox(80),
+        },
+        {
+            "type": "table",
+            "table_body": "<table><tr><td>丙</td></tr></table>",
+            "table_caption": ["7.9远端编号无兄弟"],
+            "page_idx": 0, "bbox": bbox(120),
+        },
+        {
+            "type": "table",
+            "table_body": "<table><tr><td>丁</td></tr></table>",
+            "table_caption": ["3.2本条目是完整句子，含逗号与句号。"],
+            "page_idx": 0, "bbox": bbox(160),
+        },
+    ])));
+    assert!(
+        m.values()
+            .all(|ks| !ks.contains(&SuspectKind::CaptionHeading)),
+        "{m:?}"
+    );
+}

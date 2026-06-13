@@ -181,6 +181,17 @@ static TOOLS: LazyLock<Value> = LazyLock::new(|| {
                 "reason": reason_param.clone(),
             }, "required": ["idA", "idB"] },
         }},
+        { "type": "function", "function": {
+            "name": "extractCaption",
+            "description": "把被 MinerU 吞进 table_caption 的小节标题抽出为独立标题块（字符纯移动，表格本体不动）。position 按内容归属判断：表格属于该标题之前的小节（标题统领表格之后的内容）→ after；表格是该标题小节的首个内容 → before。level 应与同级编号兄弟标题一致。",
+            "parameters": { "type": "object", "properties": {
+                "id": id_param,
+                "captionIndex": { "type": "integer", "description": "待抽出条目在 table_caption 数组中的下标（疑点证据中给出）" },
+                "position": { "type": "string", "enum": ["before", "after"], "description": "抽出块插在表格之前还是之后" },
+                "level": { "type": "integer", "description": "标题层级 1-6；省略则抽出为普通正文块" },
+                "reason": reason_param.clone(),
+            }, "required": ["id", "captionIndex", "position"] },
+        }},
     ])
 });
 
@@ -189,7 +200,7 @@ pub fn tools() -> &'static Value {
     &TOOLS
 }
 
-const OP_NAMES: [&str; 9] = [
+const OP_NAMES: [&str; 10] = [
     "merge",
     "split",
     "demote",
@@ -199,6 +210,7 @@ const OP_NAMES: [&str; 9] = [
     "strip",
     "deleteChar",
     "mergeList",
+    "extractCaption",
 ];
 const OBSERVE_NAMES: [&str; 4] = ["outline", "getItems", "whyFlagged", "peekPage"];
 
@@ -216,7 +228,7 @@ const SYSTEM_PROMPT: &str = r#"你是 MinerU PDF 解析结果的结构修复器�
    - 列表项（-、•、①、(1) 等开头的行）之间绝不 merge——行尾无标点是列表的常态，不是断句。
    - 但 page_artifact 证据若给出「已分类页眉/页脚同文佐证」，说明同文块在别处已被正确分类为页面家具，该块就是漏标的同款 → 应 drop，不要因「像标题」而 dismiss。
    - 同一文本的多处 page_artifact 疑点应裁决一致：要删都删，不要删一处留其余。
-4. 修复只许削减/重组（merge/split/demote/promote/reorder/drop/strip/deleteChar/mergeList），系统会机器校验"不新增任何字符、表格行不被篡改"，违规会被自动回滚。
+4. 修复只许削减/重组（merge/split/demote/promote/reorder/drop/strip/deleteChar/mergeList/extractCaption），系统会机器校验"不新增任何字符、表格行不被篡改"，违规会被自动回滚。
 5. 每个疑点最终以【一个】变更 op 或 dismiss 收尾；绝不对同一个块既 dismiss 又调变更 op（矛盾决策会被整体驳回重裁）。变更 op 请在 reason 参数里给一句话依据。"#;
 
 /// 同一响应同时出现 dismiss 与变更 op 时回灌给 LLM 的驳回话术。
@@ -467,6 +479,22 @@ fn to_op_call(name: &str, args: &Value) -> Result<OpCall, String> {
                     .unwrap_or(false),
             ),
         }),
+        "extractCaption" => {
+            let position: crate::types::ExtractPosition =
+                serde_json::from_value(args.get("position").cloned().unwrap_or(Value::Null))
+                    .map_err(|_| {
+                        format!(
+                            "extractCaption position 必须是 before/after：{}",
+                            arg_str(args, "position")
+                        )
+                    })?;
+            Ok(OpCall::ExtractCaption {
+                id: arg_str(args, "id"),
+                caption_index: int_of("captionIndex")?,
+                position,
+                level: args.get("level").and_then(Value::as_i64),
+            })
+        }
         _ => Err(format!("未知 op: {name}")),
     }
 }
@@ -1083,6 +1111,9 @@ fn op_hint(kind: SuspectKind) -> &'static str {
         }
         SuspectKind::ExtraChar => {
             "读上下文判断该字是否 OCR 衍字：删掉后语句更通顺 → deleteChar（offset 用证据中的值）；属正常语法（「目的+的」「但是+是」「不甚了了」）或正文在讨论偏旁本身 → dismiss"
+        }
+        SuspectKind::CaptionHeading => {
+            "用 getItems/outline 判断该 caption 条目是否被吞的小节标题：是 → extractCaption（captionIndex/level 用证据中的值，position 按内容归属判断——表格属于该标题之前的小节 → after，表格是该小节首个内容 → before）；是真表格题注 → dismiss"
         }
         _ => "无对应 op，只能 dismiss（仅标记类）",
     }

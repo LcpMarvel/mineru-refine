@@ -16,9 +16,13 @@ MinerU 把 PDF 解析成 `content_list.json`——一个 item 对象数组,每�
 - **段尾粘连**——跨页合并把「[相关文件]」这类独立结构块吸进上一段结尾
 - **表格噪声**——全空 `<tr>`、单元格内 OCR 空格（含被空格打断的 URL）、伪 LaTeX 包装
   （`$\text{...}$` 套着普通文字，已知符号命令换成 Unicode；`\frac` 等真公式不动）
+- **形近字符的少数派写法**——同一文档里 `SWOT`×24 与 `SW0T`×6 并存（0↔O 形近误认），
+  全文频率投票直接改写少数派
+- **被吞进表格题注的小节标题**——MinerU 把「4.6 核心组织绩效的应用」塞进相邻表格的
+  `table_caption`，渲染后貌似漏升级标题，实为结构错位
 
-其中无歧义的表格噪声由**机械清洗 pass**（确定性代码、自带校验、不打 LLM）直接处理，
-其余疑点交 LLM 裁决。
+其中无歧义的表格噪声与频率投票由**机械清洗 pass**（确定性代码、自带校验、不打 LLM）
+直接处理，其余疑点交 LLM 裁决。
 
 mineru-refine 接收 content_list,修掉这些问题,返回**同 schema** 的 content_list。
 下游读到的仍然是"一份 MinerU 结果"——作为透明过滤器接进现有 pipeline,消费方零改动。
@@ -27,6 +31,9 @@ mineru-refine 接收 content_list,修掉这些问题,返回**同 schema** 的 co
 
 1. **绝不新增一个字**:只做削减与重组(合并、拆分、删除、降级),输出的每个内容字符都
    来自输入,且由机器在每一步校验——不是靠 prompt 约束 LLM,而是违反即自动回滚。
+   默认配置下唯一的字符替换是机械清洗的**全文频率投票**(`SW0T`→`SWOT`:全文多数派
+   ≥4 次且 ≥3× 少数派、恰差一处形近字符,证据全文自明、确定性落地,逐条留痕于
+   `report.removedSpans`,reason=`mech:token_vote→…`)。
 2. **绝不搞崩上游(fail-open)**:任何异常、超时、LLM 不可用,都原样返回输入 items
    并大声记 log,`report.failOpen` 标记为 `true`。
 
@@ -115,6 +122,7 @@ HTTP 模式下该目录须与 server 共享文件系统。
 | `fixOcrConfusion` | `false` | **opt-in** 的 OCR 字符混淆修正层(CE0→CEO、入=n→λ=n、竟争→竞争……),覆盖正文与表格单元格。开启后输出契约从"只删不增"变为双契约,见下文[混淆修正层](#混淆修正层opt-in) |
 | `extraConfusionPairs` | `[]` | 混淆准入名单的用户补充对,每项恰好 2 个不同字符(如 `"0D"` 表示 0↔D 互换可直接落地)。非法配置立即 fail-open,不静默吞 |
 | `rewriteGarbledTables` | `false` | **opt-in** 的重度乱码表视觉重转写层(代格→代码、数据来酒→数据来源、Midhuel→Michael……)。机械检测器选定整表认废的表格,Qwen-VL 对照 `img_path` 截图逐单元格重转写。需要 `imageDir`(缺则 fail-open),见下文[乱码表重转写层](#乱码表重转写层opt-in) |
+| `degradeGarbledTables` | `false` | **opt-in** 的乱码表降级兜底(纯机械,不依赖 LLM/VL)。跑在重转写层之后:仍判废且有 `img_path` 的表整项降级为 `image`(`table_body` 删除并留痕,`report.tableDegraded` 计数)。两层都开 = 先救、救不回再降 |
 
 返回值 `{ items, report, provenance }`:
 
@@ -133,6 +141,7 @@ HTTP 模式下该目录须与 server 共享文件系统。
 | `report.confusionObservations` | LLM 裁决时顺带观察到的表外 OCR 质量问题,只记录、从未被应用,可作下游质量信号 |
 | `report.tableRewrites` | 重转写层落地的每条整格替换(itemId / 行列号 / before / after / 新串字符区间)。`before` 即撤销凭据,写回该区间可程序化还原。仅 `rewriteGarbledTables` 开启且有替换时出现 |
 | `report.tableRewriteRejected` | 被闸门拒绝的重转写提案数(结构非法 / 行列不存在 / 整表覆盖率回归不过) |
+| `report.tableDegraded` | 降级层降级为图片的表数,每张在 `removedSpans` 各有一条留痕(reason=`garbled:degrade_to_image(coverage=…)`)。仅 `degradeGarbledTables` 开启且有降级时出现 |
 | `provenance` | 默认恒为空(纯削减不加字);混淆层/重转写层开启时逐条登记其替换(origin=`ocr_confusion` / `garbled_table`) |
 
 ## 硬保证
@@ -152,7 +161,9 @@ HTTP 模式下该目录须与 server 共享文件系统。
 
 以上保证在默认配置下全部成立。显式开启 `fixOcrConfusion` 后,"保真"与
 "表格逐字节不变"两条变为下述双契约,其余保证不变;显式开启 `rewriteGarbledTables` 后,
-被机械检测器判废的个别表格另有"整格替换 + 全量留痕"的独立契约,见[乱码表重转写层](#乱码表重转写层opt-in)。
+被机械检测器判废的个别表格另有"整格替换 + 全量留痕"的独立契约,见[乱码表重转写层](#乱码表重转写层opt-in);
+显式开启 `degradeGarbledTables` 后,救不回的乱码表整项降级为图片(纯削减 + 留痕,
+见[降级兜底](#降级兜底degradegarbledtables))。
 
 ## 混淆修正层(opt-in)
 
@@ -222,6 +233,16 @@ HTML 标签骨架在构造上不可触碰(替换只发生在单元格内层区�
 
 `rewriteGarbledTables` 进缓存 key(含重转写 prompt 版本),开关不同的调用绝不互相污染缓存。
 
+### 降级兜底(degradeGarbledTables)
+
+重转写是尽力而为:视觉故障搁置、闸门全拒、覆盖率回归不过,乱码表都会原样留在产物里——
+一张满是「目择值/数据来酒」的假表对下游检索/RAG 是**主动误导**,而它的 `img_path`
+截图完全清晰。显式传 `degradeGarbledTables: true` 启用纯机械兜底(不依赖 LLM/VL,
+可独立于重转写层开启):跑在重转写层之后,**仍判废**(词典覆盖率塌方)且有 `img_path`
+的表整项降级为 `image`——题注/脚注改挂 `image_caption`/`image_footnote`,`table_body`
+删除并留痕(`removedSpans`,reason 含覆盖率),full.md 里呈现为图片引用。
+两层都开 = 先救、救不回再降;救回(覆盖率过阈值)的表自然跳过。同样进缓存 key。
+
 ## 工作原理
 
 ```
@@ -261,11 +282,12 @@ HTML 标签骨架在构造上不可触碰(替换只发生在单元格内层区�
 | `missed_heading` 漏标标题 | 同级编号兄弟是标题而本块是正文,且编号相邻 | `promote` |
 | `trailing_marker` 段尾粘连节标记 | 段尾粘了「[相关文件]」类独立结构块(跨页 merge 吸入) | `split` |
 | `separated_caption` caption 错序 | caption 样短文本与表格之间隔着一个标题块 | `reorder` |
+| `caption_heading` 被吞标题 | `table_caption` 条目是带编号的标题样短文本,且存在相邻的同级编号标题兄弟(MinerU 把小节标题塞进了表格题注) | `extractCaption` |
 | `extra_char` 赘字/衍字 | 功能词叠字(的的/地地/是是/了了,合法叠词除外)、孤立偏旁部首(「3)亻」) | `deleteChar` |
 
 **只标记、无修复操作**(LLM 只能判误报,计入 report 供观测):孤儿/空 caption(`caption_issue`)。
 
-### 修复操作集(10 个削减/重组 + dismiss)
+### 修复操作集(11 个削减/重组 + dismiss)
 
 全部是纯函数 `(items, args) -> items`,自带保真校验,违反即回滚并计入 `report.violations`。
 
@@ -281,6 +303,7 @@ HTML 标签骨架在构造上不可触碰(替换只发生在单元格内层区�
 | `deleteChar(id, offset)` | 删单个 OCR 衍字。白名单严格:与紧邻字符重复的功能词叠字(的/地/是/了)或孤立偏旁部首;的的确确/地地道道/是是非非受构造性保护 | 不变 |
 | `mergeTable(idA, idB)` | 跨页拆表合并:B 的 `<tr>` 行**原字节**追加到 A 末行后,caption/footnote 拼接;B 首行与 A 表头逐字节相同时(每页重印表头)去重并留痕 | bbox 并集;page_idx 取首块 |
 | `mergeList(idA, idB, joinSeam?)` | 跨页拆列表合并:`list_items` 拼接;`joinSeam` 把 A 尾项与 B 首项缝成一项(断句跨页) | bbox 并集;page_idx 取首块 |
+| `extractCaption(id, captionIndex, position, level?)` | 把被吞进 `table_caption` 的小节标题抽出为独立 text 块(字符纯移动),插在表格前/后;`level` 给则直接设 `text_level` | 新块继承表格 bbox/page_idx |
 | `dismiss(id, reason)` | 裁定误报,不改文本;重新探测时不再标记它 | — |
 
 `mergeTable` **不做列对齐判断,也不做列对齐修复**:"是否同一张表"由模型看内容裁决
@@ -417,12 +440,12 @@ crates/mineru-refine/            # Rust core
   src/types.rs                   #   MineruItem(保序 JSON 对象)/ WorkItem / OpCall / RefineReport
   src/id.rs                      #   内部稳定 ID(出口剥除,绝不进输出 schema)
   src/detect.rs                  #   确定性异常探测器 → 疑点队列
-  src/mechanical.rs              #   机械清洗 pass(表格噪声,确定性、不打 LLM)
-  src/ops.rs                     #   10 个削减/重组操作 + 保真闸 + 回滚
+  src/mechanical.rs              #   机械清洗 pass(表格噪声 + 频率投票,确定性、不打 LLM)
+  src/ops.rs                     #   11 个削减/重组操作 + 保真闸 + 回滚
   src/extrachar.rs               #   赘字/衍字白名单(deleteChar 的准入)
   src/invariant.rs               #   保真 / table_body / 几何校验
   src/confusion.rs               #   混淆修正层(opt-in,fixOcrConfusion)
-  src/garbled.rs                 #   乱码表重转写层(opt-in,rewriteGarbledTables)
+  src/garbled.rs                 #   乱码表重转写层 + 降级兜底(opt-in)
   src/agent_loop.rs              #   确定性外层循环 + LLM tool-use + 守卫
   src/llm.rs                     #   裸 reqwest:DeepSeek + Qwen-VL(trait 注入,测试 mock)
   src/markdown.rs                #   清洗后 items → full.md 确定性重渲染

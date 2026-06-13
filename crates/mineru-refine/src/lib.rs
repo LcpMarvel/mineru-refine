@@ -1,8 +1,10 @@
 // mineru-refine：MinerU 解析结果的 linter/fixer（Rust core）。
 // content_list（item 对象数组）进，同 schema 出：只做削减与重组，绝不新增一个字。
 // 硬保证：C_out ⊆ C_in（机器闸门裁决，违反即回滚/fail-open）。
-// 唯一例外是 opt-in 的混淆修正层（fix_ocr_confusion，见 confusion.rs）：
-// 准入名单内的稀疏一换一替换，全量进 report/provenance，可审计可撤销。
+// 例外（均为稀疏一换一替换、全量留痕可审计可撤销）：
+//   - opt-in 混淆修正层（fix_ocr_confusion，见 confusion.rs）：LLM 裁决 + 准入名单；
+//   - 机械清洗的全文频率投票（mech:token_vote，见 mechanical.rs）：确定性、
+//     证据全文自明（SW0T×6 vs SWOT×24 且差异是 0↔O 形近对），removedSpans 留痕。
 //
 // 公共入口：refine()。内部模块（agent_loop/ops/llm）按需 re-export。
 
@@ -31,7 +33,7 @@ pub use types::{
 };
 
 pub use confusion::CONFUSION_PROMPT_VERSION;
-pub use garbled::GARBLED_PROMPT_VERSION;
+pub use garbled::{DEGRADE_VERSION, GARBLED_PROMPT_VERSION};
 
 pub use agent_loop::Logger;
 pub use llm::{

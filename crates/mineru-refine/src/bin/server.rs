@@ -27,6 +27,8 @@ struct RefineRequest {
     extra_confusion_pairs: Option<Vec<String>>,
     /// 重度乱码表的视觉重转写层（opt-in，默认关；需要 imageDir）。
     rewrite_garbled_tables: Option<bool>,
+    /// 乱码表降级兜底（opt-in，默认关；纯机械）：仍判废且有图的表整项降级为 image。
+    degrade_garbled_tables: Option<bool>,
 }
 
 async fn handle_refine(
@@ -47,6 +49,7 @@ async fn handle_refine(
             fix_ocr_confusion: req.fix_ocr_confusion.unwrap_or(false),
             extra_confusion_pairs: req.extra_confusion_pairs.unwrap_or_default(),
             rewrite_garbled_tables: req.rewrite_garbled_tables.unwrap_or(false),
+            degrade_garbled_tables: req.degrade_garbled_tables.unwrap_or(false),
             ..RefineOptions::default()
         },
     )

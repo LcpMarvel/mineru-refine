@@ -32,6 +32,10 @@ pub struct RefineOpts {
     /// Qwen-VL 对照 img_path 截图逐单元格重转写（全量进 report.tableRewrites，可程序化撤销）。
     /// 开启时必须提供 imageDir。
     pub rewrite_garbled_tables: Option<bool>,
+    /// 乱码表降级兜底（opt-in，默认关；纯机械，不依赖 LLM/VL）。跑在重转写层之后：
+    /// 仍判废且有 img_path 的表整项降级为 image（table_body 删除并进 removedSpans，
+    /// report.tableDegraded 计数）。两层都开 = 先救、救不回再降。
+    pub degrade_garbled_tables: Option<bool>,
 }
 
 /// MinerU content_list 清洗。fail-open：任何异常原样返回输入（report.failOpen=true）。
@@ -50,6 +54,7 @@ pub async fn refine(items: Value, opts: Option<RefineOpts>) -> Result<Value> {
             fix_ocr_confusion: opts.fix_ocr_confusion.unwrap_or(false),
             extra_confusion_pairs: opts.extra_confusion_pairs.unwrap_or_default(),
             rewrite_garbled_tables: opts.rewrite_garbled_tables.unwrap_or(false),
+            degrade_garbled_tables: opts.degrade_garbled_tables.unwrap_or(false),
             ..RefineOptions::default()
         },
     )

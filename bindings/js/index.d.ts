@@ -44,6 +44,12 @@ export interface RefineOpts {
    * 开启时必须提供 imageDir。
    */
   rewriteGarbledTables?: boolean
+  /**
+   * 乱码表降级兜底（opt-in，默认关；纯机械，不依赖 LLM/VL）。跑在重转写层之后：
+   * 仍判废且有 img_path 的表整项降级为 image（table_body 删除并进 removedSpans，
+   * report.tableDegraded 计数）。两层都开 = 先救、救不回再降。
+   */
+  degradeGarbledTables?: boolean
 }
 
 /** items → full.md 文本（确定性重渲染，与 MinerU pipeline 拼接规则对齐）。 */

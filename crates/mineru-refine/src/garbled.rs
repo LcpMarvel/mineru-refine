@@ -25,7 +25,7 @@
 
 use crate::agent_loop::Logger;
 use crate::llm::{LoadImage, VisionClient};
-use crate::types::{RefItem, TableCellRewrite, TokenUsage};
+use crate::types::{RefItem, RemovedSpan, TableCellRewrite, TokenUsage};
 use futures::StreamExt;
 use serde_json::json;
 use std::collections::HashSet;
@@ -34,6 +34,9 @@ use std::sync::LazyLock;
 
 /// 重转写层独立的 prompt 版本（进缓存 key）。
 pub const GARBLED_PROMPT_VERSION: &str = "g1";
+
+/// 降级层独立的逻辑版本（进缓存 key）。
+pub const DEGRADE_VERSION: &str = "d1";
 
 /// 覆盖率判废阈值（标定见模块头注释）。
 const COVERAGE_THRESHOLD: f64 = 0.55;
@@ -541,6 +544,65 @@ pub async fn rewrite_garbled_tables(
     }
 
     (items, outcome)
+}
+
+// ── 乱码表降级为图片（opt-in，degrade_garbled_tables=true 才运行）──
+//
+// 重转写层是尽力而为：视觉故障搁置、闸门全拒、覆盖率回归不过、层根本没开——
+// 这些路径都会让乱码表原样留在产物里，一张满是「目择值/数据来酒」的假表对下游
+// 检索/RAG 是主动误导，而它的 img_path 截图完全清晰。本层是纯机械兜底：
+// 跑在重转写层【之后】（救回的表覆盖率已过阈值，自然跳过），仍判废且有 img_path
+// 的表整项降级为 image——table_caption/footnote 改挂 image_*，table_body 删除并进
+// removedSpans 留痕（reason 含覆盖率），full.md 里呈现为图片引用。
+// 不依赖 LLM/VL，可独立于重转写层开启。
+
+#[derive(Default)]
+pub struct DegradeOutcome {
+    /// 每张被降级的表一条（text=[table]，reason 含词典覆盖率）。
+    pub removed_spans: Vec<RemovedSpan>,
+    pub degraded: u64,
+}
+
+/// 仍判废（词典覆盖率 < 阈值）且有 img_path 的表，整项降级为 image。
+pub fn degrade_garbled_tables(items: &mut [RefItem], log: &Logger) -> DegradeOutcome {
+    let mut outcome = DegradeOutcome::default();
+    for r in items.iter_mut() {
+        let Some(body) = r.item.table_body() else {
+            continue;
+        };
+        let Some((sample, coverage)) = detect_garbled_table(body) else {
+            continue;
+        };
+        if r.item.img_path().filter(|p| !p.is_empty()).is_none() {
+            log(&format!(
+                "降级层：{} 判废（覆盖率 {coverage:.2}）但无 img_path，无图可降，保留",
+                r.id
+            ));
+            continue;
+        }
+        r.item.set("type", json!("image"));
+        r.item.remove("table_body");
+        for (from, to) in [
+            ("table_caption", "image_caption"),
+            ("table_footnote", "image_footnote"),
+        ] {
+            if let Some(v) = r.item.0.get(from).cloned() {
+                r.item.remove(from);
+                r.item.set(to, v);
+            }
+        }
+        outcome.removed_spans.push(RemovedSpan {
+            item_id: r.id.clone(),
+            text: "[table]".into(),
+            reason: format!("garbled:degrade_to_image(coverage={coverage:.2})"),
+        });
+        outcome.degraded += 1;
+        log(&format!(
+            "降级层：{} 词典覆盖率 {coverage:.2}（样本 {sample} 字）重转写未救回，降级为图片",
+            r.id
+        ));
+    }
+    outcome
 }
 
 #[cfg(test)]

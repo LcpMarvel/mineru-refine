@@ -12,6 +12,11 @@
 > 已完成（2026-06-12，core 0.10.0 / garbled g1）：
 > ④ 重度乱码表视觉重转写层（`rewriteGarbledTables`，opt-in，见下「1.」原案与实现差异）。
 >
+> 已完成（2026-06-12，core 0.12.0 / p7，第二轮复查产出，详见「5.」）：
+> ⑥ token 频率投票机械落地（`mech:token_vote`，默认开）；
+> ⑦ 乱码表降级兜底（`degradeGarbledTables`，opt-in）；
+> ⑧ caption_heading 探测器 + extractCaption op（被吞进表格题注的小节标题）。
+>
 > 已完成（2026-06-12，bugfix）：
 > ⑤ 图注/图脚注静默丢失修复——`render_markdown`（markdown.rs）与 caption 探测器
 >    （detect.rs）查的字段名是 `img_caption`/`img_footnote`，但 MinerU 真实字段是
@@ -93,9 +98,93 @@ JZY-001 精修后仍有约 16 处疑似跨页断句，抽查分两类：
   不同结果（本轮把序号 10 续表 + 一条页眉清掉了，更优）。VL 裁决本质非确定，暂接受；
   若要稳定可考虑对 mergeTable 判定加缓存或降温。
 
+## 5. 第二轮复查（2026-06-12，通读三份 refined full.md 全文）
+
+> 注：复查所用 test_data/refined 产物是【默认配置】跑的（report 无 confusionFixes/
+> tableRewrites），opt-in 层的效果未体现。下列「混淆层已覆盖」指机制已有，默认配置不生效。
+
+### 5.1 拉丁 token 频率投票的机械落地（0/O 等形近混淆）✅（core 0.12.0）
+
+实测残留：`SW0T`×6（JZY full.md 多处）、`0GSMT`、`S/W/0/T`、`CE0`×3（047）、
+`0A系统`、SWOT 表里 O1~O12 全写成 `01`~`012`、003 版本号 `la`→`Ia`。
+
+- 混淆层（opt-in）机制上已覆盖大半：0/O 在内置等价类里、prompt 点名 CE0/0A 例子、
+  SW0T 这类还有频率投票注记直通。但默认配置（层关）零修复，且每个 0/O 都送审烧 token。
+- [x] 机械清洗 pass 第 7 件 `mech:token_vote`：全文 latin token 频率统计（≥4 字、
+      ≤1 数字，与混淆层同口径），少数派 token 与多数派（≥4 次且 ≥3× 少数派）恰差一处
+      单字替换、且 (before,after) 同属内置混淆等价类 → 机械直接落地，零 LLM。
+      text/list_items/table_caption/footnote/cell 全覆盖（cell 内紧跟 &/# 的 run 不算
+      token，防 HTML 实体）；校验走「替换对独立结构校验 + 代入旧值得期望值再严格比对」，
+      removedSpans reason=`mech:token_vote→正写`。换位（OGSTM↔OGSMT）故意不收——归混淆层。
+- [x] 实测（offline_audit，零 LLM）：JZY 落地 8 处（SW0T→SWOT×7 + 0GSMT→OGSMT×1），
+      003/047 零误报。注意这是默认配置下首个"换字符"项，主 README「绝不新增一个字」
+      承诺已补注此例外（证据全文自明 + 全量留痕）。
+- 短 token / 无全文多数派的（CE0、0A、S/W/0/T、01、la）证据不足以机械化，
+  仍归 opt-in 混淆层 LLM 裁决——不降低落地门槛。
+
+### 5.2 乱码表「重转写救不回」时降级为图片 ✅（core 0.12.0，`degradeGarbledTables`）
+
+重转写层（g1）是尽力而为：视觉故障搁置、闸门全拒、覆盖率回归不过都会让乱码表
+原样留在产物里——一张满是「目择值/数据来酒」的假表对下游 RAG 是主动误导，
+而它的 img_path 截图完全清晰。
+
+- [x] 新 opt-in 层 `degrade_garbled_tables`（纯机械，不依赖 VL，可独立于重转写层开）：
+      跑在重转写层之后——仍判废（词典覆盖率 < 0.55）且有 img_path 的表，
+      整项降级为 image（table_caption/footnote 改挂 image_*，table_body 删除并进
+      removedSpans 留痕 + report.tableDegraded 计数）。full.md 里呈现为图片引用。
+      降级版本号 d1 进缓存 key；CLI/server/js/python/refine_real（REFINE_DEGRADE_GARBLED=1）
+      五个面全部接线。
+- 顺序语义：重转写层先救，救回（覆盖率过阈值）的不降级；两层都开 = 「先救、救不回再降」
+  （garbled_test 金样本验证：重转写救回 → tableDegraded=0；只开降级层 → 表变 image）。
+
+### 5.3 被吞进 table_caption 的小节标题（promote「不一致」的真身）✅（core 0.12.0 / p7）
+
+复查时以为是 promote 漏（4.6/4.7 没升级而 4.4/4.5/4.8/4.9 都是 ##），对照源数据
+发现根因完全不同：MinerU 把「报告评分表」「4.6核心组织绩效的应用」塞进了评分表的
+table_caption 数组、「4.7公司十大核心指标」塞进了十大指标表的 caption，JZY 的
+「更改情况」同样被吞进更改表 caption。渲染成 caption 行后看起来像漏 promote，
+实际是结构错位——还顺带制造了「4.6 标题隔在『报告评分表』题注和表格之间」的错序。
+
+- [x] 新探测器 `caption_heading`：table_caption 条目过标题表面闸（≤30 内容字、
+      无逗号/句末标点）且行首编号可解析、且存在同数制同深度同父编号的相邻（±1）
+      标题兄弟 → 标疑点（每表只标首个命中条目，loop 迭代收敛）。证据带
+      captionIndex/兄弟 level/position 判断指引。
+- [x] 新 op `extractCaption(id, captionIndex, position, level?)`：把 caption 条目
+      抽出为独立 text 块（level 给则设 text_level），插在表格前/后（position 由 LLM
+      按内容归属判断：表格属于标题前的小节 → after，表格是该小节首个内容 → before）。
+      字符多重集不变（纯移动），table_body 不动，bbox/page_idx 继承表格，表格继承原 ID。
+      工具/system prompt/op_hint 全套接线，PROMPT_VERSION p6→p7。
+- [x] 实测（offline_audit）：047 精确命中 it_0197「4.6核心组织绩效的应用」与
+      it_0199「4.7公司十大核心指标」两处真实病例（兄弟锚点 4.5/4.8），
+      JZY/003 零误报；「表3.1 差距分析模板」类真题注因「表」前缀编号不解析为节编号而免疫。
+- 无编号的被吞标题（JZY「更改情况」）没有可靠机械信号（单条目、无兄弟可佐证），
+  暂不标——渲染为普通段落可接受，不值得为它放宽闸门。
+
+### 5.4 其余残留（待办，未排期）
+
+- **跨页续表碎片**（003 末尾：附件表第 10 项的 4 列碎片表 vs 3 列主表，含 `3）亻`）：
+  探测器有标（split_table 不要求列数相等），但 VL 裁决非确定（见「4. 观察」），
+  且列数不一致 + 烂行的合并正确性存疑。待跨运行稳定性方案一起看。
+- **同表双 OCR 副本**（JZY it_0586 干净表头版 + it_0587 乱码版连续两表）：
+  无现成信号（页码相同不触发 split_table），需「相邻表内容相似度」探测器。
+- **公式碎裂进多格**（JZY 判断矩阵表尾 `一-致性检验：/CI/λmax-/=8.45-8=0.0/645`）：
+  跨格重组超出现有 op 能力（cell 级只有整格重转写），搁置。
+- **colspan 文本拆裂**（047「批准|表」横拆、「公司核心/指标」竖拆）：
+  机械判定「两格拼起来是词而各自不是」可做但收益小，观察。
+- **dismissed 明细不进 report**：36 次 dismiss（JZY）只有计数没有(疑点,理由)明细，
+  优化收敛成本先要这个——可观测性补齐，低成本高价值。
+- **页眉残留漏删一处**（JZY full.md:549「附件3：…」+「编制人：张威」）：同文 3 处
+  已 drop、此处漏。0.11 已有同文组联合裁决，待重跑验证是否已根治。
+
 ## 不做（明确排除）
 
 - **漏字补全**（华大科技「00085」缺一位）：要加字且无法从上下文确定加什么，
   只进 report 当质量信号
 - **占位符 xxxxxX 归一**：源文档本来的脱敏占位内容，改了反而违背保真
 - **页眉/页码清理**：已正确分类为 `header`/`page_number`，下游过滤即可
+- **「十一、」「十二、」整句小节升标题**（JZY）：原文这两节就是「编号+整句」体，
+  含逗号/句末标点，表面闸正确拒绝——升成 40 字长标题反而更差
+- **标题与正文粘连的「1）报告撰写责任：自 2026 年起…」**（047）：需 split+promote
+  两步且切分点只能 LLM 判，同级 2）~5）已是标题、此处渲染为段落语义无损，不值得
+- **源文档自身的内容错误**（JZY「波特五力」正文把五力写成「买方/卖方议价」重复、
+  章节编号 3→5 跳号）：保真原则下不替作者改稿

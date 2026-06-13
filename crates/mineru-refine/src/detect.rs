@@ -579,6 +579,56 @@ pub fn detect(items: &[RefItem]) -> Vec<WorkItem> {
             ));
         }
 
+        // ── 被吞进 table_caption 的小节标题（→ extractCaption）：caption 条目过标题
+        // 表面闸且行首编号可解析，且存在同数制同深度同父编号的相邻（±1）标题兄弟
+        //（真实数据：MinerU 把「4.6核心组织绩效的应用」「4.7公司十大核心指标」塞进了
+        // 相邻表格的 caption，渲染后貌似漏 promote，实为结构错位）。
+        // 每表只标首个命中条目：抽出后下一轮迭代再标剩余的，loop 自然收敛。──
+        if item.item_type() == "table"
+            && let Some(captions) = item.str_array("table_caption")
+        {
+            for (ci, cap) in captions.iter().enumerate() {
+                let Some((path, style, num_end)) = parse_numbering(cap) else {
+                    continue;
+                };
+                let body = numbering_body(cap, num_end);
+                let blen = non_ws_len(body);
+                if blen == 0 || blen > 30 || COMMA_SEMI.is_match(cap) || SENTENCE_END.is_match(cap)
+                {
+                    continue;
+                }
+                let depth = path.len();
+                let parent = &path[..depth - 1];
+                let last = path[depth - 1];
+                let sibling = numbered.iter().find(|n| {
+                    n.heading
+                        && n.style == style
+                        && n.path.len() == depth
+                        && &n.path[..depth - 1] == parent
+                        && (n.path[depth - 1] + 1 == last || last + 1 == n.path[depth - 1])
+                });
+                if let Some(sib) = sibling {
+                    let sib_ref = &items[sib.idx];
+                    let level = sib_ref.item.text_level().unwrap_or(1);
+                    out.push(suspect(
+                        SuspectKind::CaptionHeading,
+                        id,
+                        format!(
+                            "table_caption[{ci}]「{}」疑似被吞进 caption 的小节标题：行首编号与相邻标题兄弟 {}「{}」（level={level}）同级。\
+                             确认是标题 → extractCaption(captionIndex={ci}, level={level}, position 按内容归属判断：\
+                             表格属于该标题【之前】的小节（标题是表格之后内容的开头）→ after；\
+                             表格是该标题小节的首个内容 → before）；确认是真表格题注 → dismiss",
+                            cap.trim(),
+                            sib_ref.id,
+                            char_prefix(sib_ref.item.text().unwrap_or(""), 40),
+                        ),
+                        true,
+                    ));
+                    break;
+                }
+            }
+        }
+
         // ── caption 与表格被标题隔开（→ reorder）：caption 样短文本后紧跟一个标题
         //（或漏标标题候选），标题后紧跟有体表格 → 三块顺序疑似错排。──
         if item.item_type() == "text" && item.text_level().is_none() && caption_like(text) {

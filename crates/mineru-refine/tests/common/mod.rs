@@ -84,6 +84,8 @@ static EVIDENCE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"证据：(.+
 pub static NEXT_ID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"后块=(it_\d+)").unwrap());
 static LEVEL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"level=(\d+)").unwrap());
 static OFFSET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"offset=(\d+)").unwrap());
+static CAPTION_INDEX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"captionIndex=(\d+)").unwrap());
 
 pub type KindHandler = Box<dyn Fn(&str, &str) -> Result<(String, Value), LlmError> + Send + Sync>;
 
@@ -215,6 +217,22 @@ impl MockChat {
                     .and_then(|c| c[1].parse::<i64>().ok())
                     .ok_or_else(|| LlmError(format!("mock 无法从证据解析 offset: {evidence}")))?;
                 ("deleteChar".into(), json!({ "id": id, "offset": offset }))
+            }
+            SuspectKind::CaptionHeading => {
+                let ci = CAPTION_INDEX_RE
+                    .captures(evidence)
+                    .and_then(|c| c[1].parse::<i64>().ok())
+                    .ok_or_else(|| {
+                        LlmError(format!("mock 无法从证据解析 captionIndex: {evidence}"))
+                    })?;
+                let level = LEVEL_RE
+                    .captures(evidence)
+                    .and_then(|c| c[1].parse::<i64>().ok())
+                    .unwrap_or(2);
+                (
+                    "extractCaption".into(),
+                    json!({ "id": id, "captionIndex": ci, "position": "after", "level": level }),
+                )
             }
             SuspectKind::CaptionIssue => {
                 return Err(LlmError("mock 未定义 caption_issue 的处理".into()));

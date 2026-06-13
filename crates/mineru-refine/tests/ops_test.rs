@@ -1115,3 +1115,119 @@ fn delete_char_rejects_out_of_whitelist_and_idioms() {
         &s.ctx(),
     ));
 }
+
+// ── extractCaption ──
+
+fn doc_with_swallowed_heading() -> Vec<MineruItem> {
+    items_of(json!([
+        { "type": "text", "text": "4.5核心组织绩效的考核方法", "text_level": 2, "page_idx": 0, "bbox": bbox(0) },
+        {
+            "type": "table",
+            "table_body": "<table><tr><td>考核项目</td><td>权重</td></tr></table>",
+            "table_caption": ["报告评分表", "4.6核心组织绩效的应用"],
+            "page_idx": 0,
+            "bbox": bbox(40),
+        },
+        { "type": "text", "text": "核心指标结果将运用于薪酬计算。", "page_idx": 0, "bbox": bbox(80) },
+    ]))
+}
+
+#[test]
+fn extract_caption_after_with_level_moves_entry_verbatim() {
+    use mineru_refine::types::ExtractPosition;
+    let s = setup(&doc_with_swallowed_heading());
+    let a = must_apply(
+        &s.ref_items,
+        OpCall::ExtractCaption {
+            id: "it_0002".into(),
+            caption_index: 1,
+            position: ExtractPosition::After,
+            level: Some(2),
+        },
+        &s.ctx(),
+    );
+    assert_eq!(a.items.len(), 4);
+    assert!(a.removed_spans.is_empty()); // 纯移动，无削减
+    // 表格继承原 ID，caption 只剩真题注，body 不动
+    assert_eq!(a.items[1].id, "it_0002");
+    assert_eq!(
+        a.items[1].item.str_array("table_caption").unwrap(),
+        vec!["报告评分表"]
+    );
+    assert_eq!(
+        a.items[1].item.table_body().unwrap(),
+        "<table><tr><td>考核项目</td><td>权重</td></tr></table>"
+    );
+    // 抽出块在表格之后：新 ID、text_level=2、几何继承表格
+    let extracted = &a.items[2];
+    assert_eq!(a.new_ids, vec![extracted.id.clone()]);
+    assert_eq!(extracted.item.item_type(), "text");
+    assert_eq!(extracted.item.text().unwrap(), "4.6核心组织绩效的应用");
+    assert_eq!(extracted.item.text_level(), Some(2));
+    assert_eq!(extracted.item.page_idx(), Some(0));
+    assert_eq!(
+        serde_json::to_value(extracted.item.bbox().unwrap()).unwrap(),
+        json!([50.0, 40.0, 550.0, 60.0])
+    );
+}
+
+#[test]
+fn extract_caption_before_without_level_yields_plain_text() {
+    use mineru_refine::types::ExtractPosition;
+    let s = setup(&items_of(json!([
+        {
+            "type": "table",
+            "table_body": "<table><tr><td>日期</td><td>修改内容</td></tr></table>",
+            "table_caption": ["更改情况"],
+            "page_idx": 0,
+            "bbox": bbox(0),
+        },
+    ])));
+    let a = must_apply(
+        &s.ref_items,
+        OpCall::ExtractCaption {
+            id: "it_0001".into(),
+            caption_index: 0,
+            position: ExtractPosition::Before,
+            level: None,
+        },
+        &s.ctx(),
+    );
+    assert_eq!(a.items.len(), 2);
+    assert_eq!(a.items[0].item.text().unwrap(), "更改情况");
+    assert_eq!(a.items[0].item.text_level(), None);
+    assert_eq!(a.items[1].id, "it_0001");
+    assert_eq!(a.items[1].item.str_array("table_caption").unwrap().len(), 0);
+}
+
+#[test]
+fn extract_caption_rejects_bad_args() {
+    use mineru_refine::types::ExtractPosition;
+    let s = setup(&doc_with_swallowed_heading());
+    let call = |id: &str, ci: i64, level: Option<i64>| OpCall::ExtractCaption {
+        id: id.into(),
+        caption_index: ci,
+        position: ExtractPosition::After,
+        level,
+    };
+    assert!(is_rejected(
+        &s.ref_items,
+        call("it_0001", 0, Some(2)),
+        &s.ctx()
+    )); // 非 table
+    assert!(is_rejected(
+        &s.ref_items,
+        call("it_0002", 2, Some(2)),
+        &s.ctx()
+    )); // index 越界
+    assert!(is_rejected(
+        &s.ref_items,
+        call("it_0002", -1, Some(2)),
+        &s.ctx()
+    ));
+    assert!(is_rejected(
+        &s.ref_items,
+        call("it_0002", 1, Some(0)),
+        &s.ctx()
+    )); // level 非法
+}

@@ -8,6 +8,7 @@
 //      REFINE_MAX_ITERATIONS=N 可显式覆盖外层循环上限
 //      REFINE_FIX_CONFUSION=1 开启 OCR 字符混淆修正层（opt-in，直接替换）
 //      REFINE_REWRITE_GARBLED=1 开启重度乱码表的视觉重转写层（opt-in，整格替换）
+//      REFINE_DEGRADE_GARBLED=1 开启乱码表降级兜底（opt-in，救不回的表降级为图片）
 
 use mineru_refine::types::MineruItem;
 use mineru_refine::{RefineOptions, detect_items, refine, render_markdown};
@@ -96,6 +97,9 @@ async fn main() {
                 rewrite_garbled_tables: std::env::var("REFINE_REWRITE_GARBLED")
                     .map(|v| v == "1" || v == "true")
                     .unwrap_or(false),
+                degrade_garbled_tables: std::env::var("REFINE_DEGRADE_GARBLED")
+                    .map(|v| v == "1" || v == "true")
+                    .unwrap_or(false),
                 ..RefineOptions::default()
             },
         )
@@ -136,6 +140,9 @@ async fn main() {
                     f.item_id, f.row, f.col
                 );
             }
+        }
+        if r.report.table_degraded > 0 {
+            println!("降级层: {} 张乱码表降级为图片", r.report.table_degraded);
         }
         if !r.report.confusion_fixes.is_empty() || r.report.confusion_rejected > 0 {
             println!(

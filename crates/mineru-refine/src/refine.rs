@@ -31,8 +31,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 // 0.9：赘字/衍字删除（extra_char 探测器 + deleteChar op，全走 LLM 裁决）；
 // 0.10：重度乱码表视觉重转写层（rewrite_garbled_tables，opt-in）;
 // 0.11：矛盾决策守卫 + 兄弟组/同文 page_artifact 联合裁决 + dismiss 时序竞争守卫 + promote 层级锚点校正
-pub const REFINE_LOGIC_VERSION: &str = "0.11.0";
-pub const PROMPT_VERSION: &str = "p6"; // p6：extra_char 疑点 op_hint + deleteChar 工具
+// 0.12：机械清洗第 7 件 token 频率投票（mech:token_vote）+ caption_heading 探测器 +
+//       extractCaption op + 乱码表降级兜底层（degrade_garbled_tables，opt-in）
+pub const REFINE_LOGIC_VERSION: &str = "0.12.0";
+pub const PROMPT_VERSION: &str = "p7"; // p7：caption_heading 疑点 op_hint + extractCaption 工具
 /// 默认文本裁决模型;运行时可被 `DEEPSEEK_MODEL` 覆盖(见 `cache_key_for`)。
 pub const MODEL_ID: &str = crate::llm::DEEPSEEK_DEFAULT_MODEL;
 
@@ -64,6 +66,10 @@ pub struct RefineOptions {
     /// 视觉 LLM 对照 img_path 截图逐单元格重转写，闸门 + 全量 provenance，可程序化撤销。
     /// 开启时必须提供 image_dir/load_image（取表格截图），否则按配置错误 fail-open。
     pub rewrite_garbled_tables: bool,
+    /// 乱码表降级兜底（opt-in，纯机械，不依赖 LLM/VL）。跑在重转写层之后：
+    /// 仍判废（词典覆盖率塌方）且有 img_path 的表整项降级为 image
+    /// （table_body 删除并进 removedSpans 留痕）。两层都开 = 先救、救不回再降。
+    pub degrade_garbled_tables: bool,
     pub log: Option<Logger>,
 }
 
@@ -101,6 +107,9 @@ pub fn cache_key_for_opts(sha256: &str, opts: &RefineOptions) -> String {
     }
     if opts.rewrite_garbled_tables {
         key = format!("{key}:garbled-{GARBLED_PROMPT_VERSION}");
+    }
+    if opts.degrade_garbled_tables {
+        key = format!("{key}:degrade-{}", crate::garbled::DEGRADE_VERSION);
     }
     key
 }
@@ -275,6 +284,15 @@ async fn refine_inner(
     )
     .await;
 
+    // ── 乱码表降级兜底（opt-in，纯机械）：重转写层之后——救回的表覆盖率已过阈值，
+    // 自然跳过；仍判废且有图的表整项降级为 image。
+    let mut items = items;
+    let degrade = if opts.degrade_garbled_tables {
+        crate::garbled::degrade_garbled_tables(&mut items, log)
+    } else {
+        crate::garbled::DegradeOutcome::default()
+    };
+
     // ── 混淆修正层（opt-in）：出口闸门之后运行，核心承诺已经定格。
     let (items, confusion) = apply_confusion_layer(
         confusion_table,
@@ -325,6 +343,7 @@ async fn refine_inner(
     }
     let mut removed_spans = mech.removed_spans;
     removed_spans.extend(loop_result.removed_spans);
+    removed_spans.extend(degrade.removed_spans);
 
     Ok(RefineResult {
         items: strip_ids(&items), // 出口剥除内部 ID（schema 透明）
@@ -342,6 +361,7 @@ async fn refine_inner(
             confusion_observations: confusion.observations,
             table_rewrites: garbled.fixes,
             table_rewrite_rejected: garbled.rejected,
+            table_degraded: degrade.degraded,
         },
     })
 }
