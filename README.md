@@ -53,6 +53,10 @@ mineru-refine 接收 content_list,修掉这些问题,返回**同 schema** 的 co
 | **JS/TS** | `bun add mineru-refine` / `npm i mineru-refine` | napi-rs 原生插件,Bun / Node ≥18([文档](bindings/js/)) |
 | **Rust** | `cargo add mineru-refine` | core crate([文档](crates/mineru-refine/)) |
 | **任意语言** | `cargo install mineru-refine --features bin` | HTTP server / CLI(见下) |
+| **Claude Code** | `/plugin install mineru-refine` | 端到端 skill:文件进、干净 markdown 出([文档](plugin/)) |
+
+以上 Python/JS/Rust/HTTP 都接收**已解析的** `content_list`(由 MinerU 产出)。如果你手里只有
+原始文件(PDF/DOC/PPT/图片),想要"一步到位"拿干净 markdown,见下面的 [Claude Code plugin](#claude-code-pluginpdf-进干净-markdown-出)——它把 MinerU 官方 API 解析与 mineru-refine 清洗串成一个 skill。
 
 ## 快速上手
 
@@ -110,6 +114,30 @@ HTTP 模式下该目录须与 server 共享文件系统。
 
 建议消费方在读 `content_list.json` 之后、消费之前调一次,用返回的 `items` 替换原数组;
 调用侧再兜一层超时回退,与内置 fail-open 构成双保险。
+
+## Claude Code plugin(PDF 进、干净 Markdown 出)
+
+上面的库/绑定都从 `content_list` 起步——默认你已经跑过 MinerU。`plugin/` 提供一个 **Claude Code
+plugin**,把"解析 + 清洗"两步串成一个 skill:**原始文件(PDF/DOC/PPT/图片)进,干净 markdown 出**,
+无需自己写集成代码。
+
+```
+/plugin marketplace add LcpMarvel/mineru-refine
+/plugin install mineru-refine@mineru-refine
+```
+
+装好后直接说「清洗这个 PDF:/abs/path/to/报告.pdf」,skill(`mineru-prime`)会:
+
+1. **解析** —— 文件交 [MinerU](https://mineru.net) 官方 API,得 `content_list.json` + images;
+2. **清洗** —— 调 mineru-refine 后处理(三层 opt-in 清洗默认**全开**,追求最干净产物);
+3. 产出一个 **drop-in 替身目录**(`images/`/`layout.json` 镜像,`content_list.json` 换清洗版,
+   `full.md` 重渲染,外加 `refine_report.json`),放进 `mineru-refine-out/refined/`。
+
+首次运行 skill 会引导写入工作目录 `.env`(持久化):`MINERU_API_TOKEN`(解析)、
+`DEEPSEEK_APIKEY`(清洗)、`QWEN_APIKEY`(视觉裁决,强烈建议)。依赖 [bun](https://bun.sh) +
+`unzip`;npm 原生绑定首次自动 `bun install`(含预编译二进制,无需 Rust 工具链)。
+
+详见 [`plugin/README.md`](plugin/)。
 
 ## 选项与返回值
 
@@ -461,6 +489,9 @@ crates/mineru-refine/            # Rust core
 bindings/python/                 # PyO3 → pip install mineru-refine
 bindings/js/                     # napi-rs → bun add mineru-refine
 scripts/mineru_fetch.ts          # MinerU 官方 API 拉取测试产物(Bun)
+plugin/                          # Claude Code plugin(端到端 skill:文件进、干净 markdown 出)
+  skills/mineru-prime/SKILL.md   #   编排:MinerU 解析 → mineru-refine 清洗 → drop-in 产物
+  scripts/{mineru_fetch,refine}.ts  # 解析与清洗脚本(Bun)
 ```
 
 ## 边界(有意不做的)
