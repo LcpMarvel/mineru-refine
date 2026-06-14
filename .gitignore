@@ -13,3 +13,12 @@ __pycache__/
 # JS binding 本地构建产物（CI 按平台出包）
 bindings/js/*.node
 bindings/js/npm/
+
+# Claude Code 本地状态（plugin 启用开关、调度锁等，非共享配置）
+.claude/settings.json
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# plugin 试跑 / 产出目录
+mineru-prime-tryout/
+mineru-refine-out/
