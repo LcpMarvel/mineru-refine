@@ -1157,6 +1157,9 @@ fn op_hint(kind: SuspectKind) -> &'static str {
         SuspectKind::CaptionHeading => {
             "用 getItems/outline 判断该 caption 条目是否被吞的小节标题：是 → extractCaption（captionIndex/level 用证据中的值，position 按内容归属判断——表格属于该标题之前的小节 → after，表格是该小节首个内容 → before）；是真表格题注 → dismiss"
         }
+        SuspectKind::CaptionArtifact => {
+            "确认该 caption 条目是被吞进表格题注的页眉/页脚家具（证据给出「同文已分类为 header/footer 佐证」或「全文高频重复」）→ dropCaption（captionIndex 用证据中的值）；确认是真表格题注 → dismiss"
+        }
         _ => "无对应 op，只能 dismiss（仅标记类）",
     }
 }
