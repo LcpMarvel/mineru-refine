@@ -33,8 +33,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 // 0.11：矛盾决策守卫 + 兄弟组/同文 page_artifact 联合裁决 + dismiss 时序竞争守卫 + promote 层级锚点校正
 // 0.12：机械清洗第 7 件 token 频率投票（mech:token_vote）+ caption_heading 探测器 +
 //       extractCaption op + 乱码表降级兜底层（degrade_garbled_tables，opt-in）
-pub const REFINE_LOGIC_VERSION: &str = "0.12.0";
-pub const PROMPT_VERSION: &str = "p7"; // p7：caption_heading 疑点 op_hint + extractCaption 工具
+// 0.13：caption_artifact 探测器（被吞进 table_caption 的页眉/页脚家具）+ dropCaption op +
+//       两处 Qwen-VL 视觉裁决加 top_k:1 贪婪解码（钉死跨运行漂移，改变裁决产物）
+pub const REFINE_LOGIC_VERSION: &str = "0.13.0";
+pub const PROMPT_VERSION: &str = "p8"; // p8：dropCaption 工具入集（caption_artifact → dropCaption / dismiss）
 /// 默认文本裁决模型;运行时可被 `DEEPSEEK_MODEL` 覆盖(见 `cache_key_for`)。
 pub const MODEL_ID: &str = crate::llm::DEEPSEEK_DEFAULT_MODEL;
 
