@@ -10,8 +10,14 @@
 //
 // 末行输出一行 JSON 摘要，供上层程序化读取。
 
-import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
+
+// MinerU 批量 API 的 zip 解包出一批带 UUID 前缀的原始件（<uuid>_origin.pdf /
+// _model.json / _content_list.json / _content_list_v2.json …），fetch 已归一化出无前缀的
+// content_list.json，这些原始件在 drop-in 替身里是冗余。镜像后按此前缀清掉，
+// 无前缀的标准产物（content_list.json / full.md / layout.json / images/）一律保留。
+const RAW_ARTIFACT = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}_/;
 import { detectSuspects, refine, renderMarkdown } from "mineru-refine";
 
 const [srcArg, dstArg] = process.argv.slice(2);
@@ -43,9 +49,13 @@ const suspectsAfter = (detectSuspects(result.items) as unknown[]).length;
 
 // ── 产出 drop-in 替身目录 ──
 // 先整目录镜像（保住 images/、layout.json，img_path 引用不断链），再覆盖三件套。
-await rmIfExists(dstDir);
+await rm(dstDir, { recursive: true, force: true });
 await cp(srcDir, dstDir, { recursive: true });
 await mkdir(dstDir, { recursive: true });
+// 剔除 MinerU 原始件（带 UUID 前缀），让 drop-in 替身只剩标准产物。
+for (const name of await readdir(dstDir)) {
+  if (RAW_ARTIFACT.test(name)) await rm(join(dstDir, name), { recursive: true, force: true });
+}
 await writeFile(join(dstDir, "content_list.json"), JSON.stringify(result.items, null, 2));
 await writeFile(join(dstDir, "full.md"), renderMarkdown(result.items));
 await writeFile(join(dstDir, "refine_report.json"), JSON.stringify(result.report, null, 2));
@@ -71,8 +81,3 @@ const summary = {
 
 console.log(`✅ ${summary.stem} → ${dstDir}/  (疑点 ${suspectsBefore} → ${suspectsAfter}${summary.failOpen ? "，⚠️ failOpen" : ""})`);
 console.log(JSON.stringify(summary));
-
-async function rmIfExists(p: string) {
-  const { rm } = await import("node:fs/promises");
-  await rm(p, { recursive: true, force: true });
-}
