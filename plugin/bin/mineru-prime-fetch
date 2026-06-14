@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# MinerU 官方 API 解析单文件 → 产物目录。用法: mineru-prime-fetch <input-file> <out-dir>
+# 由 plugin 的 bin/ 自动进 PATH，可在 skill 里直接当命令调，无需 $CLAUDE_PLUGIN_ROOT。
+# 不 cd：保持调用方 CWD 不变，让 bun 从含 .env 的工作目录自动加载 MINERU_API_TOKEN。
+set -euo pipefail
+PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# 把 cwd 的 .env 导入真实进程环境。Bun 的 .env autoload 只进 JS process.env，
+# 不进 C environ，原生绑定/原生 fetch 经此才读得到 key；此处 source 进真实 env 兜全。
+set -a
+[ -f .env ] && . ./.env
+set +a
+exec bun "$PLUGIN_ROOT/scripts/mineru_fetch.ts" "$@"

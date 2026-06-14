@@ -1,0 +1,13 @@
+{
+  "name": "mineru-refine",
+  "version": "0.1.0",
+  "description": "PDF 进、干净 Markdown 出：MinerU 官方 API 解析 + mineru-refine 后处理清洗（伪标题/跨页断句/乱码表…），全程机器校验保真、fail-open 不搞崩。",
+  "author": {
+    "name": "LcpMarvel",
+    "email": "lcpmarvel@gmail.com"
+  },
+  "homepage": "https://github.com/LcpMarvel/mineru-refine",
+  "repository": "https://github.com/LcpMarvel/mineru-refine",
+  "license": "MIT",
+  "keywords": ["mineru", "pdf", "ocr", "markdown", "rag", "document-parsing"]
+}

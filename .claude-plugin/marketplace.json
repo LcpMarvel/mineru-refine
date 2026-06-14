@@ -1,0 +1,14 @@
+{
+  "name": "mineru-refine",
+  "owner": {
+    "name": "LcpMarvel",
+    "email": "lcpmarvel@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "mineru-refine",
+      "description": "PDF/DOC/PPT/图片 进、干净 Markdown 出：MinerU 官方 API 解析 + mineru-refine 后处理清洗，全程机器校验保真、fail-open 不搞崩。",
+      "source": "./plugin"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# mineru-refine 清洗（三层全开）→ drop-in 替身目录 + 报告。
+# 用法: mineru-prime-refine <mineru-out-dir> [refined-out-dir]
+# 由 plugin 的 bin/ 自动进 PATH，可在 skill 里直接当命令调，无需 $CLAUDE_PLUGIN_ROOT。
+# 不 cd：保持调用方 CWD 不变，让 bun 从含 .env 的工作目录自动加载 DEEPSEEK_APIKEY/QWEN_APIKEY。
+set -euo pipefail
+PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPTS="$PLUGIN_ROOT/scripts"
+# 首次运行自动装 mineru-refine 原生绑定（幂等，已装则跳过）。子 shell 里 cd，不污染调用方 CWD。
+if [ ! -d "$SCRIPTS/node_modules/mineru-refine" ]; then
+  ( cd "$SCRIPTS" && bun install )
+fi
+# 把 cwd 的 .env 导入真实进程环境。Bun 的 .env autoload 只进 JS process.env，不进
+# C environ，而 mineru-refine 原生绑定靠 std::env::var 读 key（DEEPSEEK_APIKEY/
+# QWEN_APIKEY）——必须 source 进真实 env 才喂得到，否则视觉裁决会误报「未设置」。
+set -a
+[ -f .env ] && . ./.env
+set +a
+exec bun "$SCRIPTS/refine.ts" "$@"

@@ -1,0 +1,10 @@
+{
+  "name": "mineru-refine-plugin-scripts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Vendored runtime deps for the mineru-refine Claude Code plugin scripts. setup 阶段在本目录跑 `bun install`。",
+  "dependencies": {
+    "mineru-refine": "^0.10.1"
+  }
+}

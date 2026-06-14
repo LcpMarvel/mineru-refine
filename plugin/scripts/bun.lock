@@ -1,0 +1,23 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "mineru-refine-plugin-scripts",
+      "dependencies": {
+        "mineru-refine": "^0.10.1",
+      },
+    },
+  },
+  "packages": {
+    "mineru-refine": ["mineru-refine@0.10.1", "", { "optionalDependencies": { "mineru-refine-darwin-arm64": "0.10.1", "mineru-refine-darwin-x64": "0.10.1", "mineru-refine-linux-arm64-gnu": "0.10.1", "mineru-refine-linux-x64-gnu": "0.10.1" } }, "sha512-3GLkEHgan1iwwx1PyDV4ZYYaByYEqskA3+km5Manqf03lDQ/FPuNMgPhjTL8GVSqx9dh/ep9AZBu6tj3RvuCWQ=="],
+
+    "mineru-refine-darwin-arm64": ["mineru-refine-darwin-arm64@0.10.1", "", { "os": "darwin", "cpu": "arm64" }, "sha512-4kVe99+t/6cMW9wUVHDCWMbFw4lpGWO1jB+SUR16xsKgYor9sBMxThwXOs62Mf8YLpZQVMVLimIHYN+6V0bYAA=="],
+
+    "mineru-refine-darwin-x64": ["mineru-refine-darwin-x64@0.10.1", "", { "os": "darwin", "cpu": "x64" }, "sha512-PUR9iTS1kgsdNNrHGKoO8zChIIorJqSSvX7wG3CoSRlLptd+Q6RqSb2WAcEJoUvbgXRcaSuOibqlNoRWZj5NKw=="],
+
+    "mineru-refine-linux-arm64-gnu": ["mineru-refine-linux-arm64-gnu@0.10.1", "", { "os": "linux", "cpu": "arm64" }, "sha512-LbJCZJVfndCqDygxb6JPPj6bd/baES7tb8+G7Y8rsi24gbwk/LGLCbWWAVtVR+si4oA7KlQo9Vzwd6iWDqJOfQ=="],
+
+    "mineru-refine-linux-x64-gnu": ["mineru-refine-linux-x64-gnu@0.10.1", "", { "os": "linux", "cpu": "x64" }, "sha512-Q/tMPQvuiASMtDB3AEzfTTLSgGOFstPNxy4DAwXaXdaXlWhSdODu2M+Us4cYs3b2X5hR46II2wi7qjJryD/fZQ=="],
+  }
+}
