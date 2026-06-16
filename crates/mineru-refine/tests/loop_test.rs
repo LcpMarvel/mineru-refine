@@ -5,7 +5,8 @@ mod common;
 use async_trait::async_trait;
 use common::{FnChat, Scripted, bbox, golden_input, items_of, parse_suspect, tool_reply};
 use mineru_refine::agent_loop::{
-    DEFAULT_CONCURRENCY, DEFAULT_MAX_ITERATIONS, DEFAULT_MAX_ROUNDS, Logger, LoopOptions, run_loop,
+    DEFAULT_CONCURRENCY, DEFAULT_MAX_ITERATIONS, DEFAULT_MAX_ROUNDS, Logger, LoopOptions, Progress,
+    run_loop,
 };
 use mineru_refine::id::assign_ids;
 use mineru_refine::llm::{ChatClient, ChatResult, LlmError, Message};
@@ -27,6 +28,8 @@ fn opts(chat: Arc<dyn ChatClient>, concurrency: usize, max_rounds: u32) -> LoopO
         load_image: None,
         vision: None,
         log: silent_log(),
+        progress: None,
+        input_suspects: 0,
     }
 }
 
@@ -110,6 +113,48 @@ async fn observation_round_trips_then_verdict() {
     assert_eq!(r.op_counts.get("demote"), Some(&1));
     let it2 = r.items.iter().find(|x| x.id == "it_0002").unwrap();
     assert!(it2.item.text_level().is_none());
+}
+
+#[tokio::test]
+async fn progress_sink_emits_per_iteration_with_terminal_zero() {
+    let (ref_items, next_id) = assign_ids(&golden_input());
+    // 全部 dismiss：本测只关心进度帧，不关心裁决内容
+    let chat = FnChat::new(move |messages: &[Message], _: &Value| {
+        let (_, id, _) = parse_suspect(common::first_user_content(messages))?;
+        Ok(call("dismiss", json!({ "id": id, "reason": "测试" })))
+    });
+    let events: Arc<Mutex<Vec<Progress>>> = Arc::new(Mutex::new(vec![]));
+    let ev = events.clone();
+    let r = run_loop(
+        ref_items,
+        next_id,
+        LoopOptions {
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+            max_rounds_per_suspect: DEFAULT_MAX_ROUNDS,
+            concurrency: DEFAULT_CONCURRENCY,
+            chat: Arc::new(chat),
+            load_image: None,
+            vision: None,
+            log: silent_log(),
+            progress: Some(Arc::new(move |p: Progress| ev.lock().unwrap().push(p))),
+            input_suspects: 4, // golden_input 有 4 个 hasOp 疑点
+        },
+    )
+    .await
+    .unwrap();
+
+    let events = events.lock().unwrap();
+    assert!(events.len() >= 2, "至少起点 + 终点两帧"); // 实际：iter0 有 worklist，下一轮空 → 终点帧
+    let first = &events[0];
+    assert_eq!(first.iterations, 0); // 起点：还没处理任何疑点
+    assert_eq!(first.worklist_remaining, 4); // = 初始可处理疑点
+    assert_eq!(first.input_suspects, 4); // 分母原样透传
+    assert_eq!(first.max_iterations, DEFAULT_MAX_ITERATIONS);
+    let last = events.last().unwrap();
+    assert_eq!(last.worklist_remaining, 0); // 终点帧：清洗到底
+    assert_eq!(last.input_suspects, 4);
+    // 进度的 iterations 与最终返回口径一致（全 dismiss → 1 轮跑完）
+    assert_eq!(last.iterations, r.iterations);
 }
 
 #[tokio::test]
@@ -247,6 +292,8 @@ async fn contradictory_dismiss_plus_op_rejected_then_redecided() {
             chat: Arc::new(chat),
             load_image: None,
             vision: None,
+            progress: None,
+            input_suspects: 0,
             log: Arc::new(move |s| lg.lock().unwrap().push(s.to_string())),
         },
     )
@@ -330,6 +377,8 @@ async fn sibling_group_jointly_adjudicated_in_one_unit() {
             chat: Arc::new(chat),
             load_image: None,
             vision: None,
+            progress: None,
+            input_suspects: 0,
             log,
         },
     )
@@ -396,6 +445,8 @@ async fn promote_level_deterministically_corrected_to_sibling_anchor() {
             chat: Arc::new(chat),
             load_image: None,
             vision: None,
+            progress: None,
+            input_suspects: 0,
             log,
         },
     )
@@ -479,6 +530,8 @@ async fn stale_outline_dismissal_rechallenged_once() {
             chat: Arc::new(Yielding(chat)),
             load_image: None,
             vision: None,
+            progress: None,
+            input_suspects: 0,
             log,
         },
     )
@@ -543,6 +596,8 @@ async fn same_text_page_artifacts_jointly_adjudicated() {
             chat: Arc::new(chat),
             load_image: None,
             vision: None,
+            progress: None,
+            input_suspects: 0,
             log,
         },
     )

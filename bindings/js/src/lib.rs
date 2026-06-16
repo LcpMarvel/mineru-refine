@@ -1,11 +1,13 @@
 // napi-rs 绑定：Bun/Node 直接 import 原生插件。
 // items 收/发普通 JS 对象（serde-json 桥接），refine 是真 async（napi tokio runtime）。
 
-use mineru_refine_core::RefineOptions;
 use mineru_refine_core::types::MineruItem;
+use mineru_refine_core::{Progress, RefineOptions};
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use serde_json::Value;
+use std::sync::Arc;
 
 fn parse_items(items: Value) -> Result<Vec<MineruItem>> {
     serde_json::from_value(items)
@@ -40,10 +42,26 @@ pub struct RefineOpts {
 
 /// MinerU content_list 清洗。fail-open：任何异常原样返回输入（report.failOpen=true）。
 /// 返回 { items, provenance, report }，schema 与 TS/HTTP 版完全一致。
+///
+/// onProgress 可选：清洗阶段每轮迭代回调一次，参数 { iterations, maxIterations,
+/// worklistRemaining, inputSuspects }。回调在原生线程上以 NonBlocking 模式投递，
+/// 不阻塞清洗；不传则零开销、行为与原先一致。
 #[napi]
-pub async fn refine(items: Value, opts: Option<RefineOpts>) -> Result<Value> {
+pub async fn refine(
+    items: Value,
+    opts: Option<RefineOpts>,
+    on_progress: Option<ThreadsafeFunction<Value, (), Value, Status, false>>,
+) -> Result<Value> {
     let items = parse_items(items)?;
     let opts = opts.unwrap_or_default();
+    // ThreadsafeFunction 本身就是 Clone + Send + Sync 的 Arc 句柄，直接 move 进闭包即可。
+    let progress = on_progress.map(|cb| {
+        Arc::new(move |p: Progress| {
+            if let Ok(v) = serde_json::to_value(&p) {
+                cb.call(v, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        }) as mineru_refine_core::ProgressSink
+    });
     let result = mineru_refine_core::refine(
         items,
         RefineOptions {
@@ -55,6 +73,7 @@ pub async fn refine(items: Value, opts: Option<RefineOpts>) -> Result<Value> {
             extra_confusion_pairs: opts.extra_confusion_pairs.unwrap_or_default(),
             rewrite_garbled_tables: opts.rewrite_garbled_tables.unwrap_or(false),
             degrade_garbled_tables: opts.degrade_garbled_tables.unwrap_or(false),
+            progress,
             ..RefineOptions::default()
         },
     )

@@ -222,6 +222,42 @@ table_caption 数组、「4.7公司十大核心指标」塞进了十大指标表
   或 dismiss。真 LLM 重跑：`dropCaption×2` 落地、549/551 残留清零、正文引用（131 行）保留、
   细分市场表 caption=[]、violations=0、failOpen=false、table_body 逐字节不变。
 
+## 6. 处理进度：清洗阶段进度钩子 ✅（core 0.13.0，库侧完成；前端属另一仓）
+
+> 已完成（2026-06-15，core 进度钩子）：本库侧（core + CLI/server/js/python）全部接线。
+> 前端「解析中/清洗中」两段状态屏（design.pen）属 Web 产品仓，不在本库范围，下「①前端」不做。
+
+> 背景：mineru-refine 计划做成收费 Web 服务（设计稿 `design.pen`）。异步任务的「处理中」
+> 状态屏要给用户显示真实进度。链路本是两段，进度性质不同，页面应呈现 **解析中 / 清洗中** 两个状态，
+> 而不是一个糊弄人的全局「第 N 页」。
+
+- **解析中（MinerU）——真页码，现成可用**：官方轮询接口 `/api/v4/extract-results/batch/{id}`
+  已回 `extract_progress.{extracted_pages, total_pages}`（`scripts/mineru_fetch.ts` 已在读并打印
+  `${extracted_pages}/${total_pages}页`）。这段直接照搬接口字段显示「已解析 X / Y 页」即可，非估算。
+- **清洗中（refine）——没有「第几页」概念，需加进度钩子**：`run_loop`
+  （`crates/mineru-refine/src/agent_loop.rs`）是 loop-until-dry 跑「待修点(suspects)」worklist，
+  预算由 `max_iterations`（按 `input_suspects` 自适应）封顶，大量 op 跨页（如跨页拼表看
+  `page-1/page/page+1`），所以**没有当前页码**。真实进度单位是「已处理疑点 / 迭代轮次」。
+  目前 `run_loop` 内有 `iterations` 与 worklist 长度，但**没有对外的进度回调/channel**
+  （无 sender/emit/callback），前端拿不到实时进度，只能转圈。
+
+- [x] `run_loop`/`refine`/`refine_inner` 加可选 `progress: Option<ProgressSink>`
+      （`agent_loop.rs`，`ProgressSink = Arc<dyn Fn(Progress)+Send+Sync>`）。每轮迭代开始吐一帧
+      `Progress { iterations, max_iterations, worklist_remaining, input_suspects }`（camelCase 序列化），
+      含起点（iterations=0、remaining=初始疑点）与终点（remaining=0「清洗到底」）两个边界帧。
+      缺省 None 时不构造事件、不调用，行为逐字节一致（回归 `loop_test::progress_sink_emits_per_iteration_with_terminal_zero`）。
+- [x] 四面接线：
+      - **CLI**：进度走 stderr 的 NDJSON（`[mineru-refine:progress] {…}`），stdout 仍纯结果 JSON
+        （真 LLM 实测：ZBZ-003 吐 iter0 remaining=5 → iter5 remaining=0）。
+      - **server**：新增 `POST /refine/stream`（`text/event-stream`）：逐轮 `event: progress`、收尾 `event: result`
+        （= 非流式 `/refine` 回包）；坏请求仍 400。原 `POST /refine` 不变。真 LLM 实测通过。
+      - **js**（napi）：`refine(items, opts?, onProgress?)`，`onProgress: (p)=>void`（ThreadsafeFunction，
+        NonBlocking 投递，CalleeHandled=false 给干净的单参回调）。源码已改，`.node`/`.d.ts` 随 release 重生成。
+      - **python**（pyo3）：`refine(..., progress=None)`，回调收一个 dict（原生线程上临时取回 GIL 调用）。
+        源码已改，wheel 随 release 重生成。
+- ~~前端「处理中」两段状态屏~~ —— 属 Web 产品仓（design.pen），不在本库范围。本库只负责
+      把清洗阶段的真实进度暴露出来（上面四面），前端如何消费（SSE/轮询 + 解析中页码拼接）由产品仓决定。
+
 ## 不做（明确排除）
 
 - **漏字补全**（华大科技「00085」缺一位）：要加字且无法从上下文确定加什么，

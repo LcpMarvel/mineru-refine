@@ -17,8 +17,12 @@ export const PROMPT_VERSION: string
 /**
  * MinerU content_list 清洗。fail-open：任何异常原样返回输入（report.failOpen=true）。
  * 返回 { items, provenance, report }，schema 与 TS/HTTP 版完全一致。
+ *
+ * onProgress 可选：清洗阶段每轮迭代回调一次，参数 { iterations, maxIterations,
+ * worklistRemaining, inputSuspects }。回调在原生线程上以 NonBlocking 模式投递，
+ * 不阻塞清洗；不传则零开销、行为与原先一致。
  */
-export declare function refine(items: any, opts?: RefineOpts | undefined | null): Promise<any>
+export declare function refine(items: any, opts?: RefineOpts | undefined | null, onProgress?: ((value: any) => void) | undefined | null): Promise<any>
 
 export const REFINE_LOGIC_VERSION: string
 

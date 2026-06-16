@@ -3,8 +3,8 @@
 // 出口闸门：保真不变式 + 异常数单调 + 几何，任一不过 → fail-open。
 
 use crate::agent_loop::{
-    DEFAULT_CONCURRENCY, DEFAULT_MAX_ROUNDS, Logger, LoopOptions, default_logger, run_loop,
-    skipped_without_vision,
+    DEFAULT_CONCURRENCY, DEFAULT_MAX_ROUNDS, Logger, LoopOptions, ProgressSink, default_logger,
+    run_loop, skipped_without_vision,
 };
 use crate::confusion::{
     CONFUSION_PROMPT_VERSION, ConfusionOutcome, ConfusionTable, fix_confusions,
@@ -73,6 +73,10 @@ pub struct RefineOptions {
     /// （table_body 删除并进 removedSpans 留痕）。两层都开 = 先救、救不回再降。
     pub degrade_garbled_tables: bool,
     pub log: Option<Logger>,
+    /// 可选进度回调（清洗阶段）。每轮迭代吐出一次 Progress，调用方折算成百分比/
+    /// 「已处理 N / M 个待修点」。缺省 None 时行为与现状逐字节一致。
+    /// 注意：进度只覆盖 run_loop 主循环；opt-in 的乱码重转写/混淆层不发进度。
+    pub progress: Option<ProgressSink>,
 }
 
 /// maxIterations 的自适应默认值：随初始可处理疑点数走，固定常数对大文档必然截断。
@@ -255,6 +259,8 @@ async fn refine_inner(
             load_image: load_image.clone(),
             vision: vision.clone(),
             log: log.clone(),
+            progress: opts.progress.clone(),
+            input_suspects,
         },
     )
     .await

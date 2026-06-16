@@ -9,10 +9,11 @@
 //
 // 跑：  cat content_list.json | mineru-refine
 
-use mineru_refine::{MineruItem, RefineOptions, refine};
+use mineru_refine::{MineruItem, Progress, RefineOptions, refine};
 use serde_json::Value;
 use std::io::Read;
 use std::process::exit;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
@@ -32,7 +33,7 @@ async fn main() {
         }
     };
 
-    let (items_value, opts) = match parsed {
+    let (items_value, mut opts) = match parsed {
         Value::Array(_) => (parsed, RefineOptions::default()),
         Value::Object(ref obj) => {
             // 严格解析：含非字符串元素是配置错误，早抛不静默吞（与 HTTP server 的 serde 行为一致）
@@ -80,6 +81,15 @@ async fn main() {
             exit(2);
         }
     };
+
+    // 进度走 stderr 的 NDJSON（stdout 仍是纯结果 JSON）：每行 `[mineru-refine:progress] {…}`，
+    // subprocess 调用方按前缀过滤即可拿到清洗阶段实时进度。
+    opts.progress = Some(Arc::new(|p: Progress| {
+        eprintln!(
+            "[mineru-refine:progress] {}",
+            serde_json::to_string(&p).expect("Progress 序列化不可能失败")
+        );
+    }));
 
     let result = refine(items, opts).await;
     println!(

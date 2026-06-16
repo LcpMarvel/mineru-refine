@@ -112,6 +112,33 @@ curl localhost:8771/health
 视觉裁决(用表格裁剪图判断"是不是同一张表"),不提供则该类问题整体跳过、表格原样保留。
 HTTP 模式下该目录须与 server 共享文件系统。
 
+**清洗进度(可选):** 清洗是 loop-until-dry 跑「待修点」worklist,没有页码概念,
+进度单位是「已处理疑点 / 迭代轮次」。每轮迭代吐一帧
+`{ iterations, maxIterations, worklistRemaining, inputSuspects }`(含起点 iterations=0
+与终点 worklistRemaining=0),各面接法:
+
+```bash
+# HTTP: SSE 流(逐轮 event: progress,收尾 event: result = 非流式 /refine 回包)
+curl -N -X POST localhost:8771/refine/stream -d '{"items":[...]}'
+```
+
+```ts
+// JS: 第三个参数 onProgress
+await refine(contentList, {}, (p) => console.log(p.worklistRemaining, "/", p.inputSuspects));
+```
+
+```python
+# Python: progress= 关键字,回调收一个 dict
+mineru_refine.refine(items, progress=lambda p: print(p["worklistRemaining"], "/", p["inputSuspects"]))
+```
+
+```rust
+// Rust: RefineOptions.progress = Some(Arc<dyn Fn(Progress)+Send+Sync>)
+```
+
+CLI 模式下进度走 stderr 的 NDJSON(`[mineru-refine:progress] {…}`),stdout 仍是纯结果 JSON。
+进度回调不传时零开销,行为逐字节不变。
+
 建议消费方在读 `content_list.json` 之后、消费之前调一次,用返回的 `items` 替换原数组;
 调用侧再兜一层超时回退,与内置 fail-open 构成双保险。
 

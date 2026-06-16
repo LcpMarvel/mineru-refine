@@ -3,11 +3,11 @@
 // LLM 调用在独立 tokio runtime 上跑，期间释放 GIL（不卡住调用方解释器）。
 
 use mineru_refine_core::types::MineruItem;
-use mineru_refine_core::{RefineOptions, render_markdown as core_render_markdown};
+use mineru_refine_core::{Progress, RefineOptions, render_markdown as core_render_markdown};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pythonize::{depythonize, pythonize};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
@@ -26,7 +26,11 @@ fn parse_items(items: &Bound<'_, PyAny>) -> PyResult<Vec<MineruItem>> {
 /// 返回 dict：{ "items": [...], "provenance": [], "report": {...} }，
 /// 字段与 TS/HTTP 版完全一致（camelCase report）。
 #[pyfunction]
-#[pyo3(signature = (items, *, sha256=None, max_iterations=None, concurrency=None, image_dir=None, fix_ocr_confusion=false, extra_confusion_pairs=None, rewrite_garbled_tables=false, degrade_garbled_tables=false))]
+/// progress 可选：清洗阶段每轮迭代回调一次，参数是一个 dict
+/// `{ "iterations", "maxIterations", "worklistRemaining", "inputSuspects" }`。
+/// 回调在原生工作线程上调用（临时重新获取 GIL），实现应轻量；不传则零开销、
+/// 行为与原先逐字节一致。
+#[pyo3(signature = (items, *, sha256=None, max_iterations=None, concurrency=None, image_dir=None, fix_ocr_confusion=false, extra_confusion_pairs=None, rewrite_garbled_tables=false, degrade_garbled_tables=false, progress=None))]
 #[allow(clippy::too_many_arguments)] // PyO3 keyword-only 参数面，逐项展开是接口本体
 fn refine(
     py: Python<'_>,
@@ -39,8 +43,20 @@ fn refine(
     extra_confusion_pairs: Option<Vec<String>>,
     rewrite_garbled_tables: bool,
     degrade_garbled_tables: bool,
+    progress: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     let items = parse_items(&items)?;
+    // Py<PyAny> 本身就是 Send + Sync + Clone 的引用计数句柄，直接 move 进闭包即可。
+    let progress = progress.map(|callable| {
+        Arc::new(move |p: Progress| {
+            // 回调在 RUNTIME 线程上触发，此刻 GIL 已被 detach 释放——临时取回再调用 Python。
+            Python::attach(|py| {
+                if let Ok(obj) = pythonize(py, &p) {
+                    let _ = callable.bind(py).call1((obj,)); // 回调抛错不打断清洗
+                }
+            });
+        }) as mineru_refine_core::ProgressSink
+    });
     let opts = RefineOptions {
         sha256,
         max_iterations,
@@ -50,6 +66,7 @@ fn refine(
         extra_confusion_pairs: extra_confusion_pairs.unwrap_or_default(),
         rewrite_garbled_tables,
         degrade_garbled_tables,
+        progress,
         ..RefineOptions::default()
     };
     let result = py.detach(|| RUNTIME.block_on(mineru_refine_core::refine(items, opts)));

@@ -24,6 +24,23 @@ pub fn default_logger() -> Logger {
     Arc::new(|m: &str| eprintln!("[mineru-refine] {m}"))
 }
 
+/// 清洗（refine）阶段的进度快照。每轮迭代吐出一次（含起点 iterations=0 与终点
+/// worklist_remaining=0）。`iterations`/`max_iterations` 是迭代预算口径，
+/// `worklist_remaining` 是本轮待裁决的可处理疑点数（递减趋势但非严格单调——
+/// 修复会解锁新疑点），`input_suspects` 是初始可处理疑点数（分母）。
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Progress {
+    pub iterations: u64,
+    pub max_iterations: u64,
+    pub worklist_remaining: usize,
+    pub input_suspects: usize,
+}
+
+/// 可选进度回调。在 tokio 任务线程上同步调用，实现应尽量轻（如塞进 channel），
+/// 不要在里面阻塞或 panic。缺省（None）时 run_loop 行为与现状逐字节一致。
+pub type ProgressSink = Arc<dyn Fn(Progress) + Send + Sync>;
+
 pub struct LoopResult {
     pub items: Vec<RefItem>,
     pub iterations: u64,
@@ -48,6 +65,11 @@ pub struct LoopOptions {
     pub load_image: Option<Arc<dyn LoadImage>>,
     pub vision: Option<Arc<dyn VisionClient>>,
     pub log: Logger,
+    /// 可选进度回调：每轮迭代吐出一次 Progress。缺省 None 时不构造事件、不调用，
+    /// 行为与现状逐字节一致。
+    pub progress: Option<ProgressSink>,
+    /// 初始可处理疑点数，仅作为进度事件的分母透传（run_loop 不据此做任何决策）。
+    pub input_suspects: usize,
 }
 
 pub const DEFAULT_MAX_ITERATIONS: u64 = 48;
@@ -835,6 +857,8 @@ pub async fn run_loop(
     opts: LoopOptions,
 ) -> Result<LoopResult, LlmError> {
     let max_iterations = opts.max_iterations;
+    let progress = opts.progress.clone();
+    let input_suspects = opts.input_suspects;
     let log = opts.log.clone();
     let valid_pages = {
         let refs: Vec<&crate::types::MineruItem> = initial.iter().map(|r| &r.item).collect();
@@ -899,6 +923,16 @@ pub async fn run_loop(
             })
             .cloned()
             .collect();
+        // 进度：每轮迭代开始时吐出当前剩余可处理疑点数（actionable 为空时也吐一帧
+        // worklist_remaining=0，作为「清洗到底」的终点信号）。
+        if let Some(sink) = &progress {
+            sink(Progress {
+                iterations,
+                max_iterations,
+                worklist_remaining: actionable.len(),
+                input_suspects,
+            });
+        }
         if actionable.is_empty() {
             break;
         }

@@ -35,7 +35,7 @@ pub use types::{
 pub use confusion::CONFUSION_PROMPT_VERSION;
 pub use garbled::{DEGRADE_VERSION, GARBLED_PROMPT_VERSION};
 
-pub use agent_loop::Logger;
+pub use agent_loop::{Logger, Progress, ProgressSink};
 pub use llm::{
     ChatClient, ChatResult, ImageDirLoader, LlmError, LoadImage, Message, SplitTableVerdict,
     TableTranscription, ToolCall, TranscribedCell, Usage, VisionClient,
