@@ -376,6 +376,10 @@ pub struct RefineReport {
     pub table_rewrites: Vec<TableCellRewrite>,
     #[serde(default, skip_serializing_if = "u64_is_zero")]
     pub table_rewrite_rejected: u64,
+    /// 有提案被驳回（已尽力但仍可能低质）的乱码表 item_id 列表，供逐表人工核对定位。
+    /// 关 flag 时恒空，序列化与旧版逐字节兼容。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub table_rewrite_rejected_table_ids: Vec<String>,
     /// 降级层（degrade_garbled_tables）降级为图片的表数。关 flag 时恒缺省。
     /// 每张降级表在 removedSpans 各有一条留痕（reason=garbled:degrade_to_image）。
     #[serde(default, skip_serializing_if = "u64_is_zero")]

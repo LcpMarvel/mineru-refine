@@ -305,6 +305,9 @@ pub struct GarbledOutcome {
     pub fixes: Vec<TableCellRewrite>,
     /// 被闸门拒绝的提案数（原格无资格 / 结构非法 / 行列不存在 / 错位特征 / 整表覆盖率回归不过）。
     pub rejected: u64,
+    /// 有任意提案被驳回的乱码表 item_id（每表至多一条，文档序，确定性）。
+    /// 这些表「已尽力处理」但仍可能低质，供调用方逐表定位人工核对。
+    pub rejected_table_ids: Vec<String>,
     pub usage: TokenUsage,
 }
 
@@ -396,6 +399,8 @@ pub async fn rewrite_garbled_tables(
     // 3. 闸门 + 落地（逐表独立：一表失败不影响他表）
     for (t, result) in targets.iter().zip(results) {
         let id = items[t.item_idx].id.clone();
+        // 本表迭代内 rejected 是否增长——增长即「有提案被驳回」，记其 id 供逐表核查。
+        let rejected_at_start = outcome.rejected;
         let transcription = match result {
             Ok(tr) => tr,
             Err(e) => {
@@ -479,6 +484,9 @@ pub async fn rewrite_garbled_tables(
         }
         if proposed.is_empty() {
             log(&format!("重转写层：{id} 无可落地提案，原样保留"));
+            if outcome.rejected > rejected_at_start {
+                outcome.rejected_table_ids.push(id.clone());
+            }
             continue;
         }
 
@@ -502,6 +510,7 @@ pub async fn rewrite_garbled_tables(
                 "重转写层：{id} 重转写后覆盖率 {new_coverage:.2} 未高于原 {:.2}，整表回退",
                 t.coverage
             ));
+            outcome.rejected_table_ids.push(id.clone());
             continue;
         }
 
@@ -541,6 +550,10 @@ pub async fn rewrite_garbled_tables(
             proposed.len(),
             t.coverage
         ));
+        // 部分格落地但仍有格被驳回：已尽力但未必全净，仍列入逐表核查。
+        if outcome.rejected > rejected_at_start {
+            outcome.rejected_table_ids.push(id.clone());
+        }
     }
 
     (items, outcome)

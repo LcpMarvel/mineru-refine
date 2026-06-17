@@ -370,6 +370,7 @@ async fn refine_inner(
             confusion_observations: confusion.observations,
             table_rewrites: garbled.fixes,
             table_rewrite_rejected: garbled.rejected,
+            table_rewrite_rejected_table_ids: garbled.rejected_table_ids,
             table_degraded: degrade.degraded,
         },
     })
