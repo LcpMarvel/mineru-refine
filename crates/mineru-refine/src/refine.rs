@@ -35,7 +35,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 //       extractCaption op + 乱码表降级兜底层（degrade_garbled_tables，opt-in）
 // 0.13：caption_artifact 探测器（被吞进 table_caption 的页眉/页脚家具）+ dropCaption op +
 //       两处 Qwen-VL 视觉裁决加 top_k:1 贪婪解码（钉死跨运行漂移，改变裁决产物）
-pub const REFINE_LOGIC_VERSION: &str = "0.13.0";
+// 0.14：配置驱动的多厂商 reasoning/vision 模型适配 + 模型身份缓存隔离
+pub const REFINE_LOGIC_VERSION: &str = "0.14.0";
 pub const PROMPT_VERSION: &str = "p9"; // p9：补 caption_artifact 的 op_hint 分支（原落兜底「无对应 op」误导）
 /// 默认文本裁决模型;运行时可被 `DEEPSEEK_MODEL` 覆盖(见 `cache_key_for`)。
 pub const MODEL_ID: &str = crate::llm::DEEPSEEK_DEFAULT_MODEL;

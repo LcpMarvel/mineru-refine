@@ -22,7 +22,7 @@ export const PROMPT_VERSION: string
  * worklistRemaining, inputSuspects }。回调在原生线程上以 NonBlocking 模式投递，
  * 不阻塞清洗；不传则零开销、行为与原先一致。
  */
-export declare function refine(items: any, opts?: RefineOpts | undefined | null, onProgress?: (((arg: any) => void)) | undefined | null): Promise<any>
+export declare function refine(items: any, opts?: RefineOpts | undefined | null, onProgress?: (((arg: any) => void)) | undefined | null, chat?: ChatTsfn | undefined | null, visionJudge?: VisionJudgeTsfn | undefined | null, visionTranscribe?: VisionTranscribeTsfn | undefined | null): Promise<any>
 
 export const REFINE_LOGIC_VERSION: string
 
@@ -54,6 +54,12 @@ export interface RefineOpts {
    * report.tableDegraded 计数）。两层都开 = 先救、救不回再降。
    */
   degradeGarbledTables?: boolean
+  /**
+   * T1 配置驱动换模型（见 docs/model-abstraction.md）。JSON 原生形状：
+   * `{ reasoning?: { provider?, model, key?, baseUrl? }, vision?: {...} }`。
+   * 不传 chat/vision 回调时生效：有对应角色 → 走 genai 多厂商适配器，否则回落 env 默认。
+   */
+  modelConfig?: any
 }
 
 /** items → full.md 文本（确定性重渲染，与 MinerU pipeline 拼接规则对齐）。 */
