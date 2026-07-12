@@ -3,10 +3,17 @@
 // LLM 调用在独立 tokio runtime 上跑，期间释放 GIL（不卡住调用方解释器）。
 
 use mineru_refine_core::types::MineruItem;
-use mineru_refine_core::{Progress, RefineOptions, render_markdown as core_render_markdown};
+use mineru_refine_core::{
+    AssistantMessage, ChatClient, ChatResult, LlmError, Message, ModelConfig, Progress,
+    RefineOptions, SplitTableVerdict, TableTranscription, TranscribedCell, Usage, VisionClient,
+    render_markdown as core_render_markdown,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use pythonize::{depythonize, pythonize};
+use serde::Deserialize;
+use serde_json::Value;
 use std::sync::{Arc, LazyLock};
 
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
@@ -15,6 +22,142 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .build()
         .expect("tokio runtime 构建失败")
 });
+
+// ── T2 逃生口：用户在 Python 里实现接口（非 OpenAI 兼容后端）──
+// 数据全用 JSON 原生形状：messages=list[dict]、tools=list[dict]、图片=bytes，返回 dict。
+// 回调在原生 RUNTIME 线程上同步触发（临时重取 GIL）——实现内部自行阻塞（requests/httpx）。
+
+/// chat 回调返回：{ content?, toolCalls?/tool_calls?, finishReason?, usage? }。
+#[derive(Deserialize)]
+struct ChatReplyDto {
+    #[serde(flatten)]
+    message: AssistantMessage,
+    #[serde(default, alias = "finishReason")]
+    finish_reason: String,
+    #[serde(default)]
+    usage: Usage,
+}
+
+/// 用户传入的实现 `chat(messages, tools) -> dict` 的对象。
+struct PyChatClient {
+    callable: Py<PyAny>,
+}
+
+#[async_trait::async_trait]
+impl ChatClient for PyChatClient {
+    async fn chat(&self, messages: &[Message], tools: &Value) -> Result<ChatResult, LlmError> {
+        Python::attach(|py| {
+            let msgs = pythonize(py, messages)
+                .map_err(|e| LlmError(format!("messages 序列化失败: {e}")))?;
+            let tools_obj =
+                pythonize(py, tools).map_err(|e| LlmError(format!("tools 序列化失败: {e}")))?;
+            let ret = self
+                .callable
+                .bind(py)
+                .call1((msgs, tools_obj))
+                .map_err(|e| LlmError(format!("Python chat 回调抛错: {e}")))?;
+            let reply: ChatReplyDto = depythonize(&ret)
+                .map_err(|e| LlmError(format!("Python chat 回调返回非法: {e}")))?;
+            Ok(ChatResult {
+                message: reply.message,
+                finish_reason: reply.finish_reason,
+                usage: reply.usage,
+            })
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct VerdictDto {
+    verdict: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    usage: Usage,
+}
+
+#[derive(Deserialize)]
+struct CellDto {
+    row: usize,
+    col: usize,
+    text: String,
+}
+
+#[derive(Deserialize, Default)]
+struct TranscribeDto {
+    #[serde(default)]
+    cells: Vec<CellDto>,
+    #[serde(default)]
+    usage: Usage,
+}
+
+/// 用户传入的实现 `judge_split_table(img_a, img_b) -> dict` 与
+/// `transcribe_table(img, cells_render) -> dict` 的对象。
+struct PyVisionClient {
+    callable: Py<PyAny>,
+}
+
+#[async_trait::async_trait]
+impl VisionClient for PyVisionClient {
+    async fn judge_split_table(
+        &self,
+        img_a: &[u8],
+        img_b: &[u8],
+    ) -> Result<SplitTableVerdict, LlmError> {
+        Python::attach(|py| {
+            let a = PyBytes::new(py, img_a);
+            let b = PyBytes::new(py, img_b);
+            let ret = self
+                .callable
+                .bind(py)
+                .call_method1("judge_split_table", (a, b))
+                .map_err(|e| LlmError(format!("Python judge_split_table 回调抛错: {e}")))?;
+            let dto: VerdictDto = depythonize(&ret)
+                .map_err(|e| LlmError(format!("judge_split_table 返回非法: {e}")))?;
+            if dto.verdict != "merge" && dto.verdict != "dismiss" {
+                return Err(LlmError(format!(
+                    "verdict 必须是 merge/dismiss: {}",
+                    dto.verdict
+                )));
+            }
+            Ok(SplitTableVerdict {
+                merge: dto.verdict == "merge",
+                reason: dto.reason,
+                usage: dto.usage,
+            })
+        })
+    }
+
+    async fn transcribe_table(
+        &self,
+        img: &[u8],
+        cells_render: &str,
+    ) -> Result<TableTranscription, LlmError> {
+        Python::attach(|py| {
+            let img_obj = PyBytes::new(py, img);
+            let ret = self
+                .callable
+                .bind(py)
+                .call_method1("transcribe_table", (img_obj, cells_render))
+                .map_err(|e| LlmError(format!("Python transcribe_table 回调抛错: {e}")))?;
+            let dto: TranscribeDto = depythonize(&ret)
+                .map_err(|e| LlmError(format!("transcribe_table 返回非法: {e}")))?;
+            Ok(TableTranscription {
+                cells: dto
+                    .cells
+                    .into_iter()
+                    .map(|c| TranscribedCell {
+                        row: c.row,
+                        col: c.col,
+                        text: c.text,
+                    })
+                    .collect(),
+                invalid: 0,
+                usage: dto.usage,
+            })
+        })
+    }
+}
 
 fn parse_items(items: &Bound<'_, PyAny>) -> PyResult<Vec<MineruItem>> {
     depythonize(items)
@@ -30,7 +173,7 @@ fn parse_items(items: &Bound<'_, PyAny>) -> PyResult<Vec<MineruItem>> {
 /// `{ "iterations", "maxIterations", "worklistRemaining", "inputSuspects" }`。
 /// 回调在原生工作线程上调用（临时重新获取 GIL），实现应轻量；不传则零开销、
 /// 行为与原先逐字节一致。
-#[pyo3(signature = (items, *, sha256=None, max_iterations=None, concurrency=None, image_dir=None, fix_ocr_confusion=false, extra_confusion_pairs=None, rewrite_garbled_tables=false, degrade_garbled_tables=false, progress=None))]
+#[pyo3(signature = (items, *, sha256=None, max_iterations=None, concurrency=None, image_dir=None, fix_ocr_confusion=false, extra_confusion_pairs=None, rewrite_garbled_tables=false, degrade_garbled_tables=false, model_config=None, chat=None, vision=None, progress=None))]
 #[allow(clippy::too_many_arguments)] // PyO3 keyword-only 参数面，逐项展开是接口本体
 fn refine(
     py: Python<'_>,
@@ -43,9 +186,25 @@ fn refine(
     extra_confusion_pairs: Option<Vec<String>>,
     rewrite_garbled_tables: bool,
     degrade_garbled_tables: bool,
+    model_config: Option<Bound<'_, PyAny>>,
+    chat: Option<Py<PyAny>>,
+    vision: Option<Py<PyAny>>,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     let items = parse_items(&items)?;
+    // T1：配置驱动换模型（dict → ModelConfig，camelCase：provider/model/key/baseUrl）
+    let model_config: Option<ModelConfig> = match model_config {
+        Some(mc) => Some(
+            depythonize(&mc)
+                .map_err(|e| PyValueError::new_err(format!("model_config 配置非法: {e}")))?,
+        ),
+        None => None,
+    };
+    // T2：用户实现接口逃生口（比 model_config 优先级更高）
+    let chat_client =
+        chat.map(|callable| Arc::new(PyChatClient { callable }) as Arc<dyn ChatClient>);
+    let vision_client =
+        vision.map(|callable| Arc::new(PyVisionClient { callable }) as Arc<dyn VisionClient>);
     // Py<PyAny> 本身就是 Send + Sync + Clone 的引用计数句柄，直接 move 进闭包即可。
     let progress = progress.map(|callable| {
         Arc::new(move |p: Progress| {
@@ -66,6 +225,9 @@ fn refine(
         extra_confusion_pairs: extra_confusion_pairs.unwrap_or_default(),
         rewrite_garbled_tables,
         degrade_garbled_tables,
+        model_config,
+        chat: chat_client,
+        vision: vision_client,
         progress,
         ..RefineOptions::default()
     };

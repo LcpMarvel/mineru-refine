@@ -167,9 +167,9 @@ async fn all_ops_rejected_suspends_suspects_without_crashing() {
 // ── 缓存（sha256 + 逻辑/模型/prompt 版本）──
 
 #[tokio::test]
-async fn cache_hits_on_same_sha256_skips_loop() {
+async fn injected_chat_disables_cache() {
     let mock1 = Arc::new(MockChat::new());
-    let r1 = refine(
+    refine(
         golden_input(),
         RefineOptions {
             chat: Some(mock1.clone()),
@@ -192,11 +192,8 @@ async fn cache_hits_on_same_sha256_skips_loop() {
         },
     )
     .await;
-    assert_eq!(boom.call_count(), 0);
-    assert_eq!(
-        serde_json::to_value(&r2.items).unwrap(),
-        serde_json::to_value(&r1.items).unwrap()
-    );
+    assert!(boom.call_count() > 0);
+    assert!(r2.report.fail_open);
 
     // 不同 sha256 不命中
     let mock3 = Arc::new(MockChat::new());

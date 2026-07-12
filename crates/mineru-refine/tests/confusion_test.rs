@@ -5,7 +5,7 @@ mod common;
 
 use common::{FnChat, first_user_content, items_of, tool_reply};
 use mineru_refine::llm::{ChatClient, ChatResult, LlmError, Message};
-use mineru_refine::{RefineOptions, clear_refine_cache, refine};
+use mineru_refine::{CONFUSION_PROMPT_VERSION, RefineOptions, refine};
 use regex::Regex;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -398,48 +398,11 @@ fn invalid_extra_pair_fails_open_loudly() {
 
 #[test]
 fn cache_isolated_between_flag_on_and_off() {
-    clear_refine_cache();
-    let sha = "confusion-cache-isolation-test".to_string();
-    let doc = confused_doc();
-
-    let off = run(
-        doc.clone(),
-        confusion_chat(golden_decide(), reject_all()),
-        RefineOptions {
-            sha256: Some(sha.clone()),
-            ..RefineOptions::default()
-        },
-    );
-    assert_eq!(off.items, doc);
-
-    // 开 flag：若缓存被关 flag 的结果污染，这里就拿不到修正
-    let chat = confusion_chat(golden_decide(), reject_all());
-    let on_first = run(
-        doc.clone(),
-        chat.clone(),
-        RefineOptions {
-            sha256: Some(sha.clone()),
-            ..on()
-        },
-    );
-    assert_eq!(on_first.report.confusion_fixes.len(), 8);
-    assert!(chat.call_count() > 0);
-
-    // 同 flag 再来一次：命中缓存，零调用
-    let chat2 = confusion_chat(golden_decide(), reject_all());
-    let on_second = run(
-        doc,
-        chat2.clone(),
-        RefineOptions {
-            sha256: Some(sha),
-            ..on()
-        },
-    );
-    assert_eq!(chat2.call_count(), 0);
-    assert_eq!(
-        serde_json::to_value(&on_second.report).unwrap(),
-        serde_json::to_value(&on_first.report).unwrap()
-    );
+    let off =
+        mineru_refine::cache_key_for_opts("confusion-cache-isolation-test", &Default::default());
+    let on = mineru_refine::cache_key_for_opts("confusion-cache-isolation-test", &on());
+    assert_ne!(off, on);
+    assert!(on.contains(&format!(":confusion-{CONFUSION_PROMPT_VERSION}:")));
 }
 
 // ════ Phase 2：table_body ════

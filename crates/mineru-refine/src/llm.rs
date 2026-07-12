@@ -58,7 +58,7 @@ pub struct Usage {
 pub struct AssistantMessage {
     #[serde(default)]
     pub content: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "toolCalls")]
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
@@ -152,11 +152,13 @@ impl LoadImage for ImageDirLoader {
 
 // ── 共用重试 ──
 
-const MAX_ATTEMPTS: u32 = 3;
+pub(crate) const MAX_ATTEMPTS: u32 = 3;
 
 /// reqwest 用 rustls-no-provider 编译（aws-lc 在 napi 交叉工具链下编不过），
 /// 构建 Client 前必须装好进程级 ring provider，否则 reqwest 直接 panic。
-fn http_client() -> reqwest::Client {
+/// genai 适配器（genai_llm.rs）经 `with_reqwest` 复用同一构造，避免 genai 自带
+/// rustls-tls 拉 aws-lc。
+pub(crate) fn http_client() -> reqwest::Client {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         // 并发竞争下另一线程先装好也是成功，Err 可忽略
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -170,6 +172,11 @@ fn retryable_status(status: u16) -> bool {
 
 async fn backoff(attempt: u32) {
     tokio::time::sleep(Duration::from_millis(attempt as u64 * 1500)).await;
+}
+
+/// 瞬态重试补偿：genai 适配器（genai_llm.rs）复用同一退避节奏。
+pub(crate) async fn retry_backoff(attempt: u32) {
+    backoff(attempt).await;
 }
 
 // ── DeepSeek 裸 API 客户端 ──
@@ -307,7 +314,7 @@ impl ChatClient for DeepSeekClient {
 const QWEN_DEFAULT_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const QWEN_DEFAULT_MODEL: &str = "qwen-vl-max";
 
-const QWEN_PROMPT: &str = "图1是 PDF 某页末尾的表格，图2是紧接着的下一页开头的表格。\
+pub(crate) const QWEN_PROMPT: &str = "图1是 PDF 某页末尾的表格，图2是紧接着的下一页开头的表格。\
 判断图2是否是图1这张表被分页拆开的延续部分（看列网格是否同一套、切缝处内容/编号是否接续、图2有无自己独立的表头主题）。\
 只输出 JSON：{\"verdict\":\"merge\"|\"dismiss\",\"reason\":\"一句话依据\"}，merge=同一张表的延续，dismiss=两张不同的表。";
 
@@ -407,7 +414,7 @@ impl QwenVlClient {
     }
 }
 
-const QWEN_TRANSCRIBE_PROMPT: &str = "图中是一张表格的截图。下面是 OCR 解析出的同一张表的单元格内容\
+pub(crate) const QWEN_TRANSCRIBE_PROMPT: &str = "图中是一张表格的截图。下面是 OCR 解析出的同一张表的单元格内容\
 （行列编号从 0 起，〈空〉表示空单元格），其中存在较多 OCR 乱码（形近字误认、词语错乱）。\
 请对照图片逐单元格校对：内容与图片不符的单元格，按图片上的真实内容重新转写。\
 只有列号带 ✎ 标记的单元格允许修正（未标 ✎ 的只作对照，提案也不会被采纳）。\
@@ -480,7 +487,7 @@ impl VisionClient for QwenVlClient {
 }
 
 /// 从回复文本中扒出 `{...}` 并过 safe-json-repair 解析裁决。
-fn extract_verdict_json(content: &str) -> Option<(String, String)> {
+pub(crate) fn extract_verdict_json(content: &str) -> Option<(String, String)> {
     let start = content.find('{')?;
     let end = content.rfind('}')?;
     if end < start {
@@ -502,7 +509,7 @@ fn extract_verdict_json(content: &str) -> Option<(String, String)> {
 /// 从重转写回复中扒出修正列表并解析。兼容两种形态（模型实测会无视 prompt 回裸数组）：
 /// `{"cells":[...]}` 对象，或顶层就是 `[...]` 数组。
 /// 结构非法的条目计入 invalid（解析期就拒）。
-fn extract_transcription_json(content: &str) -> Option<TableTranscription> {
+pub(crate) fn extract_transcription_json(content: &str) -> Option<TableTranscription> {
     // 取最早出现的 JSON 起始符，配对各自的收尾符——内容常裹在 ```json 代码块里。
     // 配不到收尾符 = 输出被 max_tokens 截断，整段交给 safe-json-repair 收口
     //（尾部丢失的条目就是漏修，不会误修）。

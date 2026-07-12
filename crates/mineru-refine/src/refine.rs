@@ -57,6 +57,10 @@ pub struct RefineOptions {
     pub chat: Option<Arc<dyn ChatClient>>,
     /// 内部/测试用：注入视觉裁决（默认 Qwen-VL 裸 API）。
     pub vision: Option<Arc<dyn VisionClient>>,
+    /// T1 配置驱动换模型（见 docs/model-abstraction.md）。不注入 chat/vision 时生效：
+    /// 有对应角色的 ProviderConfig → 走 genai 适配器（多厂商），否则回落 env 默认
+    ///（DeepSeek/Qwen）。注入的 chat/vision 优先级更高（Rust 逃生口/测试 mock）。
+    pub model_config: Option<crate::genai_llm::ModelConfig>,
     /// OCR 字符混淆修正层（opt-in）。开启后输出不再满足 C_out ⊆ C_in，
     /// 改为双契约：核心层只删不增 + 混淆层在准入名单内做稀疏一换一替换
     ///（每条进 report.confusionFixes 与 provenance，可审计可撤销）。
@@ -102,7 +106,14 @@ pub fn cache_key_for(sha256: &str) -> String {
 /// 否则开关不同的两次调用会互相污染缓存。关 flag 时与 cache_key_for 完全一致。
 /// 补充对先排序：语义相同但顺序不同的配置必须命中同一份缓存。
 pub fn cache_key_for_opts(sha256: &str, opts: &RefineOptions) -> String {
-    let mut key = cache_key_for(sha256);
+    // 换模型必须命中不同缓存：model_config 存在时用其模型身份替换掉 env 默认模型段。
+    let mut key = match &opts.model_config {
+        Some(mc) => format!(
+            "{sha256}:{REFINE_LOGIC_VERSION}:{}:{PROMPT_VERSION}",
+            mc.cache_identity()
+        ),
+        None => cache_key_for(sha256),
+    };
     if opts.fix_ocr_confusion {
         let mut pairs = opts.extra_confusion_pairs.clone();
         pairs.sort();
@@ -143,7 +154,13 @@ impl VisionClient for UnavailableVision {
 pub async fn refine(items: Vec<MineruItem>, opts: RefineOptions) -> RefineResult {
     let log: Logger = opts.log.clone().unwrap_or_else(default_logger);
 
-    let key = opts.sha256.as_ref().map(|s| cache_key_for_opts(s, &opts));
+    // 注入 chat/vision 逃生口时禁用缓存：不透明后端无法派生模型身份，
+    // 否则相同 sha256、不同注入后端的两次调用会互相命中脏结果。
+    let key = if opts.chat.is_some() || opts.vision.is_some() {
+        None
+    } else {
+        opts.sha256.as_ref().map(|s| cache_key_for_opts(s, &opts))
+    };
     if let Some(k) = &key
         && let Some(hit) = CACHE.lock().unwrap().get(k)
     {
@@ -235,14 +252,31 @@ async fn refine_inner(
 
     let chat: Arc<dyn ChatClient> = match &opts.chat {
         Some(c) => c.clone(),
-        None => DeepSeekClient::from_env().map_err(|e| e.to_string())?,
+        None => match opts
+            .model_config
+            .as_ref()
+            .and_then(|m| m.reasoning.as_ref())
+        {
+            Some(rc) => crate::genai_llm::GenaiChat::new(rc).map_err(|e| e.to_string())?,
+            None => DeepSeekClient::from_env().map_err(|e| e.to_string())?,
+        },
     };
     let vision: Option<Arc<dyn VisionClient>> = match &opts.vision {
         Some(v) => Some(v.clone()),
-        None if has_vision => Some(match QwenVlClient::from_env() {
-            Ok(v) => v as Arc<dyn VisionClient>,
-            Err(e) => Arc::new(UnavailableVision(e.to_string())),
-        }),
+        None if has_vision => Some(
+            match opts.model_config.as_ref().and_then(|m| m.vision.as_ref()) {
+                // 构造期错误（未知 provider 等）延后到调用时报——被 try_vision_verdict 吞成搁置，
+                // 与 QwenVlClient::from_env 缺 key 的行为一致，不因配置错误直接 fail-open 整篇。
+                Some(vc) => match crate::genai_llm::GenaiVision::new(vc) {
+                    Ok(v) => v as Arc<dyn VisionClient>,
+                    Err(e) => Arc::new(UnavailableVision(e.to_string())),
+                },
+                None => match QwenVlClient::from_env() {
+                    Ok(v) => v as Arc<dyn VisionClient>,
+                    Err(e) => Arc::new(UnavailableVision(e.to_string())),
+                },
+            },
+        ),
         None => None,
     };
 

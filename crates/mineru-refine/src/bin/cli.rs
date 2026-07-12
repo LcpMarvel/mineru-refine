@@ -1,11 +1,13 @@
 // CLI transport（备选，首选是 HTTP）：stdin 收 JSON、stdout 回 JSON，subprocess 调用。
 // stdin 形如 { "items": [...], "sha256"?: "...", "maxIterations"?: n, "imageDir"?: "/abs/path",
 //              "fixOcrConfusion"?: bool, "extraConfusionPairs"?: ["0D", ...],
-//              "rewriteGarbledTables"?: bool, "degradeGarbledTables"?: bool }
+//              "rewriteGarbledTables"?: bool, "degradeGarbledTables"?: bool,
+//              "modelConfig"?: { "reasoning"?: {...}, "vision"?: {...} } }
 // 或直接是 items 数组。imageDir 指向 MinerU 产物目录（含 images/），提供则启用视觉裁决。
 // fixOcrConfusion 开启 OCR 字符混淆修正层；rewriteGarbledTables 开启重度乱码表的
 // 视觉重转写层（需要 imageDir）；degradeGarbledTables 开启乱码表降级兜底
 //（重转写救不回 → 整项降级为 image，纯机械）——均 opt-in，见 lib 文档。
+// modelConfig 配置驱动换模型（genai 多厂商），见 docs/model-abstraction.md。
 //
 // 跑：  cat content_list.json | mineru-refine
 
@@ -47,6 +49,17 @@ async fn main() {
                     }
                 },
             };
+            // T1 配置驱动换模型：{ reasoning?: {...}, vision?: {...} }（见 docs/model-abstraction.md）
+            let model_config = match obj.get("modelConfig") {
+                None => None,
+                Some(v) => match serde_json::from_value(v.clone()) {
+                    Ok(mc) => Some(mc),
+                    Err(e) => {
+                        eprintln!("[mineru-refine] modelConfig 配置非法: {e}");
+                        exit(2);
+                    }
+                },
+            };
             let opts = RefineOptions {
                 sha256: obj
                     .get("sha256")
@@ -67,6 +80,7 @@ async fn main() {
                     .get("degradeGarbledTables")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                model_config,
                 ..RefineOptions::default()
             };
             (obj.get("items").cloned().unwrap_or(Value::Null), opts)

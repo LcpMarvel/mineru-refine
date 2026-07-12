@@ -28,6 +28,10 @@ rustls = { version = "0.23.40", default-features = false, features = ["ring", "l
 base64 = "0.22.1"
 thiserror = "2.0.18"
 safe-json-repair = "0.1.1"
+# 多厂商 LLM 统一抽象（默认实现底座）。default-features=false 关掉 genai 自带的
+# rustls-tls（会拉 aws-lc，napi 交叉工具链编不过）；改由 with_reqwest 传入进程自建的
+# ring-provider reqwest Client（见 llm.rs http_client），TLS 后端与其余 reqwest 用法统一。
+genai = { version = "=0.7.0-beta.12", default-features = false }
 
 [profile.release]
 opt-level = 3

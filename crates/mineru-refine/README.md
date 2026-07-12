@@ -1,72 +1,126 @@
 # mineru-refine
 
-[MinerU](https://github.com/opendatalab/MinerU) 解析结果的后处理器(linter / fixer)——
-本 crate 是核心实现,Python(PyO3)与 JS(napi-rs)绑定都是它的薄包装。
+> 🌏 中文文档：[README.zh-CN.md](./README.zh-CN.md)
 
-接收 MinerU 的 `content_list`(item 对象数组),修掉解析产生的高频结构问题——伪标题、
-跨页断句、跨页拆表、混入正文的页眉页脚、LaTeX / 链接残留——返回**同 schema** 的
-content_list。**只做削减与重组,绝不新增一个字**:输出的每个内容字符都来自输入,由机器
-逐步校验,违反即自动回滚;任何异常 / LLM 不可用都原样返回输入(fail-open),绝不外漏
-panic。探测器、修复操作集、闸门的完整设计文档见
-[仓库 README](https://github.com/LcpMarvel/mineru-refine#readme)。
+A post-processor (linter / fixer) for [MinerU](https://github.com/opendatalab/MinerU)
+parse results — this crate is the core implementation; the Python (PyO3) and JS
+(napi-rs) bindings are thin wrappers around it.
+
+It takes MinerU's `content_list` (an array of item objects), fixes the high-frequency
+structural problems that parsing introduces — pseudo-headings, cross-page sentence
+breaks, cross-page split tables, headers/footers mixed into the body, LaTeX / link
+residue — and returns a content_list with the **same schema**. It **only removes and
+reorganizes, never adds a single character**: every content character in the output
+comes from the input, verified step by step by machine, and any violation is rolled back
+automatically; any exception / LLM unavailability returns the input unchanged
+(fail-open), and no panic ever leaks out. The full design docs for the detector, the fix
+operation set, and the gates are in the
+[repository README](https://github.com/LcpMarvel/mineru-refine#readme).
 
 ```bash
 cargo add mineru-refine
 ```
 
-## 用法
+## Usage
 
 ```rust
 use mineru_refine::{refine, RefineOptions};
 
 let result = refine(items, RefineOptions {
-    sha256: Some(sha),                        // 可选:源文件 SHA256,提供则启用进程内缓存
-    max_iterations: None,                     // 可选:修复循环硬上限,默认随疑点数自适应
-    concurrency: Some(8),                     // 可选:并行裁决的疑点数,1 = 严格串行
-    image_dir: Some("/abs/mineru/out".into()),// 可选:MinerU 产物目录 → 启用跨页拆表的视觉裁决
-    fix_ocr_confusion: false,                 // 可选:opt-in 的 OCR 字符混淆修正层
-    extra_confusion_pairs: vec![],            // 可选:混淆准入名单补充对,如 ["0D"]
-    rewrite_garbled_tables: false,            // 可选:opt-in 的重度乱码表视觉重转写层(需要 image_dir)
+    sha256: Some(sha),                        // optional: source-file SHA256; enables the in-process cache
+    max_iterations: None,                     // optional: hard cap on the fix loop; defaults to adaptive
+    concurrency: Some(8),                     // optional: number of suspects judged in parallel; 1 = strictly serial
+    image_dir: Some("/abs/mineru/out".into()),// optional: MinerU output dir → enables vision judging for split tables
+    fix_ocr_confusion: false,                 // optional: opt-in OCR character-confusion fix layer
+    extra_confusion_pairs: vec![],            // optional: extra allowlist pairs for confusion, e.g. ["0D"]
+    rewrite_garbled_tables: false,            // optional: opt-in vision re-transcription for garbled tables (needs image_dir)
+    // model_config: config-driven model swap — see "Swapping models" below
     ..Default::default()
 }).await;
-// 永不 Err、panic 不外漏:fail-open 内置,看 result.report.fail_open
-result.items;    // 清洗后的 content_list(同 schema)
-result.report;   // 审计:iterations / op_counts / dismissed / removed_spans
-                 //      / violations / token_usage / fail_open
+// Never returns Err and never leaks a panic: fail-open is built in — check result.report.fail_open
+result.items;    // cleaned content_list (same schema)
+result.report;   // audit: iterations / op_counts / dismissed / removed_spans
+                 //        / violations / token_usage / fail_open
 ```
 
-`items` 是 `Vec<MineruItem>`——`MineruItem` 底层是保序 JSON 对象(`serde_json::Map`),
-未知字段原样透传、键序不变,serde 直接与 `content_list.json` 互转。
+`items` is a `Vec<MineruItem>` — `MineruItem` is an order-preserving JSON object
+(`serde_json::Map`) underneath: unknown fields pass through verbatim, key order is
+preserved, and serde converts directly to/from `content_list.json`.
 
-环境变量:`DEEPSEEK_APIKEY`(文本裁决,必需;缺失时 refine 直接 fail-open)、
-`QWEN_APIKEY`(视觉裁决需要;缺失则跨页拆表疑点跳过)。库本身不读 `.env`,
-请在宿主程序里设置(CLI / server 二进制会自动加载当前目录 `.env`)。
+Environment variables: `DEEPSEEK_APIKEY` (text judging, required; if missing, refine goes
+straight to fail-open) and `QWEN_APIKEY` (needed for vision judging; if missing,
+cross-page split-table suspects are skipped). The library itself does not read `.env`;
+set it in the host program (the CLI / server binaries auto-load `.env` from the current
+directory).
 
-独立可用的工具函数(都不调 LLM):
+Standalone helper functions (none call the LLM):
 
 ```rust
-mineru_refine::detect_items(&items);     // 探测器:返回疑点列表
-mineru_refine::render_markdown(&items);  // items → full.md 确定性重渲染
+mineru_refine::detect_items(&items);     // detector: returns the suspect list
+mineru_refine::render_markdown(&items);  // items → full.md deterministic re-render
 ```
 
-测试 / 嵌入场景可注入假 LLM:`RefineOptions` 的 `chat` / `vision` / `load_image` / `log`
-分别接受 `Arc<dyn ChatClient>` / `Arc<dyn VisionClient>` / `Arc<dyn LoadImage>` / `Logger`,
-默认实现是 DeepSeek / Qwen-VL 的裸 reqwest 客户端。
+For tests / embedding you can inject a fake LLM: `RefineOptions`'s `chat` / `vision` /
+`load_image` / `log` accept `Arc<dyn ChatClient>` / `Arc<dyn VisionClient>` /
+`Arc<dyn LoadImage>` / `Logger` respectively; the default implementations are bare
+reqwest clients for DeepSeek / Qwen-VL.
 
-## CLI / HTTP server(`--features bin`)
+## Swapping models (custom LLMs)
+
+By default the text role is DeepSeek and the vision role is Qwen-VL. Two mechanisms let you
+point them at any other LLM; see the
+[main README](https://github.com/LcpMarvel/mineru-refine#swapping-models-custom-llms) for the
+full explanation.
+
+**1. `model_config` — config-driven, multi-vendor (recommended).** Built on the
+[genai](https://github.com/jeremychone/rust-genai) crate; sets the text (`reasoning`) and/or
+vision (`vision`) roles to any of DeepSeek / Aliyun (Qwen) / OpenAI / Anthropic / Gemini /
+Ollama / Groq / xAI / any OpenAI-compatible endpoint. Omit a role to fall back to the env
+default.
+
+```rust
+use mineru_refine::{refine, ModelConfig, ProviderConfig, RefineOptions};
+
+// MiniMax-M3 is OpenAI-compatible and multimodal, so one model serves both roles
+let minimax = ProviderConfig {
+    provider: Some("openai".into()),
+    model: "MiniMax-M3".into(),
+    key: Some(key.clone()),
+    base_url: Some("https://api.minimaxi.com/v1".into()),
+};
+let result = refine(items, RefineOptions {
+    image_dir: Some("/abs/mineru/out".into()),
+    model_config: Some(ModelConfig {
+        reasoning: Some(minimax.clone()),
+        vision: Some(minimax),
+    }),
+    ..Default::default()
+}).await;
+```
+
+`provider` accepts `deepseek` / `aliyun` (`qwen`, `dashscope`) / `openai`
+(`openai-compatible`, `custom`) / `anthropic` (`claude`) / `gemini` (`google`) / `ollama` /
+`groq` / `xai` (`grok`); omit it to infer from the model name. Reasoning models that emit
+`<think>…</think>` blocks are handled — the block is stripped automatically.
+
+**2. Custom callbacks — the escape hatch (take priority over `model_config`).** Inject your
+own `chat: Arc<dyn ChatClient>` / `vision: Arc<dyn VisionClient>` (the same injection points
+used for test mocks) when you need auth/proxy/model logic `model_config` can't express.
+
+## CLI / HTTP server (`--features bin`)
 
 ```bash
 cargo install mineru-refine --features bin
 
 cat content_list.json | mineru-refine                  # stdin JSON → stdout JSON
-mineru-refine-server                                    # POST /refine + GET /health,端口 8771
+mineru-refine-server                                    # POST /refine + GET /health, port 8771
 ```
 
-## 开发
+## Development
 
 ```bash
-cargo test -p mineru-refine     # 全程 mock LLM,不打网络
-just --list                     # 仓库根:真实数据工作流 / 冒烟 / 发布
+cargo test -p mineru-refine     # LLM fully mocked, no network
+just --list                     # repo root: real-data workflow / smoke / publish
 ```
 
 ## License

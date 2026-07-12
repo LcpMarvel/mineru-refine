@@ -17,6 +17,8 @@ mineru-refine-core = { package = "mineru-refine", path = "../../crates/mineru-re
 serde_json.workspace = true
 napi = { version = "3.9.1", default-features = false, features = ["napi8", "serde-json", "async"] }
 napi-derive = "3.5.6"
+async-trait.workspace = true
+serde.workspace = true
 
 [build-dependencies]
 napi-build = "2.3.0"

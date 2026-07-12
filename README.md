@@ -1,67 +1,78 @@
 # mineru-refine
 
-[MinerU](https://github.com/opendatalab/MinerU) 解析结果的后处理器(linter / fixer)。
+> 🌏 中文文档：[README.zh-CN.md](./README.zh-CN.md)
 
-MinerU 把 PDF 解析成 `content_list.json`——一个 item 对象数组,每个 item 是一段正文、
-一个标题、一张表格或一张图。解析质量很好,但结构上有一类高频问题:
+A post-processor (linter / fixer) for [MinerU](https://github.com/opendatalab/MinerU) parse results.
 
-- **伪标题**——一句普通正文被误标成标题
-- **漏标标题**——同级编号兄弟都是标题，它却被标成正文
-- **跨页断句**——一句话被页边界切成两个 item
-- **跨页拆表**——同一张表被切成多页的多个表
-- **表内续行**——一条记录的长单元格被切成多个只有一列有字的 `<tr>`
-- **页面家具**——页眉、页脚、页码混进正文
-- **残留符号**——markdown 链接、LaTeX 命令、`\$`/`\*` 转义等解析残骸
-- **巨型块**——多个小节被糊成一个超长 item
-- **段尾粘连**——跨页合并把「[相关文件]」这类独立结构块吸进上一段结尾
-- **表格噪声**——全空 `<tr>`、单元格内 OCR 空格（含被空格打断的 URL）、伪 LaTeX 包装
-  （`$\text{...}$` 套着普通文字，已知符号命令换成 Unicode；`\frac` 等真公式不动）
-- **形近字符的少数派写法**——同一文档里 `SWOT`×24 与 `SW0T`×6 并存（0↔O 形近误认），
-  全文频率投票直接改写少数派
-- **被吞进表格题注的小节标题**——MinerU 把「4.6 核心组织绩效的应用」塞进相邻表格的
-  `table_caption`，渲染后貌似漏升级标题，实为结构错位
-- **被吞进表格题注的页眉/页脚家具**——MinerU 把跑马灯页眉「附件3：…」、页脚「编制人：张威」
-  塞进跨页表片段的 `table_caption`，`mergeTable` 又忠实保留，渲染成残留（靠同文家具佐证识别后删掉）
+MinerU parses a PDF into `content_list.json` — an array of item objects, each item a
+paragraph of body text, a heading, a table, or an image. The parse quality is good, but
+there is a class of high-frequency structural problems:
 
-其中无歧义的表格噪声与频率投票由**机械清洗 pass**（确定性代码、自带校验、不打 LLM）
-直接处理，其余疑点交 LLM 裁决。
+- **Pseudo-headings** — an ordinary line of body text mislabeled as a heading
+- **Missed headings** — same-level numbered siblings are all headings, yet this one is labeled body text
+- **Cross-page sentence breaks** — one sentence cut into two items by a page boundary
+- **Cross-page split tables** — one table cut into multiple tables across pages
+- **In-table continuation rows** — a record's long cell cut into several `<tr>` rows where only one column has text
+- **Page furniture** — headers, footers, and page numbers mixed into the body
+- **Residual markup** — parse debris like markdown links, LaTeX commands, `\$`/`\*` escapes
+- **Giant blocks** — several sections glued into one extra-long item
+- **Trailing adhesion** — a cross-page merge sucks a standalone structural block like "[Related documents]" onto the end of the previous paragraph
+- **Table noise** — all-empty `<tr>`, OCR spaces inside cells (including URLs broken by spaces), pseudo-LaTeX wrapping (`$\text{...}$` around plain text; known symbol commands are converted to Unicode, while real formulas like `\frac` are left untouched)
+- **Minority spellings of look-alike characters** — `SWOT`×24 coexisting with `SW0T`×6 in the same document (0↔O look-alike misread); a document-wide frequency vote rewrites the minority
+- **Section headings swallowed into a table caption** — MinerU stuffs "4.6 Application of core organizational performance" into an adjacent table's `table_caption`, which after rendering looks like a missed heading promotion but is really a structural misplacement
+- **Header/footer furniture swallowed into a table caption** — MinerU stuffs a running header "Appendix 3: …" or a footer "Prepared by: Zhang Wei" into the `table_caption` of a cross-page table fragment, `mergeTable` faithfully preserves it, and it renders as residue (identified via same-text furniture corroboration and removed)
 
-mineru-refine 接收 content_list,修掉这些问题,返回**同 schema** 的 content_list。
-下游读到的仍然是"一份 MinerU 结果"——作为透明过滤器接进现有 pipeline,消费方零改动。
+Of these, unambiguous table noise and the frequency vote are handled directly by the
+**mechanical cleaning pass** (deterministic code, self-verifying, no LLM); the rest go to
+the LLM to judge.
 
-两条核心承诺:
+mineru-refine takes the content_list, fixes these problems, and returns a content_list
+with the **same schema**. Downstream still reads "a MinerU result" — plug it into an
+existing pipeline as a transparent filter, with zero changes on the consumer side.
 
-1. **绝不新增一个字**:只做削减与重组(合并、拆分、删除、降级),输出的每个内容字符都
-   来自输入,且由机器在每一步校验——不是靠 prompt 约束 LLM,而是违反即自动回滚。
-   默认配置下唯一的字符替换是机械清洗的**全文频率投票**(`SW0T`→`SWOT`:全文多数派
-   ≥4 次且 ≥3× 少数派、恰差一处形近字符,证据全文自明、确定性落地,逐条留痕于
-   `report.removedSpans`,reason=`mech:token_vote→…`)。
-2. **绝不搞崩上游(fail-open)**:任何异常、超时、LLM 不可用,都原样返回输入 items
-   并大声记 log,`report.failOpen` 标记为 `true`。
+Two core promises:
 
-修复决策由 LLM 做("这个疑似伪标题该降级,还是误报?"),但 LLM 只负责在预定义的修复
-操作里**选一个**——执行、校验、终止全部由确定性代码控制,**是否合格由机器闸门裁决,
-不由 LLM 自评**。
+1. **Never adds a single character**: it only reduces and reorganizes (merge, split,
+   delete, demote); every content character in the output comes from the input, and each
+   step is verified by machine — not by prompting the LLM, but by rolling back
+   automatically on any violation. In the default configuration the only character
+   replacement is the mechanical cleaning pass's **document-wide frequency vote**
+   (`SW0T`→`SWOT`: document-wide majority ≥4 occurrences and ≥3× the minority, differing
+   by exactly one look-alike character; the evidence is self-evident across the document,
+   deterministic, and each case is recorded in `report.removedSpans` with
+   reason=`mech:token_vote→…`).
+2. **Never breaks the upstream (fail-open)**: any exception, timeout, or LLM
+   unavailability returns the input items unchanged, logs loudly, and marks
+   `report.failOpen` as `true`.
 
-## 安装
+The fix decisions are made by the LLM ("should this suspected pseudo-heading be demoted,
+or is it a false positive?"), but the LLM only **picks one** of the predefined fix
+operations — execution, verification, and termination are all controlled by deterministic
+code, and **whether the result passes is decided by machine gates, not by LLM
+self-assessment**.
 
-核心是一份 Rust 实现,各语言绑定直接 import 同一份代码,选项与返回值完全同构:
+## Install
 
-| 语言 | 安装 | 形态 |
+The core is a single Rust implementation; each language binding imports the same code, with
+structurally identical options and return values:
+
+| Language | Install | Form |
 |------|------|------|
-| **Python** | `pip install mineru-refine` | PyO3 原生扩展([文档](bindings/python/)) |
-| **JS/TS** | `bun add mineru-refine` / `npm i mineru-refine` | napi-rs 原生插件,Bun / Node ≥18([文档](bindings/js/)) |
-| **Rust** | `cargo add mineru-refine` | core crate([文档](crates/mineru-refine/)) |
-| **任意语言** | `cargo install mineru-refine --features bin` | HTTP server / CLI(见下) |
-| **Claude Code** | `/plugin install mineru-refine` | 端到端 skill:文件进、干净 markdown 出([文档](plugin/)) |
+| **Python** | `pip install mineru-refine` | PyO3 native extension ([docs](bindings/python/)) |
+| **JS/TS** | `bun add mineru-refine` / `npm i mineru-refine` | napi-rs native addon, Bun / Node ≥18 ([docs](bindings/js/)) |
+| **Rust** | `cargo add mineru-refine` | core crate ([docs](crates/mineru-refine/)) |
+| **Any language** | `cargo install mineru-refine --features bin` | HTTP server / CLI (see below) |
+| **Claude Code** | `/plugin install mineru-refine` | end-to-end skill: file in, clean markdown out ([docs](plugin/)) |
 
-以上 Python/JS/Rust/HTTP 都接收**已解析的** `content_list`(由 MinerU 产出)。如果你手里只有
-原始文件(PDF/DOC/PPT/图片),想要"一步到位"拿干净 markdown,见下面的 [Claude Code plugin](#claude-code-pluginpdf-进干净-markdown-出)——它把 MinerU 官方 API 解析与 mineru-refine 清洗串成一个 skill。
+The Python/JS/Rust/HTTP paths above all take an **already-parsed** `content_list` (produced
+by MinerU). If all you have is a raw file (PDF/DOC/PPT/image) and you want clean markdown in
+one step, see the [Claude Code plugin](#claude-code-plugin-pdf-in-clean-markdown-out) below —
+it chains MinerU official-API parsing with mineru-refine cleaning into a single skill.
 
-## 快速上手
+## Quick start
 
-需要 LLM API key(见[环境变量](#llm-接入与环境变量)):`DEEPSEEK_APIKEY` 必需,
-`QWEN_APIKEY` 在启用表格视觉裁决时需要。
+You need an LLM API key (see [Environment variables](#llm-integration-and-environment-variables)):
+`DEEPSEEK_APIKEY` is required, `QWEN_APIKEY` is needed when table vision judging is enabled.
 
 **Python:**
 
@@ -71,8 +82,8 @@ import mineru_refine
 
 items = json.load(open("content_list.json"))
 result = mineru_refine.refine(items, image_dir="/abs/path/to/mineru/output")
-result["items"]    # 清洗后的 content_list,schema 与输入一致
-result["report"]   # 审计报告:做了什么、删了什么、花了多少 token
+result["items"]    # cleaned content_list, same schema as the input
+result["report"]   # audit report: what was done, what was removed, how many tokens spent
 ```
 
 **JS/TS:**
@@ -94,41 +105,43 @@ let result = refine(items, RefineOptions {
     image_dir: Some("/abs/path/to/mineru/output".into()),
     ..Default::default()
 }).await;
-// 永不 Err、panic 不外漏:fail-open 内置,看 result.report.fail_open
+// Never returns Err and never leaks a panic: fail-open is built in — check result.report.fail_open
 ```
 
-**HTTP(任意语言):**
+**HTTP (any language):**
 
 ```bash
 cargo install mineru-refine --features bin
-mineru-refine-server   # 默认端口 8771,MINERU_REFINE_PORT 可改
+mineru-refine-server   # default port 8771, override with MINERU_REFINE_PORT
 
 curl -X POST localhost:8771/refine \
   -d '{"items":[...], "imageDir":"/abs/path/to/mineru/output"}'
 curl localhost:8771/health
 ```
 
-`imageDir` 是 MinerU 产物目录(含 `images/` 的那个目录),可选:提供则启用跨页拆表的
-视觉裁决(用表格裁剪图判断"是不是同一张表"),不提供则该类问题整体跳过、表格原样保留。
-HTTP 模式下该目录须与 server 共享文件系统。
+`imageDir` is the MinerU output directory (the one containing `images/`), and is optional:
+providing it enables vision judging for cross-page split tables (using table crops to decide
+"is this the same table?"); not providing it skips that whole class of problems and keeps the
+tables as-is. In HTTP mode the directory must share a filesystem with the server.
 
-**清洗进度(可选):** 清洗是 loop-until-dry 跑「待修点」worklist,没有页码概念,
-进度单位是「已处理疑点 / 迭代轮次」。每轮迭代吐一帧
-`{ iterations, maxIterations, worklistRemaining, inputSuspects }`(含起点 iterations=0
-与终点 worklistRemaining=0),各面接法:
+**Cleaning progress (optional):** cleaning runs a loop-until-dry worklist of "items to fix"
+with no notion of page numbers, so the progress unit is "suspects processed / iteration
+rounds". Each iteration emits one frame
+`{ iterations, maxIterations, worklistRemaining, inputSuspects }` (including the start point
+iterations=0 and the end point worklistRemaining=0), consumable from every surface:
 
 ```bash
-# HTTP: SSE 流(逐轮 event: progress,收尾 event: result = 非流式 /refine 回包)
+# HTTP: SSE stream (per-round event: progress, closing event: result = the non-streaming /refine response)
 curl -N -X POST localhost:8771/refine/stream -d '{"items":[...]}'
 ```
 
 ```ts
-// JS: 第三个参数 onProgress
+// JS: onProgress as the third argument
 await refine(contentList, {}, (p) => console.log(p.worklistRemaining, "/", p.inputSuspects));
 ```
 
 ```python
-# Python: progress= 关键字,回调收一个 dict
+# Python: progress= keyword, callback receives a dict
 mineru_refine.refine(items, progress=lambda p: print(p["worklistRemaining"], "/", p["inputSuspects"]))
 ```
 
@@ -136,397 +149,568 @@ mineru_refine.refine(items, progress=lambda p: print(p["worklistRemaining"], "/"
 // Rust: RefineOptions.progress = Some(Arc<dyn Fn(Progress)+Send+Sync>)
 ```
 
-CLI 模式下进度走 stderr 的 NDJSON(`[mineru-refine:progress] {…}`),stdout 仍是纯结果 JSON。
-进度回调不传时零开销,行为逐字节不变。
+In CLI mode, progress goes to stderr as NDJSON (`[mineru-refine:progress] {…}`), while stdout
+stays pure result JSON. When no progress callback is passed there is zero overhead and behavior
+is byte-for-byte unchanged.
 
-建议消费方在读 `content_list.json` 之后、消费之前调一次,用返回的 `items` 替换原数组;
-调用侧再兜一层超时回退,与内置 fail-open 构成双保险。
+We recommend the consumer call this once after reading `content_list.json` and before consuming
+it, replacing the original array with the returned `items`; add a timeout fallback on the caller
+side too, which together with the built-in fail-open forms a double safety net.
 
-## Claude Code plugin(PDF 进、干净 Markdown 出)
+## Claude Code plugin (PDF in, clean Markdown out)
 
-上面的库/绑定都从 `content_list` 起步——默认你已经跑过 MinerU。`plugin/` 提供一个 **Claude Code
-plugin**,把"解析 + 清洗"两步串成一个 skill:**原始文件(PDF/DOC/PPT/图片)进,干净 markdown 出**,
-无需自己写集成代码。
+The libraries/bindings above all start from a `content_list` — they assume you have already run
+MinerU. `plugin/` provides a **Claude Code plugin** that chains the "parse + clean" two steps into
+one skill: **raw file (PDF/DOC/PPT/image) in, clean markdown out**, with no integration code to
+write yourself.
 
 ```
 /plugin marketplace add LcpMarvel/mineru-refine
 /plugin install mineru-refine@mineru-refine
 ```
 
-装好后直接说「清洗这个 PDF:/abs/path/to/报告.pdf」,skill(`mineru-prime`)会:
+Once installed, just say "Clean this PDF: /abs/path/to/report.pdf", and the skill (`mineru-prime`)
+will:
 
-1. **解析** —— 文件交 [MinerU](https://mineru.net) 官方 API,得 `content_list.json` + images;
-2. **清洗** —— 调 mineru-refine 后处理(三层 opt-in 清洗默认**全开**,追求最干净产物);
-3. 产出一个 **drop-in 替身目录**(`images/`/`layout.json` 镜像,`content_list.json` 换清洗版,
-   `full.md` 重渲染,外加 `refine_report.json`),放进 `mineru-refine-out/refined/`。
+1. **Parse** — hand the file to the [MinerU](https://mineru.net) official API to get
+   `content_list.json` + images;
+2. **Clean** — call mineru-refine to post-process (all three opt-in cleaning layers **on** by
+   default, for the cleanest output);
+3. Produce a **drop-in replacement directory** (`images/`/`layout.json` mirrored,
+   `content_list.json` replaced with the cleaned version, `full.md` re-rendered, plus a
+   `refine_report.json`) placed under `mineru-refine-out/refined/`.
 
-首次运行 skill 会引导写入工作目录 `.env`(持久化):`MINERU_API_TOKEN`(解析)、
-`DEEPSEEK_APIKEY`(清洗)、`QWEN_APIKEY`(视觉裁决,强烈建议)。依赖 [bun](https://bun.sh) +
-`unzip`;npm 原生绑定首次自动 `bun install`(含预编译二进制,无需 Rust 工具链)。
+On first run the skill guides you through writing the working-directory `.env` (persisted):
+`MINERU_API_TOKEN` (parsing), `DEEPSEEK_APIKEY` (cleaning), `QWEN_APIKEY` (vision judging, strongly
+recommended). Depends on [bun](https://bun.sh) + `unzip`; the npm native binding runs `bun install`
+automatically on first run (includes a prebuilt binary, no Rust toolchain required).
 
-详见 [`plugin/README.md`](plugin/)。
+See [`plugin/README.md`](plugin/) for details.
 
-## 选项与返回值
+## Options and return value
 
-各语言只是命名风格不同(Python 蛇形、JS 驼峰),语义相同:
+Each language differs only in naming style (Python snake_case, JS camelCase); the semantics are
+identical:
 
-| 选项 | 默认 | 语义 |
+| Option | Default | Semantics |
 |---|---|---|
-| `sha256` | 无 | 源文件 SHA256;提供则启用进程内缓存。缓存 key 同时包含逻辑版本、模型、prompt 版本——这些一变,旧结果自动失效,不会错误命中 |
-| `maxIterations` | 自适应 | 修复循环硬上限。默认随疑点数自适应(`clamp(2N+16, 48, 512)`),到顶强停 |
-| `concurrency` | 8 | 并行裁决的疑点数;`1` = 严格串行 |
-| `imageDir` | 无 | MinerU 产物目录;提供则启用跨页拆表的视觉裁决(视觉是该类问题的唯一裁决路径) |
-| `fixOcrConfusion` | `false` | **opt-in** 的 OCR 字符混淆修正层(CE0→CEO、入=n→λ=n、竟争→竞争……),覆盖正文与表格单元格。开启后输出契约从"只删不增"变为双契约,见下文[混淆修正层](#混淆修正层opt-in) |
-| `extraConfusionPairs` | `[]` | 混淆准入名单的用户补充对,每项恰好 2 个不同字符(如 `"0D"` 表示 0↔D 互换可直接落地)。非法配置立即 fail-open,不静默吞 |
-| `rewriteGarbledTables` | `false` | **opt-in** 的重度乱码表视觉重转写层(代格→代码、数据来酒→数据来源、Midhuel→Michael……)。机械检测器选定整表认废的表格,Qwen-VL 对照 `img_path` 截图逐单元格重转写。需要 `imageDir`(缺则 fail-open),见下文[乱码表重转写层](#乱码表重转写层opt-in) |
-| `degradeGarbledTables` | `false` | **opt-in** 的乱码表降级兜底(纯机械,不依赖 LLM/VL)。跑在重转写层之后:仍判废且有 `img_path` 的表整项降级为 `image`(`table_body` 删除并留痕,`report.tableDegraded` 计数)。两层都开 = 先救、救不回再降 |
+| `sha256` | none | Source-file SHA256; enables the in-process cache. The cache key also includes the logic version, model, and prompt version — change any of those and stale results are invalidated automatically, never wrongly hit |
+| `maxIterations` | adaptive | Hard cap on the fix loop. Defaults to adaptive with suspect count (`clamp(2N+16, 48, 512)`), force-stops at the cap |
+| `concurrency` | 8 | Number of suspects judged in parallel; `1` = strictly serial |
+| `imageDir` | none | MinerU output directory; providing it enables vision judging for cross-page split tables (vision is the only judging path for that class of problem) |
+| `fixOcrConfusion` | `false` | **opt-in** OCR character-confusion fix layer (CE0→CEO, 入=n→λ=n, 竟争→竞争, …), covering body and table cells. Once on, the output contract changes from "remove-only" to a dual contract; see [Confusion-fix layer](#confusion-fix-layer-opt-in) below |
+| `extraConfusionPairs` | `[]` | User-supplied extra allowlist pairs for confusion, each exactly 2 distinct characters (e.g. `"0D"` means 0↔D can be swapped directly). An invalid config triggers fail-open immediately, not silently swallowed |
+| `rewriteGarbledTables` | `false` | **opt-in** vision re-transcription layer for heavily garbled tables (代格→代码, 数据来酒→数据来源, Midhuel→Michael, …). The mechanical detector selects tables judged whole-table junk, and Qwen-VL re-transcribes cell by cell against the `img_path` crop. Requires `imageDir` (fail-open if missing); see [Garbled-table re-transcription layer](#garbled-table-re-transcription-layer-opt-in) below |
+| `degradeGarbledTables` | `false` | **opt-in** garbled-table fallback (purely mechanical, no LLM/VL). Runs after the re-transcription layer: tables still judged junk that have an `img_path` are demoted whole to `image` (`table_body` removed and recorded, counted in `report.tableDegraded`). Both layers on = rescue first, demote what can't be rescued |
+| `modelConfig` | none | Config-driven model swap: point the text (`reasoning`) and/or vision (`vision`) roles at any multi-vendor / OpenAI-compatible LLM (DeepSeek, Qwen, OpenAI, Anthropic, Gemini, MiniMax, a self-hosted endpoint, …). Omitted roles fall back to the env default (DeepSeek/Qwen). See [Swapping models](#swapping-models-custom-llms) below |
 
-返回值 `{ items, report, provenance }`:
+Return value `{ items, report, provenance }`:
 
-| 字段 | 含义 |
+| Field | Meaning |
 |---|---|
-| `items` | 清洗后的 content_list,字段集合/类型与 MinerU 一致,未知字段原样透传 |
-| `report.iterations` | 修复循环实际轮数 |
-| `report.opCounts` | 各修复操作的执行次数 |
-| `report.dismissed` | 被裁定为误报(或被搁置)的疑点数 |
-| `report.dismissedSuspects` | `dismissed` 计数的逐条明细:每条带 `kind`(探测器类别) / `itemId` / `reason`(搁置类别:`llm_dismiss` LLM 主动判误报 / `max_rounds_exhausted` 轮数耗尽 / `vision_unavailable` split_table 无图可裁 / `llm_no_tool_call` / `llm_error` 调用重试耗尽) / `detail`(LLM 一句话理由或错误信息,可空) / `evidence`(探测器原始证据)。用于离线复盘「为什么没修」并据此调探测器/prompt;无搁置时缺省 |
-| `report.removedSpans` | 删除留痕:每段被删内容的 itemId / 原文 / 原因,逐条可审计 |
-| `report.violations` | 保真闸回滚次数(修复产物违反保真被自动撤销) |
-| `report.tokenUsage` | LLM token 消耗 |
-| `report.failOpen` | 是否触发 fail-open;`true` 时 `items` 即原始输入 |
-| `report.confusionFixes` | 混淆层落地的每条替换(itemId / 字段 / 偏移 / 前后字符 / 准入来源 / LLM 依据)。仅 `fixOcrConfusion` 开启且有替换时出现 |
-| `report.confusionRejected` | 被闸门拒绝的混淆提案数(结构非法 / 密度超标 / 二次裁决否决) |
-| `report.confusionObservations` | LLM 裁决时顺带观察到的表外 OCR 质量问题,只记录、从未被应用,可作下游质量信号 |
-| `report.tableRewrites` | 重转写层落地的每条整格替换(itemId / 行列号 / before / after / 新串字符区间)。`before` 即撤销凭据,写回该区间可程序化还原。仅 `rewriteGarbledTables` 开启且有替换时出现 |
-| `report.tableRewriteRejected` | 被闸门拒绝的重转写提案数(结构非法 / 行列不存在 / 整表覆盖率回归不过) |
-| `report.tableDegraded` | 降级层降级为图片的表数,每张在 `removedSpans` 各有一条留痕(reason=`garbled:degrade_to_image(coverage=…)`)。仅 `degradeGarbledTables` 开启且有降级时出现 |
-| `provenance` | 默认恒为空(纯削减不加字);混淆层/重转写层开启时逐条登记其替换(origin=`ocr_confusion` / `garbled_table`) |
+| `items` | Cleaned content_list; field set/types match MinerU, unknown fields passed through verbatim |
+| `report.iterations` | Actual number of fix-loop rounds |
+| `report.opCounts` | Execution count for each fix operation |
+| `report.dismissed` | Number of suspects ruled false positives (or deferred) |
+| `report.dismissedSuspects` | Per-item detail of the `dismissed` count: each entry has `kind` (detector category) / `itemId` / `reason` (defer category: `llm_dismiss` LLM actively judged false positive / `max_rounds_exhausted` rounds exhausted / `vision_unavailable` split_table had no image to judge / `llm_no_tool_call` / `llm_error` call retries exhausted) / `detail` (one-line LLM reason or error message, may be empty) / `evidence` (raw detector evidence). Used for offline review of "why it wasn't fixed" and tuning the detector/prompt accordingly; omitted when there are none |
+| `report.removedSpans` | Removal record: for each removed span, itemId / original text / reason, auditable line by line |
+| `report.violations` | Number of fidelity-gate rollbacks (fix output violated fidelity and was auto-reverted) |
+| `report.tokenUsage` | LLM token consumption |
+| `report.failOpen` | Whether fail-open was triggered; when `true`, `items` is the original input |
+| `report.confusionFixes` | Each replacement the confusion layer applied (itemId / field / offset / before & after chars / allowlist source / LLM basis). Present only when `fixOcrConfusion` is on and there were replacements |
+| `report.confusionRejected` | Number of confusion proposals rejected by the gates (structurally invalid / density over the limit / vetoed by second-pass judging) |
+| `report.confusionObservations` | Out-of-table OCR-quality issues the LLM noticed while judging; recorded only, never applied, usable as a downstream quality signal |
+| `report.tableRewrites` | Each whole-cell replacement the re-transcription layer applied (itemId / row & col / before / after / character range of the new string). `before` is the undo credential — write it back over the range to reverse programmatically. Present only when `rewriteGarbledTables` is on and there were replacements |
+| `report.tableRewriteRejected` | Number of re-transcription proposals rejected by the gates (structurally invalid / row/col does not exist / whole-table coverage regression fails) |
+| `report.tableDegraded` | Number of tables the demotion layer demoted to images; each has a record in `removedSpans` (reason=`garbled:degrade_to_image(coverage=…)`). Present only when `degradeGarbledTables` is on and there were demotions |
+| `provenance` | Always empty by default (pure reduction adds no characters); when the confusion / re-transcription layers are on, each of their replacements is registered here (origin=`ocr_confusion` / `garbled_table`) |
 
-## 硬保证
+## Swapping models (custom LLMs)
 
-- **保真**:输出的内容字符(`text` + `list_items` + `table_caption`,仅计非空白)是输入
-  的子多重集——记作 `C_out ⊆ C_in`,即不含任何输入里没有的字。每个修复操作执行后立即
-  校验,违反即回滚;出口对整篇再校验一次,不过则 fail-open。
-- **表格逐字节不变**:未被处理的表,`table_body` 逐字节等于输入。跨页合并的表降级为
-  **行级逐字节**:每个 `<tr>` 行必须逐字节来自输入的行池,行外"外壳"逐字节命中某个
-  输入表外壳——除"把若干输入行按原字节拼进某个输入表"之外,任何字节改动都会被闸门回滚。
-- **schema 透明**:输出字段集合/类型与 MinerU 一致,未知字段原样透传;内部使用的稳定 ID
-  在出口前剥除,绝不进输出。
-- **fail-open**:任何异常 / 超时 / LLM 不可用 → 原样返回输入 + 大声 log,绝不搞崩上游。
-- **幂等**:清洗结果再跑一次,输出逐字节不变(实测三份真实文档成立)。无疑点的文档零 LLM
-  调用;提供 `sha256` 可命中缓存直接跳过。
-- **可审计**:删掉的每一段内容都留痕于 `report.removedSpans`(itemId / 原文 / 原因)。
+By default the text role is DeepSeek and the vision role is Qwen-VL. You are not locked
+into that — the text (`reasoning`) and vision (`vision`) roles can each be pointed at a
+different LLM independently. There are two mechanisms, in priority order.
 
-以上保证在默认配置下全部成立。显式开启 `fixOcrConfusion` 后,"保真"与
-"表格逐字节不变"两条变为下述双契约,其余保证不变;显式开启 `rewriteGarbledTables` 后,
-被机械检测器判废的个别表格另有"整格替换 + 全量留痕"的独立契约,见[乱码表重转写层](#乱码表重转写层opt-in);
-显式开启 `degradeGarbledTables` 后,救不回的乱码表整项降级为图片(纯削减 + 留痕,
-见[降级兜底](#降级兜底degradegarbledtables))。
+### 1. `modelConfig` — config-driven, multi-vendor (recommended)
 
-## 混淆修正层(opt-in)
+Built on the [genai](https://github.com/jeremychone/rust-genai) crate, which natively
+knows DeepSeek, Aliyun (Qwen/DashScope), OpenAI, Anthropic, Gemini, Ollama, Groq, xAI,
+plus **any OpenAI-compatible custom endpoint**. Pass a `modelConfig` with two independent
+roles; omit a role to fall back to the env default.
 
-OCR 高频形近误认(`CE0`→`CEO`、`0A系统`→`OA`、`入=n`→`λ=n`、`竟争`→`竞争`、
-`B1.36%`→`81.36%`)伤检索且无法用削减修复——这是**替换**。默认关闭;
-显式传 `fixOcrConfusion: true` 才运行,跑在核心清洗与全部出口闸门**之后**,
-是一个独立后处理层。
+Each role is `{ provider?, model, key?, baseUrl? }`:
 
-开启后的输出契约(双契约,均机器可验证/可追溯):
+| Field | Meaning |
+|---|---|
+| `provider` | Vendor/protocol: `deepseek` / `aliyun` (`qwen`, `dashscope`) / `openai` (also `openai-compatible`, `custom`) / `anthropic` (`claude`) / `gemini` (`google`) / `ollama` / `groq` / `xai` (`grok`). Omit to infer from the model name |
+| `model` | Model name (e.g. `deepseek-chat`, `qwen-vl-max`, `gpt-4o`, `MiniMax-M3`) |
+| `key` | API key. Omit to fall back to the vendor's default env var |
+| `baseUrl` | OpenAI-compatible endpoint (private deployment / custom gateway). Omit to use the vendor default |
 
-1. **核心层**照旧:只删不增(`C_out ⊆ C_in` 对核心阶段成立);
-2. **混淆层**:所有修改都是稀疏的一换一定点替换,每条要么属于内置混淆等价类
-   (`0↔O`、`1↔l↔I↔|`、`8↔B`、`入↔人↔λ`、`竟↔竞` 等,可经 `extraConfusionPairs` 补充),
-   要么通过了独立的对抗式二次裁决;全量进 `report.confusionFixes` 与 `provenance`,
-   可审计、可程序化撤销。
+**Example — MiniMax-M3** (OpenAI-compatible and natively multimodal, so one model serves
+both roles):
 
-权力结构:**LLM 只有提案权,没有写入权**。每条提案过三道机械闸门——
-恰好 1 字符、单字段替换密度上限(混淆是稀疏的,超标整字段拒绝)、准入名单
-(表内直落 / 表外二次裁决)。
-层内 LLM 故障只搁置对应批次(漏修不误修),层级异常只丢弃本层、核心产物原样返回。
-
-**表格**:`table_body` 经词法切分后只有 td/th 单元格内的文本可成为候选——
-HTML 标签骨架(`colspan=1` 的 `1`)在构造上就不可能被替换,实体(`&amp;`)当黑盒跳过,
-即"标签骨架逐字节不变,单元格文本仅有准入名单内的稀疏一换一替换"。表格候选用
-行列结构化上下文裁决(表标题/表头/所在行),并多一道每表聚合密度闸门:单格各自合规
-但整表提案过多 = 乱码表特征,整表拒绝——乱码表的归宿是整表裁决,不是逐字"修复"。
-
-**全文频率投票**:候选字与邻字构成的高频词全文一致出现(≥5 次)且无任何类内变体写法
-→ 大概率真术语,加白跳过送审(压误报、省调用);拉丁 token 的少数派写法
-(`OGSTM`×2 vs `OGSMT`×20,单字差或相邻换位)生成定点候选,LLM 确认且命中多数派写法的
-免二次裁决直落(`source=frequency_vote`——差异本身就是全文实证)。
-
-**observations 闭环**:LLM 裁决时顺带报告的「X 应为 Y」表外观察,解析出单字替换后
-生成定点候选做第二轮裁决(三道闸门照旧),回收已花掉的 token。最多一轮回灌,
-第二轮的 observations 只记录不再回灌(防循环);频率加白的术语(「烟感」×5)不回灌。
-
-`fixOcrConfusion` 与 `extraConfusionPairs` 均进缓存 key,开关不同的调用绝不互相污染缓存。
-
-## 乱码表重转写层(opt-in)
-
-个别表格会被 OCR **整体认废**(实测某表 13+ 处乱码:代格/目择值/数据来酒/合格军/
-Midhuel……),逐字符混淆修正救不动——但它的 `img_path` 截图完全清晰可读。这类表的
-归宿是对照图像**逐单元格重转写**。默认关闭;显式传 `rewriteGarbledTables: true` 才运行
-(需要 `imageDir`,缺则按配置错误 fail-open),跑在全部出口闸门之后、混淆层之前。
-
-权力结构:**目标选定 100% 由机械检测器定,LLM 无提名权**。检测器对单元格文本的汉字段
-做正向最大匹配(内嵌 6 万常用词词典),算"被词典词覆盖的字符比例"——乱码词的特征是
-常用字的非词组合(代格/目择/来酒),覆盖率塌方;正常表即便满是专名(股票代码/公司名)
-也明显更高。阈值按真实文档标定:乱码表 0.46,最差正常表 0.61,取 0.55 判废。
-
-判废的表连同当前单元格内容送 Qwen-VL 对照截图,视觉模型只有**单元格级提案权**,
-落地过三道机械闸门:
-
-1. **资格**:原格必须有"乱码已毁"的证据——空格、纯数值格、短编号格(`G1.4`)、
-   词覆盖率正常的格一律不许动。实测视觉模型在 33 列宽表上会**行列错位**,
-   把别格内容张冠李戴过来(`79.41%`→`84.1%`、长句→`Michael`),这道闸门拦下全部此类提案;
-2. **结构**:行列号必须命中现存单元格、不得引入标签/控制字符、长度有上限、
-   提案不得是纯数值、长度量级与原格可比(均为错位特征),同格重复提案只认第一条;
-3. **整表回归**:重转写后的词典覆盖率必须**严格高于**重转写前——视觉模型在"修复"
-   以外做的任何事都会被这道闸门按住,整表回退。
-
-HTML 标签骨架在构造上不可触碰(替换只发生在单元格内层区间);每条替换进
-`report.tableRewrites`(`before` 字段即撤销凭据)与 `provenance`(origin=`garbled_table`),
-可审计、可程序化撤销。取不到图 / 视觉故障 / 超大表只搁置对应表(漏修不误修),
-层级异常只丢弃本层。顺带地,整格重转写天然覆盖 `Midhuel→Michael` 这类**词级**错误——
-它们超出混淆层的单字符契约,在视觉重审语境里是自然产物。
-
-`rewriteGarbledTables` 进缓存 key(含重转写 prompt 版本),开关不同的调用绝不互相污染缓存。
-
-### 降级兜底(degradeGarbledTables)
-
-重转写是尽力而为:视觉故障搁置、闸门全拒、覆盖率回归不过,乱码表都会原样留在产物里——
-一张满是「目择值/数据来酒」的假表对下游检索/RAG 是**主动误导**,而它的 `img_path`
-截图完全清晰。显式传 `degradeGarbledTables: true` 启用纯机械兜底(不依赖 LLM/VL,
-可独立于重转写层开启):跑在重转写层之后,**仍判废**(词典覆盖率塌方)且有 `img_path`
-的表整项降级为 `image`——题注/脚注改挂 `image_caption`/`image_footnote`,`table_body`
-删除并留痕(`removedSpans`,reason 含覆盖率),full.md 里呈现为图片引用。
-两层都开 = 先救、救不回再降;救回(覆盖率过阈值)的表自然跳过。同样进缓存 key。
-
-## 工作原理
-
-```
-        ┌─────────────────────────────────────────────────────┐
-  in ──▶│  ① 异常探测器(确定性启发式)  →  疑点队列              │
- items  │            ▼                                         │
-        │  ② tool-use 循环(DeepSeek):                          │
-        │     预载上下文 → LLM 选修复操作 / 判误报              │
-        │     → 执行 + 保真闸(违反即回滚) → 重新探测            │
-        │            ▼   (队列弹空才结束 + 多重守卫)            │
-        │  ③ 出口闸门:保真 ∧ 疑点数不增 ∧ 几何可定位            │
-        │      pass ─┴─ fail → fail-open(返回原始输入)         │
-        └─────────────────────────────────────────────────────┘
-                     ▼  { items(同schema), report }
+```ts
+// JS
+await refine(contentList, {
+  imageDir: "/abs/mineru/out",
+  modelConfig: {
+    reasoning: { provider: "openai", model: "MiniMax-M3", key: process.env.MINIMAX_APIKEY, baseUrl: "https://api.minimaxi.com/v1" },
+    vision:    { provider: "openai", model: "MiniMax-M3", key: process.env.MINIMAX_APIKEY, baseUrl: "https://api.minimaxi.com/v1" },
+  },
+});
 ```
 
-控制流由**确定性外层循环**驱动:从队列弹出一个疑点 → 连同上下文交给 LLM → LLM 回一个
-修复操作或"误报"裁定 → 执行 → 重新探测。不让 LLM 自由驱动流程——可控、便宜、可单测。
+```python
+# Python
+mineru_refine.refine(
+    items,
+    image_dir="/abs/mineru/out",
+    model_config={
+        "reasoning": {"provider": "openai", "model": "MiniMax-M3", "key": key, "baseUrl": "https://api.minimaxi.com/v1"},
+        "vision":    {"provider": "openai", "model": "MiniMax-M3", "key": key, "baseUrl": "https://api.minimaxi.com/v1"},
+    },
+)
+```
 
-每个 item 在流程内带一个**内部稳定 ID**(如 `it_0001`),所有操作参数、队列、LLM 引用
-一律用 ID 而非数组下标——一次合并/拆分就会让下标全体错位。ID 是内部字段,出口前剥除。
+```rust
+// Rust
+use mineru_refine::{ModelConfig, ProviderConfig};
+let minimax = ProviderConfig {
+    provider: Some("openai".into()),
+    model: "MiniMax-M3".into(),
+    key: Some(key.clone()),
+    base_url: Some("https://api.minimaxi.com/v1".into()),
+};
+let opts = RefineOptions {
+    image_dir: Some("/abs/mineru/out".into()),
+    model_config: Some(ModelConfig {
+        reasoning: Some(minimax.clone()),
+        vision: Some(minimax),
+    }),
+    ..Default::default()
+};
+```
 
-### 探测器:能发现哪些问题
+Requirements: the text endpoint must support **tool-call** (`tool_choice: "required"`) and
+the vision endpoint must accept image input. Reasoning models that emit `<think>…</think>`
+blocks (MiniMax, DeepSeek-R1, QwQ, …) are handled — the reasoning block is stripped
+automatically so it never pollutes the judging output. `modelConfig` goes into the cache
+key (by model identity), so swapping models never wrongly hits a cache entry from another
+model. Judging quality is model-dependent; the fidelity gate and fail-open still backstop
+(bad changes are rolled back, worst case returns unchanged), so compare `report` on a few
+real documents when trying a new model.
 
-**可处理(有对应修复操作):**
+### 2. Custom callbacks — the escape hatch
 
-| 疑点类型 | 启发式 | 修复 |
+When you need auth/proxy/model logic that `modelConfig` can't express, inject your own
+`chat` / `vision` implementation. These take priority over `modelConfig`, which takes
+priority over the env default. See the per-language docs for the exact callback shapes:
+[Python](bindings/python/#swapping-models-custom-llms) (an object/callable),
+[JS](bindings/js/#swapping-models-custom-llms) (async callbacks),
+[Rust](crates/mineru-refine/) (`Arc<dyn ChatClient>` / `Arc<dyn VisionClient>`).
+
+## Hard guarantees
+
+- **Fidelity**: the output content characters (`text` + `list_items` + `table_caption`,
+  counting non-whitespace only) are a sub-multiset of the input — written `C_out ⊆ C_in`,
+  i.e. containing no character absent from the input. Each fix operation is verified
+  immediately after execution and rolled back on violation; the whole document is verified
+  once more at the exit, and if it fails, fail-open.
+- **Table bytes unchanged**: for tables not processed, `table_body` is byte-for-byte equal
+  to the input. Cross-page-merged tables are demoted to **row-level byte fidelity**: each
+  `<tr>` row must come byte-for-byte from the input row pool, and the row-external "shell"
+  must byte-match some input table shell — apart from "splicing certain input rows verbatim
+  into some input table", any byte change is rolled back by the gate.
+- **Schema transparency**: the output field set/types match MinerU, unknown fields pass
+  through verbatim; the stable IDs used internally are stripped before the exit and never
+  enter the output.
+- **fail-open**: any exception / timeout / LLM unavailability → return the input unchanged +
+  log loudly, never breaking the upstream.
+- **Idempotent**: run the cleaning result through again and the output is byte-for-byte
+  unchanged (verified to hold on three real documents). A document with no suspects makes
+  zero LLM calls; providing `sha256` can hit the cache and skip entirely.
+- **Auditable**: every removed span is recorded in `report.removedSpans` (itemId / original
+  text / reason).
+
+All of the above hold in the default configuration. With `fixOcrConfusion` explicitly on,
+"fidelity" and "table bytes unchanged" become the dual contract described below while the
+rest are unchanged; with `rewriteGarbledTables` explicitly on, the individual tables the
+mechanical detector judged junk get a separate "whole-cell replacement + full record"
+contract, see [Garbled-table re-transcription layer](#garbled-table-re-transcription-layer-opt-in);
+with `degradeGarbledTables` explicitly on, garbled tables that can't be rescued are demoted
+whole to images (pure reduction + record, see [Fallback demotion](#fallback-demotion-degradegarbledtables)).
+
+## Confusion-fix layer (opt-in)
+
+High-frequency OCR look-alike misreads (`CE0`→`CEO`, `0A系统`→`OA`, `入=n`→`λ=n`,
+`竟争`→`竞争`, `B1.36%`→`81.36%`) hurt retrieval and can't be fixed by reduction — this is a
+**replacement**. Off by default; it runs only when you explicitly pass `fixOcrConfusion: true`,
+**after** the core cleaning and all exit gates, as a separate post-processing layer.
+
+The output contract once on (a dual contract, both machine-verifiable/traceable):
+
+1. **Core layer** as before: remove-only (`C_out ⊆ C_in` holds for the core stage);
+2. **Confusion layer**: all changes are sparse one-for-one pinpoint replacements; each either
+   belongs to a built-in confusion equivalence class (`0↔O`, `1↔l↔I↔|`, `8↔B`, `入↔人↔λ`,
+   `竟↔竞`, etc., extensible via `extraConfusionPairs`), or passed an independent adversarial
+   second-pass judging; all recorded in `report.confusionFixes` and `provenance`, auditable
+   and programmatically reversible.
+
+Power structure: **the LLM has only proposal power, not write power**. Each proposal passes
+three mechanical gates — exactly 1 character, a per-field replacement-density ceiling
+(confusion is sparse; over the limit the whole field is rejected), and the allowlist
+(in-table direct application / out-of-table second-pass judging). An LLM failure inside the
+layer only defers the corresponding batch (miss a fix rather than mis-fix), and a
+layer-level exception discards only this layer, returning the core output unchanged.
+
+**Tables**: after lexing `table_body`, only text inside td/th cells can become a candidate —
+the HTML tag skeleton (the `1` in `colspan=1`) is by construction never replaceable, and
+entities (`&amp;`) are skipped as a black box; i.e. "tag skeleton byte-for-byte unchanged,
+cell text only sparse one-for-one replacements within the allowlist". Table candidates are
+judged with structured row/column context (table caption / header / containing row), plus an
+extra per-table aggregate-density gate: cells each individually compliant but too many
+proposals across the whole table = garbled-table signature, reject the whole table — the fate
+of a garbled table is whole-table judgment, not character-by-character "repair".
+
+**Document-wide frequency vote**: a candidate character together with its neighbors forms a
+high-frequency word that appears consistently across the document (≥5 times) with no in-class
+variant spellings → most likely a real term, allowlisted and skipped from judging (suppresses
+false positives, saves calls); minority spellings of a Latin token (`OGSTM`×2 vs `OGSMT`×20,
+single-character difference or adjacent transposition) generate a pinpoint candidate, and when
+the LLM confirms it and it hits the majority spelling it is applied directly without
+second-pass judging (`source=frequency_vote` — the difference itself is document-wide evidence).
+
+**observations closed loop**: an "X should be Y" out-of-table observation the LLM reports while
+judging is parsed into a single-character replacement, generating a pinpoint candidate for a
+second round of judging (the three gates as usual), recovering already-spent tokens. At most
+one round of re-feed; the second round's observations are recorded but not re-fed (to prevent
+loops); frequency-allowlisted terms ("烟感"×5) are not re-fed.
+
+`fixOcrConfusion` and `extraConfusionPairs` both go into the cache key, so calls with different
+switches never pollute each other's cache.
+
+## Garbled-table re-transcription layer (opt-in)
+
+Some tables are **judged whole-table junk** by OCR (one real table had 13+ garbled spots:
+代格/目择值/数据来酒/合格军/Midhuel…), which character-by-character confusion fixing can't touch —
+yet its `img_path` crop is perfectly clear and readable. The fate of such tables is
+**cell-by-cell re-transcription against the image**. Off by default; it runs only when you
+explicitly pass `rewriteGarbledTables: true` (requires `imageDir`, fail-open as a config error
+if missing), after all exit gates and before the confusion layer.
+
+Power structure: **target selection is 100% by the mechanical detector, the LLM has no
+nomination power**. The detector runs forward-maximum matching on the CJK segments of cell text
+(with an embedded 60k common-word dictionary) and computes the "fraction of characters covered
+by dictionary words" — a garbled word is a non-word combination of common characters
+(代格/目择/来酒) and its coverage collapses, while a normal table stays clearly higher even when
+full of proper nouns (stock codes / company names). Thresholds are calibrated to real documents:
+garbled table 0.46, worst normal table 0.61, taking 0.55 as the junk threshold.
+
+A table judged junk, along with its current cell contents, is sent to Qwen-VL against the crop;
+the vision model has only **cell-level proposal power**, and applying it passes three mechanical
+gates:
+
+1. **Eligibility**: the original cell must have "garbled and destroyed" evidence — spaces, pure
+   numeric cells, short-ID cells (`G1.4`), and cells with normal word coverage may never be
+   touched. In practice the vision model row/column-misaligns on a 33-column-wide table,
+   bringing another cell's content over under the wrong name (`79.41%`→`84.1%`, a long sentence
+   →`Michael`); this gate blocks all such proposals;
+2. **Structure**: the row/col number must hit an existing cell, no tags/control characters may be
+   introduced, length has an upper bound, the proposal may not be pure numeric, and its length
+   magnitude must be comparable to the original cell (all misalignment signatures); for duplicate
+   proposals on the same cell only the first is honored;
+3. **Whole-table regression**: the dictionary coverage after re-transcription must be **strictly
+   higher** than before — anything the vision model does beyond "repair" is held down by this
+   gate and the whole table is reverted.
+
+The HTML tag skeleton is by construction untouchable (replacement happens only in the cell-inner
+range); each replacement enters `report.tableRewrites` (the `before` field is the undo
+credential) and `provenance` (origin=`garbled_table`), auditable and programmatically reversible.
+No image / vision failure / oversized table just defers the corresponding table (miss rather than
+mis-fix), and a layer-level exception discards only this layer. Incidentally, whole-cell
+re-transcription naturally covers **word-level** errors like `Midhuel→Michael` — they exceed the
+confusion layer's single-character contract but are a natural product in the vision-review context.
+
+`rewriteGarbledTables` goes into the cache key (including the re-transcription prompt version), so
+calls with different switches never pollute each other's cache.
+
+### Fallback demotion (degradeGarbledTables)
+
+Re-transcription is best-effort: a vision failure defers, all gates reject, or coverage
+regression fails — in all these cases the garbled table stays in the output as-is. A fake table
+full of "目择值/数据来酒" is **actively misleading** to downstream retrieval/RAG, while its
+`img_path` crop is perfectly clear. Explicitly passing `degradeGarbledTables: true` enables a
+purely mechanical fallback (no LLM/VL, can be turned on independently of the re-transcription
+layer): running after the re-transcription layer, tables **still judged junk** (dictionary
+coverage collapse) that have an `img_path` are demoted whole to `image` — caption/footnote move
+to `image_caption`/`image_footnote`, `table_body` is removed and recorded (`removedSpans`, reason
+including coverage), and it renders as an image reference in full.md. Both layers on = rescue
+first, demote what can't be rescued; tables that are rescued (coverage passes the threshold) are
+naturally skipped. It also goes into the cache key.
+
+## How it works
+
+```
+  in items
+     │
+     ▼
+  ① Anomaly detector (deterministic heuristics)  →  suspect queue
+     │
+     ▼
+  ② tool-use loop (DeepSeek):
+       preload context → LLM picks a fix op / rules false positive
+       → execute + fidelity gate (rollback on violation) → re-detect
+       (ends only when the queue empties + multiple guards)
+     │
+     ▼
+  ③ Exit gate: fidelity ∧ suspect count non-increasing ∧ geometrically locatable
+       pass → continue   ·   fail → fail-open (return the original input)
+     │
+     ▼
+  { items (same schema), report }
+```
+
+Control flow is driven by a **deterministic outer loop**: pop a suspect from the queue → hand it
+plus context to the LLM → the LLM returns a fix operation or a "false positive" ruling → execute →
+re-detect. The LLM doesn't drive the flow freely — this keeps it controllable, cheap, and
+unit-testable.
+
+Each item carries an **internal stable ID** (like `it_0001`) throughout the flow; all operation
+parameters, the queue, and LLM references use the ID rather than an array index — one merge/split
+would shift every index. The ID is an internal field, stripped before the exit.
+
+### Detector: what it can find
+
+**Actionable (has a corresponding fix operation):**
+
+| Suspect type | Heuristic | Fix |
 |---|---|---|
-| `pseudo_heading` 伪标题 | 带 `text_level` 但含逗号/句末标点/正文过长 | `demote` / `merge` |
-| `cross_page_break` 跨页断句 | 相邻块跨页,前块未以句末标点结尾 | `merge` |
-| `giant_block` 巨型块 | 单 text 超阈值且含多个疑似小节编号 | `split` |
-| `page_artifact` 页面家具 | 高频重复短文本,或与已识别页眉页脚同文(≥2 处佐证) | `drop` |
-| `residual_markup` 残留符号 | markdown 链接、`$...$`、`\frac` 等 LaTeX 残骸 | `strip` |
-| `empty_table` 空壳表 | 零内容表(无行/caption/图)——MinerU 跨页合并后留下的占位 | `drop` |
-| `split_table` 跨页拆表 | 跨页的两个有体表格,中间仅页面家具。支持三页以上的链式拆表(每轮合一对,逐段咬合) | `mergeTable`(**仅视觉裁决**,见下) |
-| `split_list` 跨页拆列表 | 跨页相邻的两个列表 | `mergeList` |
-| `missed_heading` 漏标标题 | 同级编号兄弟是标题而本块是正文,且编号相邻 | `promote` |
-| `trailing_marker` 段尾粘连节标记 | 段尾粘了「[相关文件]」类独立结构块(跨页 merge 吸入) | `split` |
-| `separated_caption` caption 错序 | caption 样短文本与表格之间隔着一个标题块 | `reorder` |
-| `caption_heading` 被吞标题 | `table_caption` 条目是带编号的标题样短文本,且存在相邻的同级编号标题兄弟(MinerU 把小节标题塞进了表格题注) | `extractCaption` |
-| `caption_artifact` 被吞家具 | `table_caption` 条目与已分类的 `header`/`footer` 同文(≥2 处佐证)或全文高频重复——MinerU 把跑马灯页眉/页脚塞进了表格题注,`mergeTable` 又忠实保留,渲染成残留 | `dropCaption` |
-| `extra_char` 赘字/衍字 | 功能词叠字(的的/地地/是是/了了,合法叠词除外)、孤立偏旁部首(「3)亻」) | `deleteChar` |
+| `pseudo_heading` | Has `text_level` but contains a comma / sentence-ending punctuation / body too long | `demote` / `merge` |
+| `cross_page_break` | Adjacent blocks across pages, the former not ending in sentence-ending punctuation | `merge` |
+| `giant_block` | A single text over the threshold containing multiple suspected section numbers | `split` |
+| `page_artifact` | High-frequency repeated short text, or same text as an identified header/footer (≥2 corroborations) | `drop` |
+| `residual_markup` | LaTeX debris like markdown links, `$...$`, `\frac` | `strip` |
+| `empty_table` | Zero-content table (no rows/caption/image) — a placeholder left after MinerU's cross-page merge | `drop` |
+| `split_table` | Two substantive tables across pages with only page furniture in between. Supports chained splits across three+ pages (merge one pair per round, biting together segment by segment) | `mergeTable` (**vision-only judging**, see below) |
+| `split_list` | Two adjacent lists across pages | `mergeList` |
+| `missed_heading` | Same-level numbered siblings are headings but this block is body text, and the numbers are adjacent | `promote` |
+| `trailing_marker` | A section marker stuck at a paragraph's end (a standalone structural block like "[Related documents]", sucked in by a cross-page merge) | `split` |
+| `separated_caption` | A caption-like short text separated from its table by a heading block | `reorder` |
+| `caption_heading` | A `table_caption` entry is a numbered heading-like short text, and there exists an adjacent same-level numbered heading sibling (MinerU stuffed a section heading into the table caption) | `extractCaption` |
+| `caption_artifact` | A `table_caption` entry is same text as a classified `header`/`footer` (≥2 corroborations) or is document-wide high-frequency repeated — MinerU stuffed a running header/footer into the table caption, `mergeTable` faithfully preserved it, and it renders as residue | `dropCaption` |
+| `extra_char` | Function-word doubling (的的/地地/是是/了了, legitimate reduplication excepted), isolated radicals ("3)亻") | `deleteChar` |
 
-**只标记、无修复操作**(LLM 只能判误报,计入 report 供观测):孤儿/空 caption(`caption_issue`)。
+**Marked only, no fix operation** (the LLM can only rule false positive, counted in report for
+observation): orphan/empty caption (`caption_issue`).
 
-### 修复操作集(12 个削减/重组 + dismiss)
+### Fix operation set (12 reduction/reorganization + dismiss)
 
-全部是纯函数 `(items, args) -> items`,自带保真校验,违反即回滚并计入 `report.violations`。
+All are pure functions `(items, args) -> items` with built-in fidelity checks; a violation is rolled
+back and counted in `report.violations`.
 
-| 操作 | 语义 | bbox / page_idx 派生 |
+| Operation | Semantics | bbox / page_idx derivation |
 |---|---|---|
-| `merge(idA, idB)` | 相邻两块拼一块,去掉 MinerU 插入的分隔符 | bbox 并集;page_idx 取首块 |
-| `split(id, offset)` | 在 offset 处切成两块 | 两子块继承父块 |
-| `demote(id)` | 伪标题降为正文(清 `text_level`) | 不变 |
-| `promote(id, level)` | 正文升为标题 | 不变 |
-| `reorder(idsInOrder)` | 修跨页错序(仅限连续区间内的排列) | 各块不变 |
-| `drop(id)` | 删页码/页眉/页脚/水印/空壳表(须命中白名单类型) | —(删除) |
-| `strip(id, pattern)` | 去残留符号。pattern 白名单:`md_link` / `latex_dollar` / `latex_block` / `latex_command` / `escaped_dollar` / `html_tag` | 不变 |
-| `deleteChar(id, offset)` | 删单个 OCR 衍字。白名单严格:与紧邻字符重复的功能词叠字(的/地/是/了)或孤立偏旁部首;的的确确/地地道道/是是非非受构造性保护 | 不变 |
-| `mergeTable(idA, idB)` | 跨页拆表合并:B 的 `<tr>` 行**原字节**追加到 A 末行后,caption/footnote 拼接;B 首行与 A 表头逐字节相同时(每页重印表头)去重并留痕 | bbox 并集;page_idx 取首块 |
-| `mergeList(idA, idB, joinSeam?)` | 跨页拆列表合并:`list_items` 拼接;`joinSeam` 把 A 尾项与 B 首项缝成一项(断句跨页) | bbox 并集;page_idx 取首块 |
-| `extractCaption(id, captionIndex, position, level?)` | 把被吞进 `table_caption` 的小节标题抽出为独立 text 块(字符纯移动),插在表格前/后;`level` 给则直接设 `text_level` | 新块继承表格 bbox/page_idx |
-| `dropCaption(id, captionIndex)` | 删掉 `table_caption` 里被吞进的页眉/页脚家具条目(纯削减,表格本体与其余 caption 不动,留痕 `removedSpans`);须命中 `caption_artifact` 白名单 | 不变 |
-| `dismiss(id, reason)` | 裁定误报,不改文本;重新探测时不再标记它 | — |
+| `merge(idA, idB)` | Join two adjacent blocks, dropping the separator MinerU inserted | bbox union; page_idx from the first block |
+| `split(id, offset)` | Cut into two blocks at offset | Both children inherit the parent |
+| `demote(id)` | Demote a pseudo-heading to body text (clear `text_level`) | unchanged |
+| `promote(id, level)` | Promote body text to a heading | unchanged |
+| `reorder(idsInOrder)` | Fix cross-page misordering (permutations within a contiguous range only) | Each block unchanged |
+| `drop(id)` | Delete page number/header/footer/watermark/empty-shell table (must hit the allowlisted type) | — (deletion) |
+| `strip(id, pattern)` | Remove residual markup. Pattern allowlist: `md_link` / `latex_dollar` / `latex_block` / `latex_command` / `escaped_dollar` / `html_tag` | unchanged |
+| `deleteChar(id, offset)` | Delete a single OCR spurious character. Strict allowlist: function-word doubling adjacent to an identical character (的/地/是/了) or an isolated radical; 的的确确/地地道道/是是非非 are constructively protected | unchanged |
+| `mergeTable(idA, idB)` | Cross-page split-table merge: B's `<tr>` rows are appended **byte-verbatim** after A's last row, caption/footnote concatenated; when B's first row is byte-for-byte identical to A's header (header reprinted per page), it is de-duplicated and recorded | bbox union; page_idx from the first block |
+| `mergeList(idA, idB, joinSeam?)` | Cross-page split-list merge: `list_items` concatenated; `joinSeam` seams A's last item and B's first item into one (sentence break across pages) | bbox union; page_idx from the first block |
+| `extractCaption(id, captionIndex, position, level?)` | Extract a section heading swallowed into `table_caption` as a standalone text block (pure character move), inserted before/after the table; if `level` is given, set `text_level` directly | The new block inherits the table's bbox/page_idx |
+| `dropCaption(id, captionIndex)` | Delete a header/footer furniture entry swallowed into `table_caption` (pure reduction; the table body and remaining captions untouched, recorded in `removedSpans`); must hit the `caption_artifact` allowlist | unchanged |
+| `dismiss(id, reason)` | Rule a false positive, don't change text; don't mark it again on re-detection | — |
 
-`mergeTable` **不做列对齐判断,也不做列对齐修复**:"是否同一张表"由模型看内容裁决
-(故意不把"列数相等"做成闸门——rowspan 跨页携带、某页空列被 MinerU 略去,都会造成列数
-合法地不等);列参差的行原样保留,绝不发明空单元格去"补齐"——补哪一列是语义猜测,猜错
-即篡改,而行级保真闸恰好把这类"修复"挡在门外。错位若存在,那是 MinerU 输入即有的,
-合并不引入新损伤。
+`mergeTable` does **no column-alignment judging and no column-alignment fixing**: "is it the same
+table" is judged by the model from content (deliberately not making "equal column count" a gate —
+rowspan carried across a page, or an empty column omitted by MinerU on one page, both make column
+counts legitimately unequal); rows with ragged columns are kept as-is, never inventing empty cells
+to "pad" — which column to pad is a semantic guess, guessing wrong is tampering, and the row-level
+fidelity gate keeps exactly this kind of "fix" out. Any misalignment that exists was already in the
+MinerU input; merging introduces no new damage.
 
-几何字段(`bbox` / `page_idx`)的派生规则保证**每个输出 item 仍能回指至少一个源 item**——
-下游做高亮定位依赖它们。
+The geometry fields (`bbox` / `page_idx`) derivation rules guarantee **every output item can still
+point back to at least one source item** — downstream highlight positioning depends on them.
 
-### 跨页拆表的视觉裁决(Qwen-VL,唯一路径)
+### Vision judging for cross-page split tables (Qwen-VL, the only path)
 
-"两个表是不是同一张表"是图里一眼可见、文本里只能猜的事实,所以 `split_table` 疑点
-**只走视觉裁决**:把两个表的 MinerU 裁剪图(content_list 的 `img_path` 本来就指向它们)
-发给 `qwen-vl-max` 问一个窄问题,结构化回答映射到 `mergeTable` 或 `dismiss`。
-不提供文本兜底路径——首末行摘要不足以核对表格行的真实归属,错合比漏合更糟。要点:
+"Are these two tables the same table" is a fact plainly visible in the image but only guessable in
+text, so the `split_table` suspect **goes to vision judging only**: send the two tables' MinerU crops
+(the content_list `img_path` already points at them) to `qwen-vl-max` with a narrow question, and map
+the structured answer to `mergeTable` or `dismiss`. No text fallback path is provided — a first/last
+row summary is not enough to verify the true membership of table rows, and mis-merging is worse than
+missing a merge. Key points:
 
-- 视觉模型**只输出决策,不产内容字符**——合并仍走行级保真闸,不碰纯削减红线。
-- 未提供 `imageDir` → `split_table` 整体跳过,表格原样保留。
-- 无图 / 无 key / 视觉模型不可用 / 判决被闸门拒 → 搁置该疑点(不阻塞其余修复)。
-- 实测两份真实文档 7 判 7 对(5 真续表合并 + 2 假续表判误报,含 rowspan 列数不等、
-  文控页同位置异表等困难形态),单次约 2k token。
+- The vision model **only outputs a decision, produces no content characters** — the merge still goes
+  through the row-level fidelity gate, never crossing the pure-reduction red line.
+- No `imageDir` provided → `split_table` is skipped wholesale, tables kept as-is.
+- No image / no key / vision model unavailable / verdict rejected by the gate → defer that suspect
+  (without blocking the other fixes).
+- Verified 7-for-7 on two real documents (5 real continuation-table merges + 2 fake continuation
+  tables ruled false positive, including hard forms like unequal column counts from rowspan and
+  same-position different tables on a doc-control page), ~2k tokens per call.
 
-### 守卫与终止
+### Guards and termination
 
-- **队列弹空才结束**:有修复操作、未被判误报的疑点全部处理完,循环才到底。
-- **误报裁决集**:已判误报的疑点在重新探测时排除,防止同一误报反复入列、循环不收敛。
-- **硬上限**:`maxIterations` 到顶强停;单疑点轮数耗尽 → 强制搁置(计入 dismissed)。
-  默认上限随初始疑点数自适应——修复会解锁新疑点(实测总工作量约为初始数的 1.6 倍),
-  固定常数对大文档必然截断。
-- **防震荡**:合并产物禁止立刻拆分,拆分产物对禁止立刻合并回去。
-- **矛盾决策守卫**:同一条回复同时调 dismiss 和变更操作 → 整体驳回,把矛盾点回灌给
-  LLM 强制重裁(实测 LLM 会把「应 drop」的分析写进 dismiss 理由又并行调 drop)。
-  每个变更操作都带一句话依据进审计日志。
-- **联合裁决**:强关联疑点归并为一次裁决——同级编号兄弟组的 `missed_heading` 一起判
-  (防止逐个裁决忽升忽不升),同文 `page_artifact` 一起判(同一页眉文本要删全删、
-  要留全留)。
-- 出口合格判定全部是机器检查:队列空 ∧ 保真 ∧ 疑点数 ≤ 输入 ∧ 几何可定位;
-  任一不满足 → fail-open。
+- **Ends only when the queue empties**: the loop reaches the end only when all suspects that have a
+  fix operation and weren't ruled false positive are processed.
+- **False-positive ruling set**: suspects already ruled false positive are excluded on re-detection,
+  preventing the same false positive from re-entering the queue repeatedly and the loop from failing
+  to converge.
+- **Hard cap**: `maxIterations` force-stops at the cap; a single suspect exhausting its rounds → forced
+  defer (counted in dismissed). The default cap is adaptive with the initial suspect count — fixes
+  unlock new suspects (total workload measured at ~1.6× the initial count), and a fixed constant would
+  necessarily truncate large documents.
+- **Anti-oscillation**: a merge output may not be split immediately, and a split output pair may not be
+  merged back immediately.
+- **Contradiction guard**: a single reply that calls both dismiss and a change operation → rejected
+  wholesale, feeding the contradiction back to the LLM for a forced re-judgment (in practice the LLM
+  writes the "should drop" analysis into the dismiss reason while calling drop in parallel). Every
+  change operation carries a one-line basis into the audit log.
+- **Joint judging**: strongly correlated suspects are merged into one judgment — the `missed_heading`
+  of a same-level numbered sibling group is judged together (preventing per-item judging from
+  promoting some and not others), and same-text `page_artifact` is judged together (a given header
+  text should be all-deleted or all-kept).
+- The exit pass/fail decision is all machine checks: queue empty ∧ fidelity ∧ suspect count ≤ input ∧
+  geometrically locatable; any one unmet → fail-open.
 
-## LLM 接入与环境变量
+## LLM integration and environment variables
 
-LLM 全部走裸 HTTP(`reqwest`),零 SDK 依赖。
+All LLM calls go over bare HTTP (`reqwest`), with zero SDK dependency.
 
-| 变量 | 必需 | 用途 |
+| Variable | Required | Purpose |
 |---|---|---|
-| `DEEPSEEK_APIKEY` | 是 | 文本裁决主力。也接受 `RAGENT_DEEPSEEK_APIKEY`。缺失时 refine 直接 fail-open |
-| `DEEPSEEK_BASE_URL` | 否 | 默认 `https://api.deepseek.com`;可指向私有化部署的 OpenAI 兼容端点 |
-| `DEEPSEEK_MODEL` | 否 | 默认 `deepseek-v4-pro`;换模型时进程内缓存自动按模型名隔离 |
-| `QWEN_APIKEY` | 视觉裁决需要 | 跨页拆表的 Qwen-VL 裁决;缺失则该类疑点搁置 |
-| `QWEN_BASE_URL` | 否 | 默认 DashScope OpenAI 兼容端点 |
-| `QWEN_VISION_MODEL` | 否 | 默认 `qwen-vl-max` |
-| `MINERU_REFINE_PORT` | 否 | HTTP server 端口,默认 8771 |
+| `DEEPSEEK_APIKEY` | Yes | The main text-judging engine. Also accepts `RAGENT_DEEPSEEK_APIKEY`. If missing, refine goes straight to fail-open |
+| `DEEPSEEK_BASE_URL` | No | Defaults to `https://api.deepseek.com`; can point at a private OpenAI-compatible endpoint |
+| `DEEPSEEK_MODEL` | No | Defaults to `deepseek-v4-pro`; the in-process cache is isolated by model name automatically when you switch |
+| `QWEN_APIKEY` | For vision judging | Qwen-VL judging of cross-page split tables; if missing, those suspects are deferred |
+| `QWEN_BASE_URL` | No | Defaults to the DashScope OpenAI-compatible endpoint |
+| `QWEN_VISION_MODEL` | No | Defaults to `qwen-vl-max` |
+| `MINERU_REFINE_PORT` | No | HTTP server port, defaults to 8771 |
 
-**完全私有化部署**:文本与视觉两条链路的端点、模型名都可覆盖,文档不出内网。用 vLLM /
-SGLang 等 OpenAI 兼容框架自建服务,把 `DEEPSEEK_BASE_URL` / `QWEN_BASE_URL` 指过去即可。
-要求:文本端点须支持 **tool-call**(`tool_choice: "required"`),视觉端点须支持多图输入。
-裁决质量未在私有模型上基准测试过——保真闸与 fail-open 仍然兜底(改坏会被回滚,最差原样
-返回),但误报率/修复率可能与默认模型不同,建议先拿几份真实文档对比 `report`。
+**Fully private deployment**: the endpoints and model names of both the text and vision chains can be
+overridden, so documents never leave the intranet. Stand up a service with an OpenAI-compatible
+framework like vLLM / SGLang and point `DEEPSEEK_BASE_URL` / `QWEN_BASE_URL` at it. Requirements: the
+text endpoint must support **tool-call** (`tool_choice: "required"`), and the vision endpoint must
+support multi-image input. Judging quality has not been benchmarked on private models — the fidelity
+gate and fail-open still backstop (bad changes are rolled back, worst case returns unchanged), but the
+false-positive/fix rates may differ from the default model, so compare `report` on a few real documents
+first.
 
-CLI 与 HTTP server 启动时自动加载当前目录的 `.env`;作为库调用时请自行设置环境变量
-(或在宿主程序里加载 `.env`)。
+The CLI and HTTP server auto-load `.env` from the current directory at startup; when calling as a
+library, set the environment variables yourself (or load `.env` in the host program).
 
-实现要点(影响成本与可复现性):
+Implementation notes (affecting cost and reproducibility):
 
-- **DeepSeek 文本裁决**:`temperature: 0` + 关闭 thinking(可复现、省 reasoning token);
-  `tool_choice: "required"` 强制每轮必选一个操作,天然禁止输出正文;tool-call 参数先过
-  JSON 修复再解析,兜偶发坏 JSON。system prompt 与文档 outline 放消息前缀且每轮不变,
-  命中 DeepSeek input cache(命中价约为未命中的 1/120)。
-- **Qwen-VL 视觉裁决**:图走 base64 data URL,`temperature: 0`,回复按结构化 JSON 解析。
-- **容错**:网络错误 / 429 / 5xx 自动重试;单疑点故障只搁置自身不毁全局
-  (整轮零成功才 fail-open)。
-- **性能**:疑点默认 8 路并行裁决;常见疑点的上下文(±2 邻居、跨页整页)预载进首条消息,
-  省去额外的观察轮次。
+- **DeepSeek text judging**: `temperature: 0` + thinking disabled (reproducible, saves reasoning
+  tokens); `tool_choice: "required"` forces one operation per round, naturally forbidding body output;
+  tool-call arguments go through JSON repair before parsing, backstopping the occasional bad JSON. The
+  system prompt and document outline are placed as a message prefix and unchanged per round, hitting
+  the DeepSeek input cache (hit price ~1/120 of miss).
+- **Qwen-VL vision judging**: images go as base64 data URLs, `temperature: 0`, and the reply is parsed
+  as structured JSON.
+- **Fault tolerance**: network errors / 429 / 5xx auto-retry; a single suspect's failure only defers
+  itself without destroying the whole (fail-open only when a whole round has zero successes).
+- **Performance**: suspects are judged 8-way parallel by default; the context of common suspects
+  (±2 neighbors, the full cross-page pages) is preloaded into the first message, saving extra
+  observation rounds.
 
-### 成本参考
+### Cost reference
 
-三份真实文档的实测消耗(`report.tokenUsage`),按 DeepSeek-V4-Pro 现行价格
-(2026-06 起:输入缓存命中 ¥0.025 / 未命中 ¥3、输出 ¥6,均为每百万 token)估算:
+Measured consumption on three real documents (`report.tokenUsage`), estimated at DeepSeek-V4-Pro's
+current pricing (from 2026-06: input cache hit ¥0.025 / miss ¥3, output ¥6, all per million tokens):
 
-| 文档 | 裁决轮数 | prompt | completion | 估算花费 |
+| Document | Judging rounds | prompt | completion | Estimated cost |
 |---|---|---|---|---|
-| 战略管理规范(大,content_list 334 KB) | 66 | 195 万 | 2.7 万 | ¥0.5 ~ 1.2(全不命中缓存封顶 ¥6) |
-| 组织绩效管理规范 | 8 | 7.7 万 | 0.1 万 | < ¥0.25 |
-| 管理评审程序 | 7 | 6.7 万 | 0.1 万 | < ¥0.25 |
+| Strategy management spec (large, content_list 334 KB) | 66 | 1.95M | 27k | ¥0.5 ~ 1.2 (capped at ¥6 if all cache misses) |
+| Organizational performance management spec | 8 | 77k | 1k | < ¥0.25 |
+| Management review procedure | 7 | 67k | 1k | < ¥0.25 |
 
-循环按命中 input cache 设计(system prompt 与 outline 是稳定前缀),多轮迭代里绝大部分
-prompt token 走命中价,实际花费通常远低于全未命中的上限。Qwen-VL 表格裁决单次约 2k
-token,可忽略。无疑点的文档零 LLM 调用,花费为零。
+The loop is designed to hit the input cache (the system prompt and outline are a stable prefix), so
+across many iterations the vast majority of prompt tokens run at the hit price, and actual cost is
+usually far below the all-miss ceiling. A Qwen-VL table judgment is ~2k tokens per call, negligible. A
+document with no suspects makes zero LLM calls, at zero cost.
 
 ## CLI
 
 ```bash
 cargo install mineru-refine --features bin
 cat content_list.json | mineru-refine > refined.json
-# stdin 也可以是包对象:{ "items": [...], "sha256"?, "maxIterations"?, "imageDir"? }
+# stdin can also be a wrapper object: { "items": [...], "sha256"?, "maxIterations"?, "imageDir"? }
 ```
 
-## 开发
+## Development
 
 ```bash
-just test         # cargo test:全程 mock LLM,不打网络(160+ 个测试)
+just test         # cargo test: LLM fully mocked, no network (160+ tests)
 just check        # clippy -D warnings + fmt --check
-just smoke-vl     # 冒烟:真实 Qwen-VL 判表(三对真实表格图,需 key)
-just js-build     # JS 绑定本地构建(napi)
-just py-dev       # Python 绑定构建并装进 .venv
+just smoke-vl     # smoke: real Qwen-VL table judging (three pairs of real table crops, needs a key)
+just js-build     # JS binding local build (napi)
+just py-dev       # Python binding build and install into .venv
 ```
 
-测试覆盖六类性质:① golden fixtures ② 保真(`C_out ⊆ C_in`)③ table_body 逐字节不变
-④ 疑点数单调下降 ⑤ 几何可定位 ⑥ 幂等。没有"干净原文"做 ground truth 时,
-"保真 + 疑点下降 + 幂等"是能拿到的最强代理指标。
+The tests cover six kinds of properties: ① golden fixtures ② fidelity (`C_out ⊆ C_in`) ③ table_body
+bytes unchanged ④ monotonic decrease in suspect count ⑤ geometric locatability ⑥ idempotence. Without
+a "clean original" as ground truth, "fidelity + suspect decrease + idempotence" is the strongest proxy
+metric available.
 
-### 真实数据工作流
+### Real-data workflow
 
 ```bash
-# .env 需有 MINERU_API_TOKEN
-just mineru-fetch               # 把 test_data/source/ 下的 PDF/DOC 交 MinerU 官方 API 解析,
-                                # 产物落盘 test_data/mineru/<stem>/
-                                # (--force 重跑;--batch <id> 复用已完成的 batch)
-just refine-real                # 对全部真实 content_list 跑 refine(真 LLM),
-                                # 输出 test_data/refined/<stem>/,打印疑点前后对比
-just refine-real <stem>         # 只跑某个文档;REFINE_MAX_ITERATIONS 可调上限
+# .env needs MINERU_API_TOKEN
+just mineru-fetch               # hand the PDFs/DOCs under test_data/source/ to the MinerU official API,
+                                # landing output in test_data/mineru/<stem>/
+                                # (--force re-runs; --batch <id> reuses a completed batch)
+just refine-real                # run refine on all real content_lists (real LLM),
+                                # output to test_data/refined/<stem>/, print before/after suspect comparison
+just refine-real <stem>         # run just one document; REFINE_MAX_ITERATIONS tunes the cap
 ```
 
-`test_data/refined/<stem>/` 是对应 MinerU 产物目录的 **drop-in 替身**:images/、layout.json
-等原样镜像(`img_path` 引用不断链),`content_list.json` 替换为清洗版,`full.md` 从清洗后
-items 确定性重渲染,另附 `refine_report.json`(审计:ops/dismissed/removedSpans/tokens)。
+`test_data/refined/<stem>/` is a **drop-in replacement** for the corresponding MinerU output directory:
+images/, layout.json, etc. mirrored verbatim (`img_path` references stay unbroken), `content_list.json`
+replaced with the cleaned version, `full.md` deterministically re-rendered from the cleaned items, plus
+a `refine_report.json` (audit: ops/dismissed/removedSpans/tokens).
 
-## 目录结构
+## Directory structure
 
 ```
 crates/mineru-refine/            # Rust core
-  src/types.rs                   #   MineruItem(保序 JSON 对象)/ WorkItem / OpCall / RefineReport
-  src/id.rs                      #   内部稳定 ID(出口剥除,绝不进输出 schema)
-  src/detect.rs                  #   确定性异常探测器 → 疑点队列
-  src/mechanical.rs              #   机械清洗 pass(表格噪声 + 频率投票,确定性、不打 LLM)
-  src/ops.rs                     #   12 个削减/重组操作 + 保真闸 + 回滚
-  src/extrachar.rs               #   赘字/衍字白名单(deleteChar 的准入)
-  src/invariant.rs               #   保真 / table_body / 几何校验
-  src/confusion.rs               #   混淆修正层(opt-in,fixOcrConfusion)
-  src/garbled.rs                 #   乱码表重转写层 + 降级兜底(opt-in)
-  src/agent_loop.rs              #   确定性外层循环 + LLM tool-use + 守卫
-  src/llm.rs                     #   裸 reqwest:DeepSeek + Qwen-VL(trait 注入,测试 mock)
-  src/markdown.rs                #   清洗后 items → full.md 确定性重渲染
-  src/refine.rs                  #   入口:fail-open + 缓存 + 出口闸门
-  src/bin/{cli,server}.rs        #   stdin/stdout 与 HTTP transport
-  examples/{qwen_smoke,refine_real}.rs   # 真实数据工作流
-  tests/                         #   六类性质测试 + 守卫/绑定回归(mock LLM)
+  src/types.rs                   #   MineruItem (order-preserving JSON object) / WorkItem / OpCall / RefineReport
+  src/id.rs                      #   internal stable ID (stripped at exit, never enters the output schema)
+  src/detect.rs                  #   deterministic anomaly detector → suspect queue
+  src/mechanical.rs              #   mechanical cleaning pass (table noise + frequency vote, deterministic, no LLM)
+  src/ops.rs                     #   12 reduction/reorganization operations + fidelity gate + rollback
+  src/extrachar.rs               #   spurious-character allowlist (the gate for deleteChar)
+  src/invariant.rs               #   fidelity / table_body / geometry checks
+  src/confusion.rs               #   confusion-fix layer (opt-in, fixOcrConfusion)
+  src/garbled.rs                 #   garbled-table re-transcription layer + fallback demotion (opt-in)
+  src/agent_loop.rs              #   deterministic outer loop + LLM tool-use + guards
+  src/llm.rs                     #   bare reqwest: DeepSeek + Qwen-VL (trait injection, test mocks)
+  src/markdown.rs                #   cleaned items → full.md deterministic re-render
+  src/refine.rs                  #   entry: fail-open + cache + exit gate
+  src/bin/{cli,server}.rs        #   stdin/stdout and HTTP transport
+  examples/{qwen_smoke,refine_real}.rs   # real-data workflow
+  tests/                         #   six-property tests + guard/binding regressions (mock LLM)
 bindings/python/                 # PyO3 → pip install mineru-refine
 bindings/js/                     # napi-rs → bun add mineru-refine
-scripts/mineru_fetch.ts          # MinerU 官方 API 拉取测试产物(Bun)
-plugin/                          # Claude Code plugin(端到端 skill:文件进、干净 markdown 出)
-  skills/mineru-prime/SKILL.md   #   编排:MinerU 解析 → mineru-refine 清洗 → drop-in 产物
-  scripts/{mineru_fetch,refine}.ts  # 解析与清洗脚本(Bun)
+scripts/mineru_fetch.ts          # MinerU official-API fetch of test output (Bun)
+plugin/                          # Claude Code plugin (end-to-end skill: file in, clean markdown out)
+  skills/mineru-prime/SKILL.md   #   orchestration: MinerU parse → mineru-refine clean → drop-in output
+  scripts/{mineru_fetch,refine}.ts  # parse and clean scripts (Bun)
 ```
 
-## 边界(有意不做的)
+## Scope (deliberately out of scope)
 
-- **不加字**:OCR 纠错、补图注等内容生成一概不做——纯削减让保真完全可证。
-  返回值预留了 `provenance` 通道(逐字登记 AI 新增字符),供未来扩展。
-- **不修表格列对齐**:合并表格时不补空单元格、不重排单元格(见修复操作集说明)。
-- 不感知任何下游业务模型;不替代 MinerU 的解析,只做其输出的后处理。
+- **No character addition**: content generation like OCR correction or caption completion is never
+  done — pure reduction makes fidelity fully provable. The return value reserves a `provenance` channel
+  (registering AI-added characters per character) for future extensions.
+- **No table column-alignment fixing**: when merging tables, no empty cells are padded and no cells are
+  rearranged (see the fix operation set notes).
+- Aware of no downstream business model; does not replace MinerU's parsing, only post-processes its output.
 
 ## License
 

@@ -20,3 +20,5 @@ tokio.workspace = true
 # abi3-py39：一个平台一个 wheel 通吃 Python >= 3.9，CI 不用按解释器版本展开矩阵
 pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py39"] }
 pythonize = "0.28.0"
+async-trait.workspace = true
+serde.workspace = true

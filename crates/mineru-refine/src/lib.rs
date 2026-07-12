@@ -13,6 +13,7 @@ pub mod confusion;
 pub mod detect;
 pub mod extrachar;
 pub mod garbled;
+pub mod genai_llm;
 pub mod id;
 pub mod invariant;
 pub mod llm;
@@ -34,11 +35,13 @@ pub use types::{
 
 pub use confusion::CONFUSION_PROMPT_VERSION;
 pub use garbled::{DEGRADE_VERSION, GARBLED_PROMPT_VERSION};
+pub use genai_llm::{GenaiChat, GenaiVision, ModelConfig, ProviderConfig};
 
 pub use agent_loop::{Logger, Progress, ProgressSink};
 pub use llm::{
-    ChatClient, ChatResult, ImageDirLoader, LlmError, LoadImage, Message, SplitTableVerdict,
-    TableTranscription, ToolCall, TranscribedCell, Usage, VisionClient,
+    AssistantMessage, ChatClient, ChatResult, ImageDirLoader, LlmError, LoadImage, Message,
+    SplitTableVerdict, TableTranscription, ToolCall, ToolCallFunction, TranscribedCell, Usage,
+    VisionClient,
 };
 
 // 独立可用的工具件：探测器（疑点统计）、机械清洗与 full.md 确定性重渲染

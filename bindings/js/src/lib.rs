@@ -2,12 +2,162 @@
 // items 收/发普通 JS 对象（serde-json 桥接），refine 是真 async（napi tokio runtime）。
 
 use mineru_refine_core::types::MineruItem;
-use mineru_refine_core::{Progress, RefineOptions};
+use mineru_refine_core::{
+    AssistantMessage, ChatClient, ChatResult, LlmError, Message, ModelConfig, Progress,
+    RefineOptions, SplitTableVerdict, TableTranscription, TranscribedCell, Usage, VisionClient,
+};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
+use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
+
+// ── T2 逃生口：用户在 JS 里实现接口（非 OpenAI 兼容后端）──
+// 回调经 ThreadsafeFunction 在原生线程投递、返回 Promise（tokio 桥接 await）。
+// chat 收 (messages, tools)（JSON 原生形状）；视觉收 (Buffer, ...)；均返回 dict。
+
+/// chat：`(messages, tools) => Promise<reply>`。
+type ChatTsfn = ThreadsafeFunction<(Value, Value), Promise<Value>, (Value, Value), Status, false>;
+/// 视觉裁决：`(imgA, imgB) => Promise<{verdict, reason}>`。
+type VisionJudgeTsfn =
+    ThreadsafeFunction<(Buffer, Buffer), Promise<Value>, (Buffer, Buffer), Status, false>;
+/// 视觉重转写：`(img, cellsRender) => Promise<{cells}>`。
+type VisionTranscribeTsfn =
+    ThreadsafeFunction<(Buffer, String), Promise<Value>, (Buffer, String), Status, false>;
+
+#[derive(Deserialize)]
+struct ChatReplyDto {
+    #[serde(flatten)]
+    message: AssistantMessage,
+    #[serde(default, alias = "finishReason")]
+    finish_reason: String,
+    #[serde(default)]
+    usage: Usage,
+}
+
+struct JsChatClient {
+    tsfn: ChatTsfn,
+}
+
+#[async_trait::async_trait]
+impl ChatClient for JsChatClient {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+    ) -> std::result::Result<ChatResult, LlmError> {
+        let msgs = serde_json::to_value(messages)
+            .map_err(|e| LlmError(format!("messages 序列化失败: {e}")))?;
+        let promise = self
+            .tsfn
+            .call_async((msgs, tools.clone()))
+            .await
+            .map_err(|e| LlmError(format!("JS chat 回调投递失败: {e}")))?;
+        let ret = promise
+            .await
+            .map_err(|e| LlmError(format!("JS chat 回调抛错: {e}")))?;
+        let reply: ChatReplyDto =
+            serde_json::from_value(ret).map_err(|e| LlmError(format!("JS chat 返回非法: {e}")))?;
+        Ok(ChatResult {
+            message: reply.message,
+            finish_reason: reply.finish_reason,
+            usage: reply.usage,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct VerdictDto {
+    verdict: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    usage: Usage,
+}
+
+#[derive(Deserialize)]
+struct CellDto {
+    row: usize,
+    col: usize,
+    text: String,
+}
+
+#[derive(Deserialize, Default)]
+struct TranscribeDto {
+    #[serde(default)]
+    cells: Vec<CellDto>,
+    #[serde(default)]
+    usage: Usage,
+}
+
+struct JsVisionClient {
+    judge: VisionJudgeTsfn,
+    transcribe: Option<VisionTranscribeTsfn>,
+}
+
+#[async_trait::async_trait]
+impl VisionClient for JsVisionClient {
+    async fn judge_split_table(
+        &self,
+        img_a: &[u8],
+        img_b: &[u8],
+    ) -> std::result::Result<SplitTableVerdict, LlmError> {
+        let promise = self
+            .judge
+            .call_async((Buffer::from(img_a.to_vec()), Buffer::from(img_b.to_vec())))
+            .await
+            .map_err(|e| LlmError(format!("JS judge 回调投递失败: {e}")))?;
+        let ret = promise
+            .await
+            .map_err(|e| LlmError(format!("JS judge 回调抛错: {e}")))?;
+        let dto: VerdictDto =
+            serde_json::from_value(ret).map_err(|e| LlmError(format!("judge 返回非法: {e}")))?;
+        if dto.verdict != "merge" && dto.verdict != "dismiss" {
+            return Err(LlmError(format!(
+                "verdict 必须是 merge/dismiss: {}",
+                dto.verdict
+            )));
+        }
+        Ok(SplitTableVerdict {
+            merge: dto.verdict == "merge",
+            reason: dto.reason,
+            usage: dto.usage,
+        })
+    }
+
+    async fn transcribe_table(
+        &self,
+        img: &[u8],
+        cells_render: &str,
+    ) -> std::result::Result<TableTranscription, LlmError> {
+        let Some(tsfn) = &self.transcribe else {
+            return Err(LlmError("未提供 visionTranscribe 回调".into()));
+        };
+        let promise = tsfn
+            .call_async((Buffer::from(img.to_vec()), cells_render.to_string()))
+            .await
+            .map_err(|e| LlmError(format!("JS transcribe 回调投递失败: {e}")))?;
+        let ret = promise
+            .await
+            .map_err(|e| LlmError(format!("JS transcribe 回调抛错: {e}")))?;
+        let dto: TranscribeDto = serde_json::from_value(ret)
+            .map_err(|e| LlmError(format!("transcribe 返回非法: {e}")))?;
+        Ok(TableTranscription {
+            cells: dto
+                .cells
+                .into_iter()
+                .map(|c| TranscribedCell {
+                    row: c.row,
+                    col: c.col,
+                    text: c.text,
+                })
+                .collect(),
+            invalid: 0,
+            usage: dto.usage,
+        })
+    }
+}
 
 fn parse_items(items: Value) -> Result<Vec<MineruItem>> {
     serde_json::from_value(items)
@@ -38,6 +188,10 @@ pub struct RefineOpts {
     /// 仍判废且有 img_path 的表整项降级为 image（table_body 删除并进 removedSpans，
     /// report.tableDegraded 计数）。两层都开 = 先救、救不回再降。
     pub degrade_garbled_tables: Option<bool>,
+    /// T1 配置驱动换模型（见 docs/model-abstraction.md）。JSON 原生形状：
+    /// `{ reasoning?: { provider?, model, key?, baseUrl? }, vision?: {...} }`。
+    /// 不传 chat/vision 回调时生效：有对应角色 → 走 genai 多厂商适配器，否则回落 env 默认。
+    pub model_config: Option<Value>,
 }
 
 /// MinerU content_list 清洗。fail-open：任何异常原样返回输入（report.failOpen=true）。
@@ -51,9 +205,28 @@ pub async fn refine(
     items: Value,
     opts: Option<RefineOpts>,
     on_progress: Option<ThreadsafeFunction<Value, (), Value, Status, false>>,
+    chat: Option<ChatTsfn>,
+    vision_judge: Option<VisionJudgeTsfn>,
+    vision_transcribe: Option<VisionTranscribeTsfn>,
 ) -> Result<Value> {
     let items = parse_items(items)?;
     let opts = opts.unwrap_or_default();
+    // T1：配置驱动换模型（modelConfig JSON → ModelConfig）
+    let model_config: Option<ModelConfig> = match opts.model_config {
+        Some(v) => Some(
+            serde_json::from_value(v)
+                .map_err(|e| Error::from_reason(format!("modelConfig 配置非法: {e}")))?,
+        ),
+        None => None,
+    };
+    // T2：用户实现接口逃生口（比 modelConfig 优先级更高）
+    let chat_client = chat.map(|tsfn| Arc::new(JsChatClient { tsfn }) as Arc<dyn ChatClient>);
+    let vision_client = vision_judge.map(|judge| {
+        Arc::new(JsVisionClient {
+            judge,
+            transcribe: vision_transcribe,
+        }) as Arc<dyn VisionClient>
+    });
     // ThreadsafeFunction 本身就是 Clone + Send + Sync 的 Arc 句柄，直接 move 进闭包即可。
     let progress = on_progress.map(|cb| {
         Arc::new(move |p: Progress| {
@@ -73,6 +246,9 @@ pub async fn refine(
             extra_confusion_pairs: opts.extra_confusion_pairs.unwrap_or_default(),
             rewrite_garbled_tables: opts.rewrite_garbled_tables.unwrap_or(false),
             degrade_garbled_tables: opts.degrade_garbled_tables.unwrap_or(false),
+            model_config,
+            chat: chat_client,
+            vision: vision_client,
             progress,
             ..RefineOptions::default()
         },
